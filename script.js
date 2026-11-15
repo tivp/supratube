@@ -5,7 +5,7 @@ window.__supratubeEjecutado = true;
 
 // --- config.js ---
 const CFG = Object.freeze({
-    version: '1.0.0',
+    version: '1.0.1',
     sbApi: 'https://sponsor.ajay.app/api/skipSegments',
     sbCacheTTL: 5 * 60 * 1000,
     geoRefreshMs: 24 * 60 * 60 * 1000,
@@ -142,17 +142,103 @@ function getVideoId(url) {
     );
 }
 
+function isShortsUrl(hrefOrPath = '') {
+    const raw = String(hrefOrPath || (typeof location !== 'undefined' ? location.pathname : ''));
+    return /(?:^|\/)shorts(?:\/|$|\?)/.test(raw);
+}
+
+function selectActivePlayer(doc, hrefOrPath = '', expectedVideoId = '') {
+    if (!doc) return null;
+    const onShorts = isShortsUrl(hrefOrPath);
+    const candidates = onShorts
+        ? [
+              doc.querySelector?.('ytd-reel-video-renderer[is-active] #shorts-player'),
+              doc.getElementById?.('shorts-player'),
+              doc.querySelector?.('ytd-reel-video-renderer[is-active] .html5-video-player'),
+              doc.getElementById?.('movie_player'),
+              doc.querySelector?.('.html5-video-player')
+          ]
+        : [
+              doc.getElementById?.('movie_player'),
+              doc.getElementById?.('shorts-player'),
+              doc.querySelector?.('.html5-video-player')
+          ];
+
+    const unique = candidates.filter((p, i) => p && p.isConnected !== false && candidates.indexOf(p) === i);
+    if (expectedVideoId) {
+        const matched = unique.find(p => p.getVideoData?.()?.video_id === expectedVideoId);
+        if (matched) return matched;
+    }
+    if (onShorts) {
+        const shortsPreferred = unique.find(p => p.id === 'shorts-player' || p.getVideoData?.()?.video_id);
+        if (shortsPreferred) return shortsPreferred;
+    }
+    return unique[0] || null;
+}
+
+const UNDETERMINED_LANG_CODES = new Set(['und', 'zxx', 'mul', 'mis', 'default', 'root', 'unknown']);
+
+function isUndeterminedLang(code) {
+    const clean = String(code || '').trim().toLowerCase().replace(/_/g, '-');
+    if (!clean) return true;
+    const base = clean.split('-')[0];
+    return !base || UNDETERMINED_LANG_CODES.has(base);
+}
+
 function normalizeBaseLang(code) {
     const clean = String(code || '').trim().toLowerCase().replace(/_/g, '-');
     if (!clean) return '';
     return clean.split('-')[0];
 }
 
+function decodeBase64Latin1(b64Url) {
+    const norm = String(b64Url || '').replace(/-/g, '+').replace(/_/g, '/');
+    const padLen = (4 - (norm.length % 4)) % 4;
+    const padded = norm + '='.repeat(padLen);
+    if (typeof atob === 'function') {
+        try {
+            return atob(padded);
+        } catch {
+            return '';
+        }
+    }
+    if (typeof Buffer !== 'undefined') {
+        try {
+            return Buffer.from(padded, 'base64').toString('latin1');
+        } catch {
+            return '';
+        }
+    }
+    return '';
+}
+
+function parseProtoAudioPayload(trackId) {
+    const raw = String(trackId || '').trim();
+    const semiIdx = raw.indexOf(';');
+    if (semiIdx === -1) return '';
+    return decodeBase64Latin1(raw.slice(semiIdx + 1));
+}
+
+function isDubbedAutoAudioTrackId(trackId) {
+    const decoded = parseProtoAudioPayload(trackId);
+    return decoded.includes('dubbed-auto');
+}
+
 function extractLangFromAudioTrackId(trackId) {
     const raw = String(trackId || '').trim();
     if (!raw) return '';
-    const beforeDot = raw.split('.')[0];
-    return normalizeBaseLang(beforeDot);
+    if (raw.includes(';')) {
+        const decoded = parseProtoAudioPayload(raw);
+        if (!decoded) return '';
+        const match = decoded.match(/lang[\x01-\x20]{1,2}([a-zA-Z]{2,3}(?:[-_][a-zA-Z0-9]{2,8})*)/);
+        if (!match) return '';
+        const base = normalizeBaseLang(match[1]);
+        return isUndeterminedLang(base) ? '' : base;
+    }
+    const beforeDot = raw.split('.')[0].replace(/_/g, '-');
+    if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i.test(beforeDot)) return '';
+    const base = normalizeBaseLang(beforeDot);
+    return isUndeterminedLang(base) ? '' : base;
 }
 
 function readCookie(cookieStr, name) {
@@ -1009,27 +1095,58 @@ function readTrackText(field) {
     return '';
 }
 
-function detectVideoAudioLang({ activeAudioTrack, adaptiveFormats, captionTracks, playerResponse }) {
-    if (activeAudioTrack) {
-        const direct =
-            extractLangFromAudioTrackId(activeAudioTrack.id || activeAudioTrack.audioTrackId) ||
-            normalizeBaseLang(activeAudioTrack.languageCode);
-        if (direct) return direct;
-        const capInfo = activeAudioTrack.captions;
-        if (capInfo?.id) {
-            const capLang = extractLangFromAudioTrackId(capInfo.id);
-            if (capLang) return capLang;
-        }
+function extractSingleAudioTrackLang(track) {
+    if (!track) return '';
+    const langInfoId = typeof track.getLanguageInfo === 'function' ? track.getLanguageInfo()?.id : '';
+    const directCode = normalizeBaseLang(track.languageCode);
+    return (
+        extractLangFromAudioTrackId(langInfoId) ||
+        extractLangFromAudioTrackId(track.id || track.audioTrackId) ||
+        (!isUndeterminedLang(directCode) ? directCode : '') ||
+        extractLangFromAudioTrackId(track.captions?.id)
+    );
+}
+
+function isAutoDubbedTrack(track) {
+    if (!track) return false;
+    if (track.isAutoDubbed === true) return true;
+    if (typeof track.isAutoDubbed === 'function' && track.isAutoDubbed() === true) return true;
+    if (typeof track.getLanguageInfo === 'function' && track.getLanguageInfo()?.isAutoDubbed === true) return true;
+    return isDubbedAutoAudioTrackId(track.id || track.audioTrackId);
+}
+
+function detectVideoAudioLang({ activeAudioTrack, availableAudioTracks, adaptiveFormats, captionTracks, playerResponse }) {
+    const activeIsAutoDub = isAutoDubbedTrack(activeAudioTrack);
+    const activeLang = extractSingleAudioTrackLang(activeAudioTrack);
+    if (activeLang && !activeIsAutoDub) {
+        return activeLang;
+    }
+
+    if (Array.isArray(availableAudioTracks)) {
+        const originalTrack = availableAudioTracks.find(t => !isAutoDubbedTrack(t) && extractSingleAudioTrackLang(t));
+        if (originalTrack) return extractSingleAudioTrackLang(originalTrack);
     }
 
     if (Array.isArray(adaptiveFormats)) {
-        const defFmt = adaptiveFormats.find(f => f?.audioTrack?.audioIsDefault);
+        const defFmt = adaptiveFormats.find(
+            f => f?.audioTrack?.audioIsDefault && (!activeIsAutoDub || !isDubbedAutoAudioTrackId(f?.audioTrack?.id))
+        );
         const defLang = extractLangFromAudioTrackId(defFmt?.audioTrack?.id);
         if (defLang) return defLang;
+
+        if (activeIsAutoDub) {
+            const origFmt = adaptiveFormats.find(
+                f => f?.audioTrack?.id && !isDubbedAutoAudioTrackId(f.audioTrack.id) && extractLangFromAudioTrackId(f.audioTrack.id)
+            );
+            const origLang = extractLangFromAudioTrackId(origFmt?.audioTrack?.id);
+            if (origLang) return origLang;
+        }
     }
 
     if (Array.isArray(captionTracks)) {
-        const asrTrack = captionTracks.find(t => t && (t.kind === 'asr' || String(t.vssId || t.vss_id || '').startsWith('a.')));
+        const asrTrack = captionTracks.find(
+            t => t && (t.kind === 'asr' || String(t.vssId || t.vss_id || '').startsWith('a.')) && !isUndeterminedLang(t.languageCode)
+        );
         if (asrTrack?.languageCode) {
             return normalizeBaseLang(asrTrack.languageCode);
         }
@@ -1038,13 +1155,13 @@ function detectVideoAudioLang({ activeAudioTrack, adaptiveFormats, captionTracks
     const microLang =
         playerResponse?.videoDetails?.defaultAudioLanguage ||
         playerResponse?.microformat?.playerMicroformatRenderer?.defaultAudioLanguage;
-    if (microLang) return normalizeBaseLang(microLang);
+    if (microLang && !isUndeterminedLang(microLang)) return normalizeBaseLang(microLang);
 
-    if (Array.isArray(captionTracks) && captionTracks.length === 1 && captionTracks[0]?.languageCode) {
+    if (Array.isArray(captionTracks) && captionTracks.length === 1 && !isUndeterminedLang(captionTracks[0]?.languageCode)) {
         return normalizeBaseLang(captionTracks[0].languageCode);
     }
 
-    return '';
+    return activeLang || '';
 }
 
 function findBestNativeCaptionTrack(tracks, userLang) {
@@ -1154,17 +1271,53 @@ function getStorageSafe(explicitStorage) {
     }
 }
 
-function bindManualCaptionListeners(doc = typeof document !== 'undefined' ? document : null, win = typeof window !== 'undefined' ? window : null, explicitStorage = null) {
-    if (!doc || !win || doc.__supratubeCapListenerBound) return;
+function isMatchingActiveTrack(activeTrack, decision) {
+    if (!activeTrack?.languageCode) return false;
+    if (decision.action === 'select_native') {
+        return (
+            normalizeBaseLang(activeTrack.languageCode) === normalizeBaseLang(decision.track.languageCode) &&
+            !activeTrack.translationLanguage?.languageCode
+        );
+    }
+    if (decision.action === 'translate') {
+        return (
+            normalizeBaseLang(activeTrack.languageCode) === normalizeBaseLang(decision.sourceTrack.languageCode) &&
+            normalizeBaseLang(activeTrack.translationLanguage?.languageCode) === normalizeBaseLang(decision.translationTarget.languageCode)
+        );
+    }
+    return false;
+}
+
+function isShortsCaptionMenuClick(target) {
+    const popup = target?.closest?.('ytd-popup-container, tp-yt-iron-dropdown');
+    if (!popup) return false;
+    const item = target.closest('yt-list-item-view-model, [role="menuitemradio"], [role="menuitem"], tp-yt-paper-item');
+    if (!item) return false;
+    const popupText = popup.textContent || '';
+    return /subt[ií]tulos|captions|traducir autom[aá]ticamente|auto-translate/i.test(popupText);
+}
+
+function bindManualCaptionListeners(
+    doc = typeof document !== 'undefined' ? document : null,
+    win = typeof window !== 'undefined' ? window : null,
+    explicitStorage = null,
+    onManualAction = null
+) {
+    if (!doc || !win) return;
+    if (typeof onManualAction === 'function') {
+        doc.__supratubeOnManualCaption = onManualAction;
+    }
+    if (doc.__supratubeCapListenerBound) return;
     doc.__supratubeCapListenerBound = true;
     const storage = getStorageSafe(explicitStorage);
     const clearAutoFlag = () => {
         try { storage?.setItem(CC_AUTO_STORAGE_KEY, '0'); } catch {}
+        try { doc.__supratubeOnManualCaption?.(); } catch {}
     };
 
     doc.addEventListener('click', ev => {
         if (!ev.isTrusted) return;
-        if (ev.target?.closest?.('.ytp-subtitles-button')) {
+        if (ev.target?.closest?.('.ytp-subtitles-button') || isShortsCaptionMenuClick(ev.target)) {
             clearAutoFlag();
         }
     }, true);
@@ -1184,6 +1337,11 @@ async function applySmartSubtitles(player, deps = {}) {
     const storage = getStorageSafe(deps.storage);
     const scheduleFn = deps.scheduleFn || (fn => setTimeout(fn, 0));
 
+    const playerVid = player.getVideoData?.()?.video_id;
+    if (deps.expectedVideoId && playerVid && playerVid !== deps.expectedVideoId) {
+        return false;
+    }
+
     try { player.loadModule?.('captions'); } catch {}
 
     const pr = player.getPlayerResponse?.() || {};
@@ -1196,12 +1354,17 @@ async function applySmartSubtitles(player, deps = {}) {
             : (player.getOption?.('captions', 'translationLanguages') || []);
 
     const activeTrack = player.getOption?.('captions', 'track');
-    const ccBtn = doc?.querySelector?.('.ytp-subtitles-button');
-    const captionsCurrentlyOn = ccBtn?.getAttribute?.('aria-pressed') === 'true' || Boolean(activeTrack?.languageCode);
+    const playerSubsOn = typeof player.isSubtitlesOn === 'function' ? player.isSubtitlesOn() : null;
+    const scopedBtn = player.querySelector?.('.ytp-subtitles-button');
+    const ccBtn = scopedBtn || (typeof player.querySelector !== 'function' ? doc?.querySelector?.('.ytp-subtitles-button') : null);
+    const captionsCurrentlyOn = playerSubsOn !== null
+        ? Boolean(playerSubsOn)
+        : (ccBtn?.getAttribute?.('aria-pressed') === 'true' || Boolean(activeTrack?.languageCode));
     const autoActivatedByScript = storage?.getItem(CC_AUTO_STORAGE_KEY) === '1';
 
     const videoLang = detectVideoAudioLang({
         activeAudioTrack: player.getAudioTrack?.(),
+        availableAudioTracks: player.getAvailableAudioTracks?.(),
         adaptiveFormats: pr.streamingData?.adaptiveFormats,
         captionTracks,
         playerResponse: pr
@@ -1220,10 +1383,16 @@ async function applySmartSubtitles(player, deps = {}) {
 
     if (decision.action === 'disable') {
         try { player.setOption?.('captions', 'track', {}); } catch {}
-        if (ccBtn?.getAttribute?.('aria-pressed') === 'true') {
+        const stillOn = (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn() === true) ||
+            ccBtn?.getAttribute?.('aria-pressed') === 'true';
+        if (stillOn) {
             try { player.toggleSubtitles?.(); } catch {}
         }
         try { storage?.setItem(CC_AUTO_STORAGE_KEY, '0'); } catch {}
+        return true;
+    }
+
+    if (captionsCurrentlyOn && isMatchingActiveTrack(activeTrack, decision)) {
         return true;
     }
 
@@ -1267,6 +1436,8 @@ const S = {
     qualityState: { manualOverride: false, lastFormatId: null },
     userNativeLang: null,
     subsAppliedForVideo: null,
+    subsUserTouchedVideo: null,
+    _subInFlight: null,
     _player: null,
     _video: null,
     _videoListened: false,
@@ -1279,9 +1450,17 @@ const S = {
 };
 
 function getPlayer() {
+    const selected = selectActivePlayer(document, location.pathname, S.videoId);
+    if (selected) {
+        if (S._player !== selected) {
+            S._player = selected;
+            S._video = null;
+            S._videoListened = false;
+        }
+        return S._player;
+    }
     if (S._player && S._player.isConnected) return S._player;
-    S._player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
-    return S._player;
+    return null;
 }
 
 function getVideo() {
@@ -1289,7 +1468,10 @@ function getVideo() {
     const p = getPlayer();
     S._video = p ? p.querySelector('video') : document.querySelector('video');
     if (S._video && !S._videoListened) {
-        bindVideoEvents(S._video);
+        if (!S._video.__supratubeBound) {
+            S._video.__supratubeBound = true;
+            bindVideoEvents(S._video);
+        }
         S._videoListened = true;
     }
     return S._video;
@@ -1303,6 +1485,8 @@ function clearVideoCache() {
     S.qualityState.manualOverride = false;
     S.qualityState.lastFormatId = null;
     S.subsAppliedForVideo = null;
+    S.subsUserTouchedVideo = null;
+    S._subInFlight = null;
 }
 
 function runAdPass() {
@@ -1339,20 +1523,28 @@ function refreshProgressBar() {
 async function runSubtitlesForCurrentVideo() {
     const vid = S.videoId;
     if (!vid || !S.settings.autoSubtitles) return;
-    if (S.subsAppliedForVideo === vid) return;
+    if (S.subsUserTouchedVideo === vid || S._subInFlight === vid) return;
     const player = getPlayer();
     if (!player) return;
-    if (!S.userNativeLang) {
-        S.userNativeLang = await resolveUserNativeLang();
-    }
-    if (getVideoId() !== vid) return;
-    const applied = await applySmartSubtitles(player, {
-        enabled: S.settings.autoSubtitles,
-        userLang: S.userNativeLang,
-        doc: document
-    });
-    if (applied || player.getPlayerResponse?.()?.videoDetails?.videoId === vid) {
-        S.subsAppliedForVideo = vid;
+    S._subInFlight = vid;
+    try {
+        if (!S.userNativeLang) {
+            S.userNativeLang = await resolveUserNativeLang();
+        }
+        if (getVideoId() !== vid || S.subsUserTouchedVideo === vid) return;
+        const activePlayer = getPlayer();
+        if (!activePlayer) return;
+        const applied = await applySmartSubtitles(activePlayer, {
+            enabled: S.settings.autoSubtitles,
+            userLang: S.userNativeLang,
+            expectedVideoId: vid,
+            doc: document
+        });
+        if (applied) {
+            S.subsAppliedForVideo = vid;
+        }
+    } finally {
+        if (S._subInFlight === vid) S._subInFlight = null;
     }
 }
 
@@ -1503,7 +1695,9 @@ function onNavigate() {
 
 function boot() {
     injectAdStyles(document);
-    bindManualCaptionListeners(document, window);
+    bindManualCaptionListeners(document, window, null, () => {
+        S.subsUserTouchedVideo = S.videoId;
+    });
     resolveUserNativeLang().then(lang => { S.userNativeLang = lang; }).catch(() => {});
 
     subscribeSettings(window, document, nextSettings => {
@@ -1538,6 +1732,10 @@ function boot() {
     }, true);
 
     setInterval(() => {
+        if (location.href !== S.lastUrl || getVideoId() !== S.videoId) {
+            S.lastUrl = location.href;
+            onNavigate();
+        }
         if (S.settings.adSkip) runAdPass();
         else dismissEnforcement(document, window);
         if (S.settings.sponsorBlock && S.settings.greenBar && S.sbSegments.length && !document.getElementById('supratube-sb-track')) {

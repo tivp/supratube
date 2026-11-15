@@ -1,5 +1,10 @@
 import { CC_AUTO_STORAGE_KEY } from './config.js';
-import { normalizeBaseLang, extractLangFromAudioTrackId } from './utils.js';
+import {
+    normalizeBaseLang,
+    extractLangFromAudioTrackId,
+    isDubbedAutoAudioTrackId,
+    isUndeterminedLang
+} from './utils.js';
 
 function readTrackText(field) {
     if (!field) return '';
@@ -9,27 +14,58 @@ function readTrackText(field) {
     return '';
 }
 
-export function detectVideoAudioLang({ activeAudioTrack, adaptiveFormats, captionTracks, playerResponse }) {
-    if (activeAudioTrack) {
-        const direct =
-            extractLangFromAudioTrackId(activeAudioTrack.id || activeAudioTrack.audioTrackId) ||
-            normalizeBaseLang(activeAudioTrack.languageCode);
-        if (direct) return direct;
-        const capInfo = activeAudioTrack.captions;
-        if (capInfo?.id) {
-            const capLang = extractLangFromAudioTrackId(capInfo.id);
-            if (capLang) return capLang;
-        }
+function extractSingleAudioTrackLang(track) {
+    if (!track) return '';
+    const langInfoId = typeof track.getLanguageInfo === 'function' ? track.getLanguageInfo()?.id : '';
+    const directCode = normalizeBaseLang(track.languageCode);
+    return (
+        extractLangFromAudioTrackId(langInfoId) ||
+        extractLangFromAudioTrackId(track.id || track.audioTrackId) ||
+        (!isUndeterminedLang(directCode) ? directCode : '') ||
+        extractLangFromAudioTrackId(track.captions?.id)
+    );
+}
+
+function isAutoDubbedTrack(track) {
+    if (!track) return false;
+    if (track.isAutoDubbed === true) return true;
+    if (typeof track.isAutoDubbed === 'function' && track.isAutoDubbed() === true) return true;
+    if (typeof track.getLanguageInfo === 'function' && track.getLanguageInfo()?.isAutoDubbed === true) return true;
+    return isDubbedAutoAudioTrackId(track.id || track.audioTrackId);
+}
+
+export function detectVideoAudioLang({ activeAudioTrack, availableAudioTracks, adaptiveFormats, captionTracks, playerResponse }) {
+    const activeIsAutoDub = isAutoDubbedTrack(activeAudioTrack);
+    const activeLang = extractSingleAudioTrackLang(activeAudioTrack);
+    if (activeLang && !activeIsAutoDub) {
+        return activeLang;
+    }
+
+    if (Array.isArray(availableAudioTracks)) {
+        const originalTrack = availableAudioTracks.find(t => !isAutoDubbedTrack(t) && extractSingleAudioTrackLang(t));
+        if (originalTrack) return extractSingleAudioTrackLang(originalTrack);
     }
 
     if (Array.isArray(adaptiveFormats)) {
-        const defFmt = adaptiveFormats.find(f => f?.audioTrack?.audioIsDefault);
+        const defFmt = adaptiveFormats.find(
+            f => f?.audioTrack?.audioIsDefault && (!activeIsAutoDub || !isDubbedAutoAudioTrackId(f?.audioTrack?.id))
+        );
         const defLang = extractLangFromAudioTrackId(defFmt?.audioTrack?.id);
         if (defLang) return defLang;
+
+        if (activeIsAutoDub) {
+            const origFmt = adaptiveFormats.find(
+                f => f?.audioTrack?.id && !isDubbedAutoAudioTrackId(f.audioTrack.id) && extractLangFromAudioTrackId(f.audioTrack.id)
+            );
+            const origLang = extractLangFromAudioTrackId(origFmt?.audioTrack?.id);
+            if (origLang) return origLang;
+        }
     }
 
     if (Array.isArray(captionTracks)) {
-        const asrTrack = captionTracks.find(t => t && (t.kind === 'asr' || String(t.vssId || t.vss_id || '').startsWith('a.')));
+        const asrTrack = captionTracks.find(
+            t => t && (t.kind === 'asr' || String(t.vssId || t.vss_id || '').startsWith('a.')) && !isUndeterminedLang(t.languageCode)
+        );
         if (asrTrack?.languageCode) {
             return normalizeBaseLang(asrTrack.languageCode);
         }
@@ -38,13 +74,13 @@ export function detectVideoAudioLang({ activeAudioTrack, adaptiveFormats, captio
     const microLang =
         playerResponse?.videoDetails?.defaultAudioLanguage ||
         playerResponse?.microformat?.playerMicroformatRenderer?.defaultAudioLanguage;
-    if (microLang) return normalizeBaseLang(microLang);
+    if (microLang && !isUndeterminedLang(microLang)) return normalizeBaseLang(microLang);
 
-    if (Array.isArray(captionTracks) && captionTracks.length === 1 && captionTracks[0]?.languageCode) {
+    if (Array.isArray(captionTracks) && captionTracks.length === 1 && !isUndeterminedLang(captionTracks[0]?.languageCode)) {
         return normalizeBaseLang(captionTracks[0].languageCode);
     }
 
-    return '';
+    return activeLang || '';
 }
 
 export function findBestNativeCaptionTrack(tracks, userLang) {
@@ -154,17 +190,53 @@ function getStorageSafe(explicitStorage) {
     }
 }
 
-export function bindManualCaptionListeners(doc = typeof document !== 'undefined' ? document : null, win = typeof window !== 'undefined' ? window : null, explicitStorage = null) {
-    if (!doc || !win || doc.__supratubeCapListenerBound) return;
+function isMatchingActiveTrack(activeTrack, decision) {
+    if (!activeTrack?.languageCode) return false;
+    if (decision.action === 'select_native') {
+        return (
+            normalizeBaseLang(activeTrack.languageCode) === normalizeBaseLang(decision.track.languageCode) &&
+            !activeTrack.translationLanguage?.languageCode
+        );
+    }
+    if (decision.action === 'translate') {
+        return (
+            normalizeBaseLang(activeTrack.languageCode) === normalizeBaseLang(decision.sourceTrack.languageCode) &&
+            normalizeBaseLang(activeTrack.translationLanguage?.languageCode) === normalizeBaseLang(decision.translationTarget.languageCode)
+        );
+    }
+    return false;
+}
+
+function isShortsCaptionMenuClick(target) {
+    const popup = target?.closest?.('ytd-popup-container, tp-yt-iron-dropdown');
+    if (!popup) return false;
+    const item = target.closest('yt-list-item-view-model, [role="menuitemradio"], [role="menuitem"], tp-yt-paper-item');
+    if (!item) return false;
+    const popupText = popup.textContent || '';
+    return /subt[ií]tulos|captions|traducir autom[aá]ticamente|auto-translate/i.test(popupText);
+}
+
+export function bindManualCaptionListeners(
+    doc = typeof document !== 'undefined' ? document : null,
+    win = typeof window !== 'undefined' ? window : null,
+    explicitStorage = null,
+    onManualAction = null
+) {
+    if (!doc || !win) return;
+    if (typeof onManualAction === 'function') {
+        doc.__supratubeOnManualCaption = onManualAction;
+    }
+    if (doc.__supratubeCapListenerBound) return;
     doc.__supratubeCapListenerBound = true;
     const storage = getStorageSafe(explicitStorage);
     const clearAutoFlag = () => {
         try { storage?.setItem(CC_AUTO_STORAGE_KEY, '0'); } catch {}
+        try { doc.__supratubeOnManualCaption?.(); } catch {}
     };
 
     doc.addEventListener('click', ev => {
         if (!ev.isTrusted) return;
-        if (ev.target?.closest?.('.ytp-subtitles-button')) {
+        if (ev.target?.closest?.('.ytp-subtitles-button') || isShortsCaptionMenuClick(ev.target)) {
             clearAutoFlag();
         }
     }, true);
@@ -184,6 +256,11 @@ export async function applySmartSubtitles(player, deps = {}) {
     const storage = getStorageSafe(deps.storage);
     const scheduleFn = deps.scheduleFn || (fn => setTimeout(fn, 0));
 
+    const playerVid = player.getVideoData?.()?.video_id;
+    if (deps.expectedVideoId && playerVid && playerVid !== deps.expectedVideoId) {
+        return false;
+    }
+
     try { player.loadModule?.('captions'); } catch {}
 
     const pr = player.getPlayerResponse?.() || {};
@@ -196,12 +273,17 @@ export async function applySmartSubtitles(player, deps = {}) {
             : (player.getOption?.('captions', 'translationLanguages') || []);
 
     const activeTrack = player.getOption?.('captions', 'track');
-    const ccBtn = doc?.querySelector?.('.ytp-subtitles-button');
-    const captionsCurrentlyOn = ccBtn?.getAttribute?.('aria-pressed') === 'true' || Boolean(activeTrack?.languageCode);
+    const playerSubsOn = typeof player.isSubtitlesOn === 'function' ? player.isSubtitlesOn() : null;
+    const scopedBtn = player.querySelector?.('.ytp-subtitles-button');
+    const ccBtn = scopedBtn || (typeof player.querySelector !== 'function' ? doc?.querySelector?.('.ytp-subtitles-button') : null);
+    const captionsCurrentlyOn = playerSubsOn !== null
+        ? Boolean(playerSubsOn)
+        : (ccBtn?.getAttribute?.('aria-pressed') === 'true' || Boolean(activeTrack?.languageCode));
     const autoActivatedByScript = storage?.getItem(CC_AUTO_STORAGE_KEY) === '1';
 
     const videoLang = detectVideoAudioLang({
         activeAudioTrack: player.getAudioTrack?.(),
+        availableAudioTracks: player.getAvailableAudioTracks?.(),
         adaptiveFormats: pr.streamingData?.adaptiveFormats,
         captionTracks,
         playerResponse: pr
@@ -220,10 +302,16 @@ export async function applySmartSubtitles(player, deps = {}) {
 
     if (decision.action === 'disable') {
         try { player.setOption?.('captions', 'track', {}); } catch {}
-        if (ccBtn?.getAttribute?.('aria-pressed') === 'true') {
+        const stillOn = (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn() === true) ||
+            ccBtn?.getAttribute?.('aria-pressed') === 'true';
+        if (stillOn) {
             try { player.toggleSubtitles?.(); } catch {}
         }
         try { storage?.setItem(CC_AUTO_STORAGE_KEY, '0'); } catch {}
+        return true;
+    }
+
+    if (captionsCurrentlyOn && isMatchingActiveTrack(activeTrack, decision)) {
         return true;
     }
 

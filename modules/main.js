@@ -1,4 +1,4 @@
-import { getVideoId, readBridgeSettings, subscribeSettings } from './utils.js';
+import { getVideoId, selectActivePlayer, readBridgeSettings, subscribeSettings } from './utils.js';
 import { installLayer0AdPrune, injectAdStyles, trySkipAd, dismissEnforcement } from './adblock.js';
 import { fetchSponsorSegments, renderGreenProgressBar, tickSponsorBlock } from './sponsorblock.js';
 import { apply1080pQuality } from './quality.js';
@@ -20,6 +20,8 @@ const S = {
     qualityState: { manualOverride: false, lastFormatId: null },
     userNativeLang: null,
     subsAppliedForVideo: null,
+    subsUserTouchedVideo: null,
+    _subInFlight: null,
     _player: null,
     _video: null,
     _videoListened: false,
@@ -32,9 +34,17 @@ const S = {
 };
 
 function getPlayer() {
+    const selected = selectActivePlayer(document, location.pathname, S.videoId);
+    if (selected) {
+        if (S._player !== selected) {
+            S._player = selected;
+            S._video = null;
+            S._videoListened = false;
+        }
+        return S._player;
+    }
     if (S._player && S._player.isConnected) return S._player;
-    S._player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
-    return S._player;
+    return null;
 }
 
 function getVideo() {
@@ -42,7 +52,10 @@ function getVideo() {
     const p = getPlayer();
     S._video = p ? p.querySelector('video') : document.querySelector('video');
     if (S._video && !S._videoListened) {
-        bindVideoEvents(S._video);
+        if (!S._video.__supratubeBound) {
+            S._video.__supratubeBound = true;
+            bindVideoEvents(S._video);
+        }
         S._videoListened = true;
     }
     return S._video;
@@ -56,6 +69,8 @@ function clearVideoCache() {
     S.qualityState.manualOverride = false;
     S.qualityState.lastFormatId = null;
     S.subsAppliedForVideo = null;
+    S.subsUserTouchedVideo = null;
+    S._subInFlight = null;
 }
 
 function runAdPass() {
@@ -92,20 +107,28 @@ function refreshProgressBar() {
 async function runSubtitlesForCurrentVideo() {
     const vid = S.videoId;
     if (!vid || !S.settings.autoSubtitles) return;
-    if (S.subsAppliedForVideo === vid) return;
+    if (S.subsUserTouchedVideo === vid || S._subInFlight === vid) return;
     const player = getPlayer();
     if (!player) return;
-    if (!S.userNativeLang) {
-        S.userNativeLang = await resolveUserNativeLang();
-    }
-    if (getVideoId() !== vid) return;
-    const applied = await applySmartSubtitles(player, {
-        enabled: S.settings.autoSubtitles,
-        userLang: S.userNativeLang,
-        doc: document
-    });
-    if (applied || player.getPlayerResponse?.()?.videoDetails?.videoId === vid) {
-        S.subsAppliedForVideo = vid;
+    S._subInFlight = vid;
+    try {
+        if (!S.userNativeLang) {
+            S.userNativeLang = await resolveUserNativeLang();
+        }
+        if (getVideoId() !== vid || S.subsUserTouchedVideo === vid) return;
+        const activePlayer = getPlayer();
+        if (!activePlayer) return;
+        const applied = await applySmartSubtitles(activePlayer, {
+            enabled: S.settings.autoSubtitles,
+            userLang: S.userNativeLang,
+            expectedVideoId: vid,
+            doc: document
+        });
+        if (applied) {
+            S.subsAppliedForVideo = vid;
+        }
+    } finally {
+        if (S._subInFlight === vid) S._subInFlight = null;
     }
 }
 
@@ -256,7 +279,9 @@ function onNavigate() {
 
 function boot() {
     injectAdStyles(document);
-    bindManualCaptionListeners(document, window);
+    bindManualCaptionListeners(document, window, null, () => {
+        S.subsUserTouchedVideo = S.videoId;
+    });
     resolveUserNativeLang().then(lang => { S.userNativeLang = lang; }).catch(() => {});
 
     subscribeSettings(window, document, nextSettings => {
@@ -291,6 +316,10 @@ function boot() {
     }, true);
 
     setInterval(() => {
+        if (location.href !== S.lastUrl || getVideoId() !== S.videoId) {
+            S.lastUrl = location.href;
+            onNavigate();
+        }
         if (S.settings.adSkip) runAdPass();
         else dismissEnforcement(document, window);
         if (S.settings.sponsorBlock && S.settings.greenBar && S.sbSegments.length && !document.getElementById('supratube-sb-track')) {

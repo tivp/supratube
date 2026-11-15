@@ -10,7 +10,7 @@ Extensión modular Chrome MV3 (fork arquitectónico de Maximus / `chan2txt`) par
 2. **Calidad 1080p / Premium automática:** Prioriza `1080p60 Premium` > `1080p Premium` > `1080p60` > `1080p` > mejor resolución `< 1080p` disponible en la cuenta sin activar pantallas de pago en cuentas gratuitas.
 3. **SponsorBlock + barra verde:** Salta o silencia patrocinadores y pinta los segmentos en verde sobre la barra de navegación del video.
 4. **Idioma natal por IP en cookie:** Detecta el idioma del usuario según su IP y lo guarda en cookie en `.youtube.com` (`supratube_geo_lang`).
-5. **Subtítulos inteligentes:** Si el video está en otro idioma, activa subtítulos en tu idioma natal (incluyendo variantes regionales como `es`, `es-MX`, `es-ES`, `es-419`) o auto-traduce desde inglés (`en` → idioma natal). Si el video está en tu idioma natal, conserva los subtítulos si los activaste manualmente.
+5. **Subtítulos inteligentes (videos y Shorts):** Si el video o YouTube Short está en otro idioma, activa subtítulos en tu idioma natal (incluyendo variantes regionales como `es`, `es-MX`, `es-ES`, `es-419`) o auto-traduce desde inglés (`en` → idioma natal), incluso cuando YouTube activa pistas de autodoblaje IA. Si el contenido está en tu idioma natal, conserva los subtítulos si los activaste manualmente.
 6. **Actualización en vivo desde GitHub:** Desde el popup de la extensión puedes sincronizar los módulos directamente desde `https://github.com/tivp/supratube`.
 
 ## Instalación en Chrome

@@ -7,6 +7,8 @@ import {
 } from '../modules/config.js';
 import {
     getVideoId,
+    isShortsUrl,
+    selectActivePlayer,
     normalizeBaseLang,
     extractLangFromAudioTrackId,
     readCookie,
@@ -51,11 +53,39 @@ test('normalizeBaseLang folds regional Spanish and other locales to base ISO cod
     assert.equal(normalizeBaseLang(''), '');
 });
 
-test('extractLangFromAudioTrackId extracts base language from YouTube audioTrack ids', () => {
+test('extractLangFromAudioTrackId extracts base language from legacy and protobuf YouTube audioTrack ids and ignores und', () => {
     assert.equal(extractLangFromAudioTrackId('es-419.10'), 'es');
     assert.equal(extractLangFromAudioTrackId('en.4'), 'en');
     assert.equal(extractLangFromAudioTrackId('pt-BR.2'), 'pt');
+    assert.equal(extractLangFromAudioTrackId('251;ChQKBWFjb250EgtkdWJiZWQtYXV0bwoNCgRsYW5nEgVlcy1VUw'), 'es');
+    assert.equal(extractLangFromAudioTrackId('251;ChEKBWFjb250EghvcmlnaW5hbAoICgNkcmMSATEKDQoEbGFuZxIFZW4tVVM'), 'en');
+    assert.equal(extractLangFromAudioTrackId('und'), '');
+    assert.equal(extractLangFromAudioTrackId('und.4'), '');
+    assert.equal(extractLangFromAudioTrackId('zxx'), '');
+    assert.equal(extractLangFromAudioTrackId('default'), '');
+    assert.equal(extractLangFromAudioTrackId('251;not_valid_protobuf'), '');
     assert.equal(extractLangFromAudioTrackId(''), '');
+});
+
+test('selectActivePlayer prioritizes #shorts-player on /shorts URLs even when #movie_player is connected', () => {
+    assert.equal(isShortsUrl('/shorts/KBIKtrmM80Y'), true);
+    assert.equal(isShortsUrl('https://www.youtube.com/shorts/KBIKtrmM80Y?feature=share'), true);
+    assert.equal(isShortsUrl('/watch?v=KBIKtrmM80Y'), false);
+
+    const moviePlayer = { id: 'movie_player', isConnected: true, getVideoData: () => ({ video_id: null }) };
+    const shortsPlayer = { id: 'shorts-player', isConnected: true, getVideoData: () => ({ video_id: 'KBIKtrmM80Y' }) };
+    const fakeDoc = {
+        getElementById: id => (id === 'movie_player' ? moviePlayer : id === 'shorts-player' ? shortsPlayer : null),
+        querySelector: sel => {
+            if (sel === 'ytd-reel-video-renderer[is-active] #shorts-player') return shortsPlayer;
+            if (sel === '.html5-video-player') return moviePlayer;
+            return null;
+        }
+    };
+
+    assert.equal(selectActivePlayer(fakeDoc, '/shorts/KBIKtrmM80Y', 'KBIKtrmM80Y'), shortsPlayer);
+    assert.equal(selectActivePlayer(fakeDoc, '/shorts/KBIKtrmM80Y'), shortsPlayer);
+    assert.equal(selectActivePlayer(fakeDoc, '/watch?v=dQw4w9WgXcQ'), moviePlayer);
 });
 
 test('readCookie and buildCookieString roundtrip encoded cookie values', () => {
