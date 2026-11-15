@@ -5,6 +5,7 @@ import { apply1080pQuality } from './quality.js';
 import { resolveUserNativeLang } from './geo-lang.js';
 import { bindManualCaptionListeners, applySmartSubtitles, installTimedtextMonitor, clearFallbackCaptions, detectVideoAudioLang } from './subtitles.js';
 import { createAiSummaryController } from './ai-summary.js';
+import { createTranscriptDownloadController } from './transcript-download.js';
 
 installLayer0AdPrune(window);
 installTimedtextMonitor(window);
@@ -26,6 +27,12 @@ const S = {
     _subInFlight: null,
     _lastAudioLang: null,
     _aiCtrl: createAiSummaryController({ doc: document, win: window }),
+    _tdCtrl: createTranscriptDownloadController({
+        doc: document,
+        win: window,
+        getUserLang: () => S.userNativeLang || 'es',
+        requestFn: gmRequest
+    }),
     _player: null,
     _video: null,
     _videoListened: false,
@@ -308,9 +315,11 @@ function boot() {
         }, 60);
     });
     resolveUserNativeLang().then(lang => { S.userNativeLang = lang; }).catch(() => {});
+    S._tdCtrl.setEnabled(S.settings.transcriptDownload !== false);
 
     subscribeSettings(window, document, nextSettings => {
         S.settings = nextSettings;
+        S._tdCtrl.setEnabled(S.settings.transcriptDownload !== false);
         if (!S.settings.autoSubtitles) {
             clearFallbackCaptions(document, window);
         }
@@ -369,6 +378,7 @@ function boot() {
             }
         }
         S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: S.videoId });
+        if (S.settings.transcriptDownload !== false) S._tdCtrl.scan();
     }, 800);
 
     const navObs = new MutationObserver(() => {

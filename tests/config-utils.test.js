@@ -16,7 +16,7 @@ import {
     gmRequest
 } from '../modules/utils.js';
 
-test('ORDEN_MODULOS lists all 9 runtime modules ending with main.js', () => {
+test('ORDEN_MODULOS lists all 10 runtime modules ending with main.js', () => {
     assert.deepEqual(ORDEN_MODULOS, [
         'config.js',
         'utils.js',
@@ -26,6 +26,7 @@ test('ORDEN_MODULOS lists all 9 runtime modules ending with main.js', () => {
         'geo-lang.js',
         'subtitles.js',
         'ai-summary.js',
+        'transcript-download.js',
         'main.js'
     ]);
     assert.equal(DEFAULT_SETTINGS.adSkip, true);
@@ -34,6 +35,7 @@ test('ORDEN_MODULOS lists all 9 runtime modules ending with main.js', () => {
     assert.equal(DEFAULT_SETTINGS.auto1080p, true);
     assert.equal(DEFAULT_SETTINGS.autoSubtitles, true);
     assert.equal(DEFAULT_SETTINGS.aiSummary, true);
+    assert.equal(DEFAULT_SETTINGS.transcriptDownload, true);
     assert.equal(COUNTRY_TO_LANG.CL, 'es');
     assert.equal(COUNTRY_TO_LANG.MX, 'es');
     assert.equal(COUNTRY_TO_LANG.US, 'en');

@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "Supratube | Maximus",
-    "version": "1.0.3",
-    "description": "YouTube sin anuncios, 1080p/Premium automático, barra verde SponsorBlock, subtítulos por IP y botón IA Resume de verdad.",
+    "version": "1.0.4",
+    "description": "YouTube sin anuncios, 1080p/Premium automático, barra verde SponsorBlock, subtítulos por IP, IA y descarga TXT.",
     "author": "tivp",
     "icons": {
         "16": "icons/icon-16.png",

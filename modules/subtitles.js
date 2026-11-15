@@ -299,7 +299,8 @@ const FALLBACK_BOX_ID = 'supratube-fallback-captions';
 const MODULE_FALLBACK_HOLDER = {};
 const MODULE_TT_HOLDER = {};
 
-function encodeBase64Bytes(bytes) {
+/** Encode byte array to standard base64 across browser and Node runtimes. */
+export function encodeBase64Bytes(bytes) {
     let bin = '';
     for (let i = 0; i < bytes.length; i++) {
         bin += String.fromCharCode(bytes[i]);
@@ -308,7 +309,8 @@ function encodeBase64Bytes(bytes) {
     return Buffer.from(bytes).toString('base64');
 }
 
-function getTtState(win) {
+/** Return or initialize per-window timedtext capture and block state. */
+export function getTtState(win) {
     const host = win || MODULE_TT_HOLDER;
     if (!host.__supratubeTtState) {
         host.__supratubeTtState = {
@@ -346,15 +348,25 @@ function setBoundedCache(map, key, value, limit = 20) {
     map.set(key, value);
 }
 
-function decodeHtmlEntities(str) {
-    return String(str || '').replace(/&(#x?[0-9a-f]+|amp|lt|gt|quot|apos|nbsp|#39);/gi, (m, ent) => {
-        const low = ent.toLowerCase();
-        if (low[0] === '#') {
-            const code = low[1] === 'x' ? parseInt(low.slice(2), 16) : parseInt(low.slice(1), 10);
-            return Number.isFinite(code) ? String.fromCodePoint(code) : m;
-        }
-        return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }[low] || m;
-    });
+/** Decode numeric and standard HTML entities across one or more escape passes. */
+export function decodeHtmlEntities(str, passes = 1) {
+    let out = String(str ?? '');
+    const limit = Math.max(1, Number(passes) || 1);
+    for (let pass = 0; pass < limit; pass++) {
+        if (!out.includes('&')) break;
+        out = out.replace(/&(?:#(\d+)|#x([0-9a-f]+)|(amp|lt|gt|quot|apos|nbsp));/gi, (m, dec, hex, named) => {
+            if (dec !== undefined) {
+                const code = parseInt(dec, 10);
+                return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+            }
+            if (hex !== undefined) {
+                const code = parseInt(hex, 16);
+                return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+            }
+            return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }[named.toLowerCase()] || m;
+        });
+    }
+    return out;
 }
 
 /** Parse YouTube json3 timedtext payload into sorted second-based cue objects. */
@@ -383,23 +395,103 @@ export function parseJson3Cues(dataOrText) {
     return out;
 }
 
-function parseTimedtextResponseText(bodyText) {
+function parseVttClockSeconds(rawClock) {
+    const clean = String(rawClock || '').trim().replace(',', '.');
+    const parts = clean.split(':').map(Number);
+    if (!parts.length || parts.some(n => !Number.isFinite(n))) return 0;
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return parts[0];
+}
+
+function parseVttCues(rawVtt) {
+    const raw = String(rawVtt || '').replace(/\r\n?/g, '\n');
+    const parsedCues = [];
+    for (const block of raw.split(/\n\n+/)) {
+        const lines = block.split('\n').map(l => l.trim()).filter(Boolean);
+        if (!lines.length) continue;
+        if (/^(?:WEBVTT|NOTE|STYLE|REGION)\b/.test(lines[0])) continue;
+        const timeIdx = lines.findIndex(l => l.includes('-->'));
+        if (timeIdx < 0) continue;
+        const arrowParts = lines[timeIdx].split('-->');
+        if (arrowParts.length < 2) continue;
+        const start = parseVttClockSeconds(arrowParts[0]);
+        const end = parseVttClockSeconds(arrowParts[1].trim().split(/\s+/)[0]);
+        const dur = Math.max(0, end - start);
+        const textLines = lines
+            .slice(timeIdx + 1)
+            .map(l => decodeHtmlEntities(l.replace(/<[^>]*>/g, ''), 2).replace(/\s+/g, ' ').trim())
+            .filter(Boolean);
+        if (textLines.length) {
+            parsedCues.push({ start, end: end > start ? end : start + dur, dur, textLines });
+        }
+    }
+    if (!parsedCues.length) return [];
+
+    // YouTube ASR WebVTT uses two-line rolling overlap and <=50ms transition flushes.
+    const isRollingYt = /<c(?:\.[^>]+)?>|<\d{2}:\d{2}:\d{2}\.\d{3}>/.test(raw) ||
+        /^Kind:\s*captions/im.test(raw) ||
+        parsedCues.some(c => c.dur > 0 && c.dur <= 0.05);
+
+    const out = [];
+    if (!isRollingYt) {
+        for (const c of parsedCues) {
+            const text = c.textLines.join(' ').replace(/\s+/g, ' ').trim();
+            if (!text) continue;
+            const prev = out[out.length - 1];
+            if (prev && prev.text === text && Math.abs(c.start - prev.start) < 0.2) continue;
+            out.push({ start: c.start, end: c.dur > 0 ? c.start + c.dur : c.start + 4, text });
+        }
+        return out;
+    }
+
+    let prevLine = '';
+    let prevEnd = 0;
+    for (const c of parsedCues) {
+        const isTinyFlush = c.dur <= 0.05;
+        const picked = [];
+        for (const line of c.textLines) {
+            const isCarry = line === prevLine && (c.textLines.length > 1 || isTinyFlush || Math.abs(c.start - prevEnd) < 0.25);
+            if (isCarry) continue;
+            const lastOut = out[out.length - 1];
+            if (lastOut && lastOut.text === line && Math.abs(c.start - lastOut.start) < 1.5) continue;
+            if (isTinyFlush && lastOut && lastOut.text.endsWith(line)) continue;
+            picked.push(line);
+        }
+        prevLine = c.textLines[c.textLines.length - 1] || prevLine;
+        prevEnd = c.end;
+        const text = picked.join(' ').replace(/\s+/g, ' ').trim();
+        if (text) out.push({ start: c.start, end: c.dur > 0.05 ? c.start + c.dur : c.start + 2.5, text });
+    }
+    return out;
+}
+
+/** Parse json3, XML timedtext (<p>/<text>), or WebVTT payloads into cue objects. */
+export function parseTimedtextResponseText(bodyText) {
     const trimmed = String(bodyText || '').trim();
     if (!trimmed) return [];
     if (trimmed[0] === '{') return parseJson3Cues(trimmed);
+    if (trimmed.includes('WEBVTT') || trimmed.includes('-->')) {
+        const vttCues = parseVttCues(trimmed);
+        if (vttCues.length) return vttCues;
+    }
     if (trimmed[0] !== '<') return [];
     const cues = [];
     for (const m of trimmed.matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/g)) {
-        const t = Number(/\bt="(\d+)"/.exec(m[1])?.[1] || 0) / 1000;
-        const d = Number(/\bd="(\d+)"/.exec(m[1])?.[1] || 0) / 1000;
-        const txt = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+        const tAttr = /\bt="([\d.]+)"/.exec(m[1])?.[1];
+        const dAttr = /\bd="([\d.]+)"/.exec(m[1])?.[1];
+        const sAttr = /\bstart="([\d.]+)"/.exec(m[1])?.[1];
+        const durAttr = /\bdur="([\d.]+)"/.exec(m[1])?.[1];
+        const t = tAttr !== undefined ? Number(tAttr) / 1000 : Number(sAttr || 0);
+        const d = dAttr !== undefined ? Number(dAttr) / 1000 : Number(durAttr || 0);
+        const txt = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, ''), 2).replace(/\s+/g, ' ').trim();
         if (txt) cues.push({ start: t, end: d > 0 ? t + d : t + 4, text: txt });
     }
     if (!cues.length) {
         for (const m of trimmed.matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/g)) {
             const t = Number(/\bstart="([\d.]+)"/.exec(m[1])?.[1] || 0);
             const d = Number(/\bdur="([\d.]+)"/.exec(m[1])?.[1] || 0);
-            const txt = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+            const txt = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, ''), 2).replace(/\s+/g, ' ').trim();
             if (txt) cues.push({ start: t, end: d > 0 ? t + d : t + 4, text: txt });
         }
     }
@@ -757,7 +849,8 @@ export async function translateCueBatch({ texts, sourceLang = 'auto', targetLang
     return out;
 }
 
-async function fetchTranscriptViaGetPanel(videoId, win) {
+/** Fetch and parse transcript segments via YouTube's modern PAmodern_transcript_view panel. */
+export async function fetchTranscriptViaGetPanel(videoId, win) {
     if (!win || typeof win.fetch !== 'function') return [];
     const params = buildTranscriptPanelParams(videoId);
     if (!params) return [];

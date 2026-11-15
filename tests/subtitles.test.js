@@ -12,7 +12,12 @@ import {
     translateCueBatch,
     installTimedtextMonitor,
     clearFallbackCaptions,
-    applySmartSubtitles
+    applySmartSubtitles,
+    decodeHtmlEntities,
+    parseTimedtextResponseText,
+    getTtState,
+    fetchTranscriptViaGetPanel,
+    encodeBase64Bytes
 } from '../modules/subtitles.js';
 
 test('detectVideoAudioLang inspects active dubbed audio track first, then default audio, then asr caption', () => {
@@ -664,4 +669,42 @@ test('applySmartSubtitles skips subtitles on auto-dubbed Spanish audio and prese
     });
     assert.equal(resAutoDisable, true);
     assert.equal(subsOn, false);
+});
+
+test('decodeHtmlEntities and parseTimedtextResponseText decode XML/JSON3/WebVTT rolling cues cleanly', () => {
+    assert.equal(decodeHtmlEntities('Tom &amp;#39;Jerry&#39; &quot;OK&quot;'), 'Tom &#39;Jerry\' "OK"');
+    assert.equal(decodeHtmlEntities('Tom &amp;#39;Jerry&#39;', 2), 'Tom \'Jerry\'');
+    assert.equal(typeof encodeBase64Bytes, 'function');
+    assert.equal(typeof getTtState, 'function');
+    assert.equal(typeof fetchTranscriptViaGetPanel, 'function');
+
+    const pXml = '<timedtext><body><p t="1500" d="2200">Hola &amp; mundo</p><p t="4000" d="1000">Adiós</p></body></timedtext>';
+    const fromP = parseTimedtextResponseText(pXml);
+    assert.equal(fromP.length, 2);
+    assert.equal(fromP[0].start, 1.5);
+    assert.equal(fromP[0].end, 3.7);
+    assert.equal(fromP[0].text, 'Hola & mundo');
+
+    const vtt = [
+        'WEBVTT',
+        'Kind: captions',
+        '',
+        '00:00:01.000 --> 00:00:03.000',
+        'First line',
+        '',
+        '00:00:03.000 --> 00:00:03.020',
+        'First line',
+        'Second line',
+        '',
+        '00:00:03.020 --> 00:00:05.500',
+        'Second line'
+    ].join('\n');
+    const fromVtt = parseTimedtextResponseText(vtt);
+    assert.deepEqual(
+        fromVtt.map(c => ({ start: c.start, text: c.text })),
+        [
+            { start: 1, text: 'First line' },
+            { start: 3, text: 'Second line' }
+        ]
+    );
 });

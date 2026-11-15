@@ -14,7 +14,8 @@
         greenBar: true,
         auto1080p: true,
         autoSubtitles: true,
-        aiSummary: true
+        aiSummary: true,
+        transcriptDownload: true
     };
 
     const syncSettingsToPage = (raw, dispatchEvent) => {

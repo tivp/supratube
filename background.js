@@ -15,6 +15,7 @@ const ORDEN_MODULOS = [
     'geo-lang.js',
     'subtitles.js',
     'ai-summary.js',
+    'transcript-download.js',
     'main.js'
 ];
 
