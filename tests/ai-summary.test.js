@@ -2,8 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     AI_SUMMARY_PROMPT,
+    AI_CORRECTED_PROMPT,
+    AI_RESUME_BTN_ID,
+    AI_CORRECT_BTN_ID,
     injectAiSummaryStyles,
-    ensureResumeButton,
+    ensureAiButtons,
     createAiSummaryController
 } from '../modules/ai-summary.js';
 
@@ -228,7 +231,7 @@ function createFakeDom() {
     return { doc, FakeElement };
 }
 
-test('injectAiSummaryStyles scopes chip hiding strictly under active card class and styles green Resume de verdad button', () => {
+test('injectAiSummaryStyles styles green chip buttons without hiding any YouTube chat elements', () => {
     const { doc } = createFakeDom();
     const s1 = injectAiSummaryStyles(doc);
     const s2 = injectAiSummaryStyles(doc);
@@ -236,14 +239,19 @@ test('injectAiSummaryStyles scopes chip hiding strictly under active card class 
     assert.equal(doc.head.children.length, 1);
 
     const css = s1.textContent;
-    assert.match(css, /body\.supratube-ia-tarjeta-activa\s+you-chat-chips-data/);
-    assert.doesNotMatch(css, /(^|\n)\s*you-chat-chips-data\s*\{/);
-    assert.match(css, /#supratube-ia-resume-btn[\s\S]*border[\s\S]*#22c55e/);
+    assert.doesNotMatch(css, /supratube-ia-tarjeta-activa/);
+    assert.doesNotMatch(css, /yt-chat-input-view-model|#footer/);
+    assert.doesNotMatch(css, /display:\s*none/);
+    assert.match(css, /\.ytwYouChatChipsDataChip\.supratube-ia-chip-btn[\s\S]*border[\s\S]*#22c55e/);
+    assert.match(css, /\.supratube-ia-chip-wrap[\s\S]*opacity:\s*1/);
 });
 
-test('ensureResumeButton mounts Resume de verdad immediately after you-chat-chips-data without duplicating', () => {
+test('ensureAiButtons mounts both green chips inside first visible you-chat-chips-data without duplicating or adding extra wrappers', () => {
     const { doc } = createFakeDom();
     const panelBody = doc.createElement('div');
+    const itemRow = doc.createElement('you-chat-item-view-model');
+    itemRow.className = 'ytwYouChatItemViewModelYouChatItemViewModel';
+
     const chips = doc.createElement('you-chat-chips-data');
     chips.className = 'ytwYouChatChipsDataHost';
     const nativeWrap = doc.createElement('div');
@@ -253,26 +261,46 @@ test('ensureResumeButton mounts Resume de verdad immediately after you-chat-chip
     nativeBtn.textContent = 'Resume el video';
     nativeWrap.appendChild(nativeBtn);
     chips.appendChild(nativeWrap);
-    panelBody.appendChild(chips);
+    itemRow.appendChild(chips);
+
+    // Second native chip group further down in panel (must NOT get duplicate custom buttons)
+    const secondChips = doc.createElement('you-chat-chips-data');
+    secondChips.className = 'ytwYouChatChipsDataHost';
+
+    // Simulate stale legacy sibling wrapper left behind before upgrade
+    const staleLegacy = doc.createElement('div');
+    staleLegacy.id = 'supratube-ia-resume-wrap';
+    itemRow.appendChild(staleLegacy);
+
+    panelBody.appendChild(itemRow);
+    panelBody.appendChild(secondChips);
     doc.body.appendChild(panelBody);
 
-    let clicks = 0;
-    const btn1 = ensureResumeButton(doc, null, () => { clicks += 1; });
-    const btn2 = ensureResumeButton(doc, null, () => { clicks += 1; });
+    const clickedActions = [];
+    const btns1 = ensureAiButtons(doc, action => clickedActions.push(action.id));
+    const btns2 = ensureAiButtons(doc, action => clickedActions.push(action.id));
 
-    assert.ok(btn1);
-    assert.equal(btn1, btn2);
-    assert.equal(btn1.textContent, 'Resume de verdad');
-    // Must live outside <you-chat-chips-data>, as its immediate next sibling, so YouTube Wiz reconciler never wipes it.
-    assert.equal(chips.children.length, 1);
-    assert.equal(chips.nextElementSibling?.id, 'supratube-ia-resume-wrap');
-    assert.equal(panelBody.querySelectorAll('#supratube-ia-resume-btn').length, 1);
+    assert.equal(btns1.length, 2);
+    assert.deepEqual(btns2, btns1);
+    assert.equal(doc.getElementById('supratube-ia-resume-wrap'), null, 'stale outer wrapper must be removed');
+    assert.equal(itemRow.children.length, 1, 'must NOT add sibling elements inside flex-row you-chat-item-view-model');
+    assert.equal(chips.children.length, 3, 'two green chips appended cleanly inside first you-chat-chips-data');
+    assert.equal(secondChips.children.length, 0, 'must NOT duplicate buttons into secondary chip groups');
 
-    btn1.click();
-    assert.equal(clicks, 1);
+    const [resumeBtn, correctBtn] = btns1;
+    assert.equal(resumeBtn.id, AI_RESUME_BTN_ID);
+    assert.equal(resumeBtn.textContent, 'Resume de verdad');
+    assert.ok(resumeBtn.classList.contains('ytwYouChatChipsDataChip'));
+    assert.equal(correctBtn.id, AI_CORRECT_BTN_ID);
+    assert.equal(correctBtn.textContent, 'Dame la version corregida');
+    assert.ok(correctBtn.classList.contains('ytwYouChatChipsDataChip'));
+
+    resumeBtn.click();
+    correctBtn.click();
+    assert.deepEqual(clickedActions, [AI_RESUME_BTN_ID, AI_CORRECT_BTN_ID]);
 });
 
-test('AI controller auto-opens Preguntar once per video, aborts on music videos, and cleans card only on Resume de verdad click', () => {
+test('AI controller never auto-clicks Preguntar/menu, never hides chat UI, and sends both prompts cleanly', () => {
     const { doc } = createFakeDom();
     const scheduled = [];
     const setTimer = (fn, ms) => { scheduled.push({ fn, ms }); return scheduled.length; };
@@ -283,7 +311,7 @@ test('AI controller auto-opens Preguntar once per video, aborts on music videos,
     };
     win.HTMLTextAreaElement.prototype = {};
 
-    // Metadata bar with Preguntar entrypoint
+    // Metadata bar with Preguntar & 3-dots menu (must never be auto-clicked)
     const menuBar = doc.createElement('ytd-menu-renderer');
     menuBar.className = 'ytd-watch-metadata';
     const epWrap = doc.createElement('div');
@@ -292,17 +320,20 @@ test('AI controller auto-opens Preguntar once per video, aborts on music videos,
     askBtn.setAttribute('aria-label', 'Preguntar');
     epWrap.appendChild(askBtn);
     menuBar.appendChild(epWrap);
+    const moreBtn = doc.createElement('button');
+    moreBtn.setAttribute('aria-label', 'Más acciones');
+    menuBar.appendChild(moreBtn);
     doc.body.appendChild(menuBar);
 
-    const ctrl = createAiSummaryController({ doc, win, setTimer, transitionDelayMs: 0 });
+    const ctrl = createAiSummaryController({ doc, win, setTimer });
     ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidOne11111', videoId: 'vidOne11111' });
-    // Release transition timer
     scheduled.splice(0).forEach(t => t.fn());
     ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidOne11111', videoId: 'vidOne11111' });
 
-    assert.equal(askBtn.clicked, 1, 'must auto-click Preguntar once upon entering watch page');
+    assert.equal(askBtn.clicked, 0, 'must NOT auto-click Preguntar');
+    assert.equal(moreBtn.clicked, 0, 'must NOT auto-open 3-dots menu');
 
-    // Simulate Ask panel appearing with chips, disclaimer, textarea & Enviar button
+    // User manually opens Ask panel
     const panel = doc.createElement('ytd-engagement-panel-section-list-renderer');
     const chips = doc.createElement('you-chat-chips-data');
     chips.className = 'ytwYouChatChipsDataHost';
@@ -322,114 +353,63 @@ test('AI controller auto-opens Preguntar once per video, aborts on music videos,
     const discSpan = doc.createElement('span');
     discSpan.textContent = 'La IA puede cometer errores, así que verifica las respuestas.';
     discWrap.appendChild(discSpan);
+    const priorMsg = doc.createElement('div');
+    priorMsg.setAttribute('role', 'alert');
+    priorMsg.className = 'ytwYouChatItemViewModelHost';
+    const actions = doc.createElement('yt-response-actions-view-model');
+    priorMsg.appendChild(actions);
+
     panel.appendChild(chips);
+    panel.appendChild(priorMsg);
     panel.appendChild(discWrap);
     panel.appendChild(footer);
     doc.body.appendChild(panel);
 
     ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidOne11111', videoId: 'vidOne11111' });
-    const resumeBtn = doc.getElementById('supratube-ia-resume-btn');
-    assert.ok(resumeBtn, 'Resume de verdad button must appear once panel opens');
-    assert.equal(textarea.value, '', 'must NOT auto-send prompt before clicking Resume de verdad');
+    const resumeBtn = doc.getElementById(AI_RESUME_BTN_ID);
+    const correctBtn = doc.getElementById(AI_CORRECT_BTN_ID);
+    assert.ok(resumeBtn, 'Resume de verdad button must appear once Ask panel is open');
+    assert.ok(correctBtn, 'Dame la version corregida button must appear once Ask panel is open');
+    assert.equal(textarea.value, '', 'must NOT auto-send prompt before clicking a green chip');
 
-    // If user uses a native chip / regular chat, must NOT hide UI into clean card
-    const regularMsg = doc.createElement('div');
-    regularMsg.setAttribute('role', 'alert');
-    regularMsg.className = 'ytwYouChatItemViewModelHost';
-    const regularActions = doc.createElement('yt-response-actions-view-model');
-    regularMsg.appendChild(regularActions);
-    panel.appendChild(regularMsg);
-    ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidOne11111', videoId: 'vidOne11111' });
-    assert.equal(doc.body.classList.contains('supratube-ia-tarjeta-activa'), false);
-
-    // Click Resume de verdad!
+    // Click Resume de verdad
     resumeBtn.click();
     assert.equal(textarea.value, AI_SUMMARY_PROMPT);
     assert.equal(resumeBtn.disabled, true);
-    // Run submit timer
+    assert.equal(correctBtn.disabled, true);
     scheduled.splice(0).forEach(t => t.fn());
     assert.equal(sendBtn.clicked, 1);
+    assert.equal(resumeBtn.disabled, false);
+    assert.equal(correctBtn.disabled, false);
 
-    // Prior message must NOT trigger completion; wait for a NEW multipart response
+    // Response arrives -> must NOT delete or hide any chat elements
+    const reply = doc.createElement('div');
+    reply.setAttribute('role', 'alert');
+    reply.className = 'ytwYouChatItemViewModelHost';
+    reply.appendChild(doc.createElement('yt-response-actions-view-model'));
+    panel.appendChild(reply);
     ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidOne11111', videoId: 'vidOne11111' });
+
     assert.equal(doc.body.classList.contains('supratube-ia-tarjeta-activa'), false);
+    assert.equal(priorMsg.style.display, '');
+    assert.equal(discSpan.style.display, '');
+    assert.equal(discWrap.style.display, '');
+    assert.equal(footer.style.display, '');
 
-    const part1 = doc.createElement('div');
-    part1.setAttribute('role', 'alert');
-    part1.className = 'ytwYouChatItemViewModelHost';
-    const part2 = doc.createElement('div');
-    part2.setAttribute('role', 'alert');
-    part2.className = 'ytwYouChatItemViewModelHost ytwYouChatItemViewModelChatResponseStyleMultiPartEnd';
-    const actions2 = doc.createElement('yt-response-actions-view-model');
-    part2.appendChild(actions2);
-    panel.appendChild(part1);
-    panel.appendChild(part2);
-
-    ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidOne11111', videoId: 'vidOne11111' });
-    assert.equal(doc.body.classList.contains('supratube-ia-tarjeta-activa'), true);
-    assert.equal(regularMsg.style.display, 'none');
-    assert.equal(part1.style.display, '');
-    assert.equal(part2.style.display, '');
-    assert.equal(discSpan.style.display, 'none');
-    assert.equal(discWrap.style.display, 'none');
-
-    // Navigate to a music video without Preguntar -> must reset card and abort cleanly via 3-dots lock
-    askBtn.remove();
-    panel.remove();
-    const moreBtn = doc.createElement('button');
-    moreBtn.setAttribute('aria-label', 'Más acciones');
-    const shape = doc.createElement('yt-button-shape');
-    shape.id = 'button-shape';
-    shape.appendChild(moreBtn);
-    menuBar.appendChild(shape);
-    const paperItem = doc.createElement('tp-yt-paper-item');
-    paperItem.textContent = 'Mostrar transcripción';
-    doc.body.appendChild(paperItem);
-
-    ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=musicVid222', videoId: 'musicVid222' });
-    assert.equal(doc.body.classList.contains('supratube-ia-tarjeta-activa'), false);
-    assert.equal(regularMsg.style.display, '');
+    // Click Dame la version corregida -> sends full Correccion Absoluta + simple neutral Spanish 500-char prompt
+    correctBtn.click();
+    assert.equal(textarea.value, AI_CORRECTED_PROMPT);
+    assert.match(AI_CORRECTED_PROMPT, /500 caracteres/);
+    assert.match(AI_CORRECTED_PROMPT, /español simple y neutro, no erudito/);
+    assert.match(AI_CORRECTED_PROMPT, /Descomprime cronicas, relatos historicos, noticias polarizantes/);
+    assert.match(AI_CORRECTED_PROMPT, /La Prueba del Espejo/);
+    assert.match(AI_CORRECTED_PROMPT, /solo la evidencia del proceso decide\.$/);
     scheduled.splice(0).forEach(t => t.fn());
-    ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=musicVid222', videoId: 'musicVid222' });
-    assert.equal(moreBtn.clicked, 1);
-    scheduled.splice(0).forEach(t => t.fn()); // inspects menu and locks musicVid222
-    ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=musicVid222', videoId: 'musicVid222' });
-    assert.equal(moreBtn.clicked, 1, 'music video lock must prevent re-opening 3-dots menu in a loop');
-});
+    assert.equal(sendBtn.clicked, 2);
 
-test('AI controller respects manual panel close and tears down cleanly when popup toggle is disabled', () => {
-    const { doc } = createFakeDom();
-    const win = {};
-    const menuBar = doc.createElement('ytd-menu-renderer');
-    menuBar.className = 'ytd-watch-metadata';
-    const epWrap = doc.createElement('div');
-    epWrap.className = 'you-chat-entrypoint-button';
-    const askBtn = doc.createElement('button');
-    askBtn.setAttribute('aria-label', 'Preguntar');
-    epWrap.appendChild(askBtn);
-    menuBar.appendChild(epWrap);
-    doc.body.appendChild(menuBar);
-
-    const ctrl = createAiSummaryController({ doc, win, transitionDelayMs: 0 });
-    ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidClose111', videoId: 'vidClose111' });
-    assert.equal(askBtn.clicked, 1);
-
-    // User closed panel before chips rendered -> next ticks do not re-click Preguntar
-    ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidClose111', videoId: 'vidClose111' });
-    assert.equal(askBtn.clicked, 1);
-
-    // User manually re-opens Ask panel -> Resume de verdad button mounts cleanly
-    const panel = doc.createElement('div');
-    const chips = doc.createElement('you-chat-chips-data');
-    chips.className = 'ytwYouChatChipsDataHost';
-    panel.appendChild(chips);
-    doc.body.appendChild(panel);
-    ctrl.tick({ enabled: true, url: 'https://www.youtube.com/watch?v=vidClose111', videoId: 'vidClose111' });
-    assert.ok(doc.getElementById('supratube-ia-resume-btn'));
-
-    // User disables aiSummary toggle in popup -> clean removal
-    doc.body.classList.add('supratube-ia-tarjeta-activa');
-    ctrl.tick({ enabled: false, url: 'https://www.youtube.com/watch?v=vidClose111', videoId: 'vidClose111' });
-    assert.equal(doc.body.classList.contains('supratube-ia-tarjeta-activa'), false);
-    assert.equal(doc.getElementById('supratube-ia-resume-btn'), null);
+    // User disables aiSummary toggle in popup -> removes only our two chips cleanly
+    ctrl.tick({ enabled: false, url: 'https://www.youtube.com/watch?v=vidOne11111', videoId: 'vidOne11111' });
+    assert.equal(doc.getElementById(AI_RESUME_BTN_ID), null);
+    assert.equal(doc.getElementById(AI_CORRECT_BTN_ID), null);
+    assert.equal(footer.style.display, '');
 });

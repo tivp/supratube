@@ -1,5 +1,5 @@
 export const CFG = Object.freeze({
-    version: '1.0.6',
+    version: '1.0.7',
     sbApi: 'https://sponsor.ajay.app/api/skipSegments',
     sbCacheTTL: 5 * 60 * 1000,
     geoRefreshMs: 24 * 60 * 60 * 1000,
