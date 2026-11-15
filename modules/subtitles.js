@@ -17,15 +17,73 @@ function readTrackText(field) {
     return '';
 }
 
+const TRACK_NAME_LANG_PATTERNS = Object.freeze([
+    [/^(?:espa[ñn]ol|spanish)(?:\s*\(|\s|$)/i, 'es'],
+    [/^(?:ingl[eé]s|english)(?:\s*\(|\s|$)/i, 'en'],
+    [/^(?:portugu[eê]s|portuguese)(?:\s*\(|\s|$)/i, 'pt'],
+    [/^(?:franc[eé]s|french)(?:\s*\(|\s|$)/i, 'fr'],
+    [/^(?:alem[aá]n|german)(?:\s*\(|\s|$)/i, 'de'],
+    [/^(?:italiano|italian)(?:\s*\(|\s|$)/i, 'it'],
+    [/^(?:japon[eé]s|japanese)(?:\s*\(|\s|$)/i, 'ja'],
+    [/^(?:coreano|korean)(?:\s*\(|\s|$)/i, 'ko']
+]);
+
+function detectLangFromTrackDisplayName(name) {
+    const raw = String(name || '').trim();
+    if (!raw) return '';
+    for (let i = 0; i < TRACK_NAME_LANG_PATTERNS.length; i++) {
+        if (TRACK_NAME_LANG_PATTERNS[i][0].test(raw)) {
+            return TRACK_NAME_LANG_PATTERNS[i][1];
+        }
+    }
+    return '';
+}
+
+function getTrackLanguageInfoSafe(track) {
+    if (!track || typeof track !== 'object') return null;
+    if (typeof track.getLanguageInfo === 'function') {
+        try {
+            return track.getLanguageInfo() || null;
+        } catch {
+            return track.Vb || null;
+        }
+    }
+    return track.Vb || null;
+}
+
+function readTrackNameString(track, langInfo) {
+    return (
+        (typeof langInfo?.getName === 'function' ? langInfo.getName() : '') ||
+        langInfo?.name ||
+        (typeof track.getName === 'function' ? track.getName() : '') ||
+        readTrackText(track.name || track.displayName)
+    );
+}
+
+function isDefaultAudioTrack(track) {
+    if (!track || typeof track !== 'object') return false;
+    if (track.isDefault === true) return true;
+    if (typeof track.getIsDefault === 'function' && track.getIsDefault() === true) return true;
+    const langInfo = getTrackLanguageInfoSafe(track);
+    if (langInfo?.isDefault === true) return true;
+    if (typeof langInfo?.getIsDefault === 'function' && langInfo.getIsDefault() === true) return true;
+    return track.Vb?.isDefault === true;
+}
+
 function extractSingleAudioTrackLang(track) {
     if (!track) return '';
-    const langInfoId = typeof track.getLanguageInfo === 'function' ? track.getLanguageInfo()?.id : '';
+    const langInfo = getTrackLanguageInfoSafe(track);
+    const langInfoId = (typeof langInfo?.getId === 'function' ? langInfo.getId() : '') || langInfo?.id || '';
+    const vbId = (typeof track.Vb?.getId === 'function' ? track.Vb.getId() : '') || track.Vb?.id || '';
+    const directId = (typeof track.getId === 'function' ? track.getId() : '') || track.id || track.audioTrackId || '';
     const directCode = normalizeBaseLang(track.languageCode);
     return (
         extractLangFromAudioTrackId(langInfoId) ||
-        extractLangFromAudioTrackId(track.id || track.audioTrackId) ||
+        extractLangFromAudioTrackId(vbId) ||
+        extractLangFromAudioTrackId(directId) ||
         (!isUndeterminedLang(directCode) ? directCode : '') ||
-        extractLangFromAudioTrackId(track.captions?.id)
+        extractLangFromAudioTrackId(track.captions?.id) ||
+        detectLangFromTrackDisplayName(readTrackNameString(track, langInfo))
     );
 }
 
@@ -33,36 +91,43 @@ function isAutoDubbedTrack(track) {
     if (!track) return false;
     if (track.isAutoDubbed === true) return true;
     if (typeof track.isAutoDubbed === 'function' && track.isAutoDubbed() === true) return true;
-    if (typeof track.getLanguageInfo === 'function' && track.getLanguageInfo()?.isAutoDubbed === true) return true;
+    if (typeof track.getIsAutoDubbed === 'function' && track.getIsAutoDubbed() === true) return true;
+    const langInfo = getTrackLanguageInfoSafe(track);
+    if (langInfo?.isAutoDubbed === true) return true;
+    if (typeof langInfo?.getIsAutoDubbed === 'function' && langInfo.getIsAutoDubbed() === true) return true;
     return isDubbedAutoAudioTrackId(track.id || track.audioTrackId);
 }
 
 export function detectVideoAudioLang({ activeAudioTrack, availableAudioTracks, adaptiveFormats, captionTracks, playerResponse }) {
-    const activeIsAutoDub = isAutoDubbedTrack(activeAudioTrack);
+    // Active audio track represents what the viewer actually hears (including AI auto-dubbed tracks like Español US).
     const activeLang = extractSingleAudioTrackLang(activeAudioTrack);
-    if (activeLang && !activeIsAutoDub) {
+    if (activeLang) {
         return activeLang;
     }
 
     if (Array.isArray(availableAudioTracks)) {
+        const defaultTrack = availableAudioTracks.find(t => isDefaultAudioTrack(t) && extractSingleAudioTrackLang(t));
+        if (defaultTrack) return extractSingleAudioTrackLang(defaultTrack);
+
         const originalTrack = availableAudioTracks.find(t => !isAutoDubbedTrack(t) && extractSingleAudioTrackLang(t));
         if (originalTrack) return extractSingleAudioTrackLang(originalTrack);
+
+        const anyTrack = availableAudioTracks.find(t => extractSingleAudioTrackLang(t));
+        if (anyTrack) return extractSingleAudioTrackLang(anyTrack);
     }
 
     if (Array.isArray(adaptiveFormats)) {
         const defFmt = adaptiveFormats.find(
-            f => f?.audioTrack?.audioIsDefault && (!activeIsAutoDub || !isDubbedAutoAudioTrackId(f?.audioTrack?.id))
+            f => f?.audioTrack?.audioIsDefault && extractLangFromAudioTrackId(f?.audioTrack?.id)
         );
         const defLang = extractLangFromAudioTrackId(defFmt?.audioTrack?.id);
         if (defLang) return defLang;
 
-        if (activeIsAutoDub) {
-            const origFmt = adaptiveFormats.find(
-                f => f?.audioTrack?.id && !isDubbedAutoAudioTrackId(f.audioTrack.id) && extractLangFromAudioTrackId(f.audioTrack.id)
-            );
-            const origLang = extractLangFromAudioTrackId(origFmt?.audioTrack?.id);
-            if (origLang) return origLang;
-        }
+        const origFmt = adaptiveFormats.find(
+            f => f?.audioTrack?.id && !isDubbedAutoAudioTrackId(f.audioTrack.id) && extractLangFromAudioTrackId(f.audioTrack.id)
+        );
+        const origLang = extractLangFromAudioTrackId(origFmt?.audioTrack?.id);
+        if (origLang) return origLang;
     }
 
     if (Array.isArray(captionTracks)) {

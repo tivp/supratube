@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { compileBundle } from '../tools/build-bundle.mjs';
 import { ORDEN_MODULOS } from '../modules/config.js';
 
-test('compileBundle builds a syntactically valid IIFE from all 8 modules', () => {
+test('compileBundle builds a syntactically valid IIFE from all 9 modules', () => {
     const map = {};
     for (const name of ORDEN_MODULOS) {
         map[name] = fs.readFileSync(path.resolve('modules', name), 'utf8');

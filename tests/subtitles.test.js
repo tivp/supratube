@@ -162,7 +162,7 @@ test('applySmartSubtitles preserves native tracklist metadata in one single setO
     assert.equal(buildPlayerTrackArg({ languageCode: 'es', vssId: '.es' }).vss_id, '.es');
 });
 
-test('detectVideoAudioLang handles Shorts und tracks, protobuf IDs, getLanguageInfo, and AI auto-dubbed original source', () => {
+test('detectVideoAudioLang handles Shorts und tracks, protobuf IDs, getLanguageInfo, Vb, and respects active AI auto-dubbed audio', () => {
     assert.equal(
         detectVideoAudioLang({
             activeAudioTrack: { id: 'und', getLanguageInfo: () => ({ id: 'und', isAutoDubbed: false }) },
@@ -192,7 +192,7 @@ test('detectVideoAudioLang handles Shorts und tracks, protobuf IDs, getLanguageI
             ],
             captionTracks: [{ languageCode: 'en', kind: 'asr', vssId: 'a.en' }]
         }),
-        'en'
+        'es'
     );
 
     assert.equal(
@@ -200,7 +200,29 @@ test('detectVideoAudioLang handles Shorts und tracks, protobuf IDs, getLanguageI
             activeAudioTrack: { id: '251;ChQKBWFjb250EgtkdWJiZWQtYXV0bwoNCgRsYW5nEgVlcy1VUw' },
             captionTracks: [{ languageCode: 'en', kind: 'asr', vssId: 'a.en' }]
         }),
-        'en'
+        'es'
+    );
+
+    assert.equal(
+        detectVideoAudioLang({
+            activeAudioTrack: {
+                Vb: { id: 'es-US.3', name: 'Español (US)', isAutoDubbed: true }
+            },
+            captionTracks: [{ languageCode: 'en', kind: 'asr', vssId: 'a.en' }]
+        }),
+        'es'
+    );
+
+    assert.equal(
+        detectVideoAudioLang({
+            activeAudioTrack: null,
+            availableAudioTracks: [
+                { getIsDefault: () => false, getLanguageInfo: () => ({ getId: () => 'en.4' }) },
+                { getIsDefault: () => true, getLanguageInfo: () => ({ getId: () => 'es-419.3', isAutoDubbed: true }) }
+            ],
+            captionTracks: [{ languageCode: 'en', kind: 'asr', vssId: 'a.en' }]
+        }),
+        'es'
     );
 
     assert.equal(
@@ -236,9 +258,9 @@ test('applySmartSubtitles activates and cleans up captions properly on #shorts-p
             subsOn = !subsOn;
         },
         getAudioTrack: () => ({
-            id: '251;ChQKBWFjb250EgtkdWJiZWQtYXV0bwoNCgRsYW5nEgVlcy1VUw',
-            isAutoDubbed: () => true,
-            getLanguageInfo: () => ({ id: 'es-US.10', isAutoDubbed: true })
+            id: '251;ChEKBWFjb250EghvcmlnaW5hbAoICgNkcmMSATEKDQoEbGFuZxIFZW4tVVM',
+            isAutoDubbed: () => false,
+            getLanguageInfo: () => ({ id: 'en-US.4', isAutoDubbed: false })
         }),
         getAvailableAudioTracks: () => [
             {
@@ -573,4 +595,73 @@ test('applySmartSubtitles activates get_panel + translated overlay when timedtex
 
     clearFallbackCaptions(fakeDoc, fakeWin);
     assert.equal(elements.get('supratube-fallback-captions'), undefined);
+});
+
+test('applySmartSubtitles skips subtitles on auto-dubbed Spanish audio and preserves user-enabled subtitles', async () => {
+    const store = new Map();
+    const storage = { getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v) };
+    let subsOn = false;
+    const setOptionCalls = [];
+
+    const player = {
+        getVideoData: () => ({ video_id: '4Pg9rUF1Raa' }),
+        loadModule: () => {},
+        isSubtitlesOn: () => subsOn,
+        toggleSubtitles: () => { subsOn = !subsOn; },
+        getAudioTrack: () => ({
+            id: 'es-US.10',
+            isAutoDubbed: () => true,
+            getLanguageInfo: () => ({ id: 'es-US.10', isAutoDubbed: true })
+        }),
+        getAvailableAudioTracks: () => [
+            { id: 'es-US.10', isAutoDubbed: () => true, getLanguageInfo: () => ({ id: 'es-US.10', isAutoDubbed: true }) },
+            { id: 'en.4', isAutoDubbed: () => false, getLanguageInfo: () => ({ id: 'en.4', isAutoDubbed: false }) }
+        ],
+        getOption: () => undefined,
+        setOption: (...args) => setOptionCalls.push(args),
+        getPlayerResponse: () => ({
+            captions: {
+                playerCaptionsTracklistRenderer: {
+                    captionTracks: [{ languageCode: 'es', kind: 'asr', vssId: 'a.es' }],
+                    translationLanguages: [{ languageCode: 'es', languageName: { simpleText: 'Español' } }]
+                }
+            }
+        })
+    };
+
+    const resOff = await applySmartSubtitles(player, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: '4Pg9rUF1Raa',
+        storage,
+        skipFallbackCheck: true
+    });
+    assert.equal(resOff, false);
+    assert.equal(subsOn, false);
+    assert.equal(setOptionCalls.length, 0);
+
+    // User manually enabled subtitles on the Spanish-dubbed video: preserve them!
+    subsOn = true;
+    store.set('supratube_cc_auto', '0');
+    const resManual = await applySmartSubtitles(player, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: '4Pg9rUF1Raa',
+        storage,
+        skipFallbackCheck: true
+    });
+    assert.equal(resManual, false);
+    assert.equal(subsOn, true);
+
+    // Script had previously auto-enabled subtitles: clean them up when Spanish dub takes effect!
+    store.set('supratube_cc_auto', '1');
+    const resAutoDisable = await applySmartSubtitles(player, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: '4Pg9rUF1Raa',
+        storage,
+        skipFallbackCheck: true
+    });
+    assert.equal(resAutoDisable, true);
+    assert.equal(subsOn, false);
 });

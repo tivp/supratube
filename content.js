@@ -13,7 +13,8 @@
         sponsorBlock: true,
         greenBar: true,
         auto1080p: true,
-        autoSubtitles: true
+        autoSubtitles: true,
+        aiSummary: true
     };
 
     const syncSettingsToPage = (raw, dispatchEvent) => {

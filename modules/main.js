@@ -3,7 +3,8 @@ import { installLayer0AdPrune, injectAdStyles, trySkipAd, dismissEnforcement } f
 import { fetchSponsorSegments, renderGreenProgressBar, tickSponsorBlock } from './sponsorblock.js';
 import { apply1080pQuality } from './quality.js';
 import { resolveUserNativeLang } from './geo-lang.js';
-import { bindManualCaptionListeners, applySmartSubtitles, installTimedtextMonitor, clearFallbackCaptions } from './subtitles.js';
+import { bindManualCaptionListeners, applySmartSubtitles, installTimedtextMonitor, clearFallbackCaptions, detectVideoAudioLang } from './subtitles.js';
+import { createAiSummaryController } from './ai-summary.js';
 
 installLayer0AdPrune(window);
 installTimedtextMonitor(window);
@@ -23,6 +24,8 @@ const S = {
     subsAppliedForVideo: null,
     subsUserTouchedVideo: null,
     _subInFlight: null,
+    _lastAudioLang: null,
+    _aiCtrl: createAiSummaryController({ doc: document, win: window }),
     _player: null,
     _video: null,
     _videoListened: false,
@@ -72,18 +75,25 @@ function clearVideoCache() {
     S.subsAppliedForVideo = null;
     S.subsUserTouchedVideo = null;
     S._subInFlight = null;
+    S._lastAudioLang = null;
 }
 
 function runAdPass() {
     if (!S.settings.adSkip) return;
+    const wasAdActive = Boolean(S.adState.adSpeedActive);
+    const p = getPlayer();
     trySkipAd({
         enabled: true,
-        player: getPlayer(),
+        player: p,
         video: getVideo(),
         state: S.adState,
         doc: document,
         win: window
     });
+    if (wasAdActive && !S.adState.adSpeedActive && !p?.classList?.contains?.('ad-showing')) {
+        apply1080pQuality(p, S.qualityState, S.settings.auto1080p);
+        runSubtitlesForCurrentVideo();
+    }
 }
 
 function scheduleAdSkip() {
@@ -118,7 +128,11 @@ async function runSubtitlesForCurrentVideo() {
         }
         if (getVideoId() !== vid || S.subsUserTouchedVideo === vid) return;
         const activePlayer = getPlayer();
-        if (!activePlayer) return;
+        if (!activePlayer || activePlayer.classList?.contains?.('ad-showing')) return;
+        const activeAudioLang = detectVideoAudioLang({ activeAudioTrack: activePlayer.getAudioTrack?.() });
+        if (activeAudioLang) {
+            S._lastAudioLang = activeAudioLang;
+        }
         const applied = await applySmartSubtitles(activePlayer, {
             enabled: S.settings.autoSubtitles,
             userLang: S.userNativeLang,
@@ -278,6 +292,7 @@ function onNavigate() {
         }
         setupObservers();
         runAdPass();
+        S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: vid });
     }, 350);
 }
 
@@ -320,6 +335,7 @@ function boot() {
                 ensureSBLoop();
             }
         }
+        S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: S.videoId });
     });
 
     document.addEventListener('click', ev => {
@@ -338,6 +354,21 @@ function boot() {
         if (S.settings.sponsorBlock && S.settings.greenBar && S.sbSegments.length && !document.getElementById('supratube-sb-track')) {
             refreshProgressBar();
         }
+        if (S.videoId && S.settings.autoSubtitles && S.subsUserTouchedVideo !== S.videoId) {
+            const p = getPlayer();
+            if (p && !p.classList?.contains?.('ad-showing')) {
+                const liveAudioLang = detectVideoAudioLang({ activeAudioTrack: p.getAudioTrack?.() });
+                if (liveAudioLang && liveAudioLang !== S._lastAudioLang) {
+                    const hadPrev = S._lastAudioLang !== null;
+                    S._lastAudioLang = liveAudioLang;
+                    if (hadPrev) {
+                        S.subsAppliedForVideo = null;
+                        runSubtitlesForCurrentVideo();
+                    }
+                }
+            }
+        }
+        S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: S.videoId });
     }, 800);
 
     const navObs = new MutationObserver(() => {
@@ -354,6 +385,7 @@ function boot() {
         S.sbVideoId = null;
         S.sbSegments = [];
         clearVideoCache();
+        S._aiCtrl.resetForVideo('', false);
     }, { passive: true });
     window.addEventListener('yt-navigate-finish', () => onNavigate(), { passive: true });
     window.addEventListener('yt-page-data-updated', () => onNavigate(), { passive: true });

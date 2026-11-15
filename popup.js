@@ -48,7 +48,7 @@ function mostrarEstado(texto, tipo = '') {
 
 function pintarEstadoGuardado(respuesta) {
     if (!respuesta || !respuesta.ok) {
-        mostrarEstado(respuesta?.error || 'Usando versión local v1.0.0');
+        mostrarEstado(respuesta?.error || 'Usando versión local v1.0.3');
         return;
     }
 
@@ -65,13 +65,13 @@ function pintarEstadoGuardado(respuesta) {
             respuesta.userScriptsActivo ? 'ok' : ''
         );
     } else {
-        mostrarEstado('Usando módulos locales v1.0.0. Pulsa el botón para traer la última versión de GitHub.');
+        mostrarEstado('Usando módulos locales v1.0.3. Pulsa el botón para traer la última versión de GitHub.');
     }
 }
 
 chrome.runtime.sendMessage({ action: 'SUPRATUBE_GET_STATUS' }, respuesta => {
     if (chrome.runtime.lastError) {
-        mostrarEstado('Usando versión local v1.0.0');
+        mostrarEstado('Usando versión local v1.0.3');
         return;
     }
     pintarEstadoGuardado(respuesta);

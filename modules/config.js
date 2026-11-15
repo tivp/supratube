@@ -1,5 +1,5 @@
 export const CFG = Object.freeze({
-    version: '1.0.2',
+    version: '1.0.3',
     sbApi: 'https://sponsor.ajay.app/api/skipSegments',
     sbCacheTTL: 5 * 60 * 1000,
     geoRefreshMs: 24 * 60 * 60 * 1000,
@@ -15,6 +15,7 @@ export const ORDEN_MODULOS = Object.freeze([
     'quality.js',
     'geo-lang.js',
     'subtitles.js',
+    'ai-summary.js',
     'main.js'
 ]);
 
@@ -23,7 +24,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
     sponsorBlock: true,
     greenBar: true,
     auto1080p: true,
-    autoSubtitles: true
+    autoSubtitles: true,
+    aiSummary: true
 });
 
 export const GEO_COOKIE_NAME = 'supratube_geo_lang';
