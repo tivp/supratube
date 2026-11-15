@@ -1005,3 +1005,151 @@ test('applySmartSubtitles launches Layer 2 Whisper bridge on truly uncaptioned v
     assert.ok(cmds.some(c => c.action === 'stop' && c.videoId === 'noSubsVid01'));
     assert.equal(elements.get('supratube-fallback-captions'), undefined);
 });
+
+test('fallback captions sync .ytp-subtitles-button active state, tooltip, and filled icon while active and restore on clear', async () => {
+    const elements = new Map();
+    const origHollowPath = 'M21.20 3.01L21 3H3Z';
+    const makeAttrs = (init = {}) => {
+        const map = { ...init };
+        return {
+            attributesMap: map,
+            setAttribute(k, v) { map[k] = String(v); },
+            getAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null; },
+            hasAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k); },
+            removeAttribute(k) { delete map[k]; }
+        };
+    };
+    const pathEl = { tagName: 'path', ...makeAttrs({ d: origHollowPath, fill: 'white' }) };
+    const svgEl = {
+        tagName: 'svg',
+        ...makeAttrs({ viewBox: '0 0 24 24', width: '24', height: '24' }),
+        querySelector: sel => (sel.includes('path') ? pathEl : null)
+    };
+    const ccBtn = {
+        tagName: 'BUTTON',
+        disabled: true,
+        style: { display: 'none' },
+        dataset: {},
+        ...makeAttrs({
+            class: 'ytp-subtitles-button ytp-button',
+            'aria-pressed': 'false',
+            'aria-disabled': 'true',
+            'aria-label': 'Subtítulos no disponibles',
+            'data-tooltip-title': 'Subtítulos no disponibles',
+            'data-title-no-tooltip': 'Subtítulos no disponibles'
+        }),
+        querySelector(sel) {
+            if (sel.includes('path')) return pathEl;
+            if (sel.includes('svg')) return svgEl;
+            return null;
+        },
+        matches: () => false
+    };
+    let obsCallback = null;
+    let obsDisconnected = false;
+    class FakeMutationObserver {
+        constructor(cb) { obsCallback = cb; }
+        observe() {}
+        disconnect() { obsDisconnected = true; }
+    }
+    const createEl = tag => ({
+        tagName: tag.toUpperCase(),
+        id: '',
+        style: {},
+        dataset: {},
+        children: [],
+        ...makeAttrs(),
+        appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+        remove() {
+            if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(c => c !== this);
+            if (this.id) elements.delete(this.id);
+        },
+        querySelectorAll: () => []
+    });
+    const headChildren = [];
+    const fakeDoc = {
+        head: { appendChild: el => { headChildren.push(el); if (el.id) elements.set(el.id, el); } },
+        documentElement: { dataset: { supratubeWhisperBridge: '1' } },
+        createElement: createEl,
+        getElementById: id => elements.get(id) || null,
+        querySelector: sel => (sel === '.ytp-subtitles-button' ? ccBtn : null),
+        querySelectorAll: () => []
+    };
+    const listeners = {};
+    class FakeCustomEvent {
+        constructor(type, init = {}) { this.type = type; this.detail = init.detail; }
+    }
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/watch?v=ccActiveVid1', pathname: '/watch', origin: 'https://www.youtube.com' },
+        CustomEvent: FakeCustomEvent,
+        MutationObserver: FakeMutationObserver,
+        ytcfg: { get: () => '' },
+        fetch: async () => ({ ok: true, status: 200, text: async () => '{}' }),
+        addEventListener(ev, fn) { (listeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { listeners[ev] = (listeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) { for (const fn of (listeners[ev.type] || [])) fn(ev); }
+    };
+    const videoEl = {
+        currentTime: 1.0,
+        paused: false,
+        setAttribute() {},
+        removeAttribute() {},
+        addEventListener() {},
+        removeEventListener() {}
+    };
+    const fakePlayer = {
+        id: 'movie_player',
+        clientWidth: 1000,
+        isSubtitlesOn: () => false,
+        getVideoData: () => ({ video_id: 'ccActiveVid1' }),
+        querySelector: sel => {
+            if (sel === '.ytp-subtitles-button') return ccBtn;
+            if (sel === 'video') return videoEl;
+            if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+            return null;
+        },
+        querySelectorAll: () => [],
+        appendChild: el => { if (el.id) elements.set(el.id, el); return el; },
+        getOption: () => [],
+        getPlayerResponse: () => ({ videoDetails: { videoId: 'ccActiveVid1' } })
+    };
+
+    await applySmartSubtitles(fakePlayer, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: 'ccActiveVid1',
+        doc: fakeDoc,
+        win: fakeWin
+    });
+    await new Promise(r => setTimeout(r, 35));
+
+    assert.equal(ccBtn.getAttribute('aria-pressed'), 'true');
+    assert.equal(ccBtn.getAttribute('data-supratube-cc-active'), '1');
+    assert.equal(ccBtn.disabled, false);
+    assert.equal(ccBtn.getAttribute('aria-disabled'), null);
+    assert.equal(ccBtn.style.display, '');
+    assert.match(ccBtn.getAttribute('data-tooltip-title') || '', /^Subtítulos IA \(c\)$/);
+    assert.equal(ccBtn.getAttribute('data-title-no-tooltip'), 'Subtítulos IA');
+    assert.notEqual(pathEl.getAttribute('d'), origHollowPath);
+
+    // Simulate YouTube fighting back to overwrite attributes while fallback is active:
+    ccBtn.setAttribute('aria-pressed', 'false');
+    ccBtn.setAttribute('data-tooltip-title', 'Subtítulos no disponibles');
+    ccBtn.setAttribute('aria-disabled', 'true');
+    pathEl.setAttribute('d', origHollowPath);
+    obsCallback?.([]);
+    assert.equal(ccBtn.getAttribute('aria-pressed'), 'true');
+    assert.equal(ccBtn.getAttribute('data-tooltip-title'), 'Subtítulos IA (c)');
+    assert.equal(ccBtn.getAttribute('aria-disabled'), null);
+    assert.notEqual(pathEl.getAttribute('d'), origHollowPath);
+
+    clearFallbackCaptions(fakeDoc, fakeWin);
+    assert.equal(obsDisconnected, true);
+    assert.equal(ccBtn.getAttribute('aria-pressed'), 'false');
+    assert.equal(ccBtn.getAttribute('data-supratube-cc-active'), null);
+    assert.equal(ccBtn.getAttribute('aria-disabled'), 'true');
+    assert.equal(ccBtn.disabled, true);
+    assert.equal(ccBtn.style.display, 'none');
+    assert.equal(ccBtn.getAttribute('data-tooltip-title'), 'Subtítulos no disponibles');
+    assert.equal(pathEl.getAttribute('d'), origHollowPath);
+});

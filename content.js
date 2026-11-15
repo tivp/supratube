@@ -100,6 +100,7 @@
 
     const captureByVideo = new WeakMap();
     let whisperSession = { active: false, videoId: '', video: null, connected: false };
+    let whisperStartSeq = 0;
 
     function disconnectProc(entry) {
         if (!entry) return;
@@ -114,6 +115,7 @@
     }
 
     function stopWhisperCapture(videoId = '') {
+        whisperStartSeq++;
         if (!whisperSession.active) return;
         if (videoId && whisperSession.videoId && videoId !== whisperSession.videoId) return;
         const vid = whisperSession.videoId;
@@ -123,6 +125,19 @@
             disconnectProc(captureByVideo.get(vidEl));
         }
         chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_STOP', videoId: vid }).catch(() => {});
+    }
+
+    async function waitAudioTracks(vidEl, token) {
+        for (let attempt = 0; attempt < 15; attempt++) {
+            if (token !== whisperStartSeq) return [];
+            try {
+                const stream = vidEl.captureStream ? vidEl.captureStream() : vidEl.mozCaptureStream?.();
+                const tracks = stream?.getAudioTracks?.() || [];
+                if (tracks.length) return tracks;
+            } catch {}
+            await new Promise(r => setTimeout(r, 350));
+        }
+        return [];
     }
 
     async function startWhisperCapture({ videoId, targetLang = 'es', manualForce = false }) {
@@ -137,12 +152,18 @@
         if (whisperSession.active && whisperSession.videoId !== videoId) {
             stopWhisperCapture(whisperSession.videoId);
         }
+        const token = ++whisperStartSeq;
 
         let entry = captureByVideo.get(vidEl);
         if (!entry) {
-            const stream = vidEl.captureStream ? vidEl.captureStream() : vidEl.mozCaptureStream?.();
-            const aTracks = stream?.getAudioTracks?.() || [];
-            if (!aTracks.length) return;
+            const aTracks = await waitAudioTracks(vidEl, token);
+            if (token !== whisperStartSeq) return;
+            if (!aTracks.length) {
+                window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
+                    detail: { kind: 'error', videoId, error: 'no audio track' }
+                }));
+                return;
+            }
 
             const Ctx = window.AudioContext || window.webkitAudioContext;
             if (!Ctx) return;
@@ -152,7 +173,7 @@
             const mute = ctx.createGain();
             mute.gain.value = 0;
             mute.connect(ctx.destination);
-            entry = { ctx, src, proc, mute, connected: false, boundSeek: false };
+            entry = { ctx, src, proc, mute, connected: false, boundSeek: false, boundPlay: false };
             captureByVideo.set(vidEl, entry);
         }
 
@@ -165,9 +186,19 @@
             }, { passive: true });
         }
 
+        if (!entry.boundPlay) {
+            entry.boundPlay = true;
+            vidEl.addEventListener('play', () => {
+                if (whisperSession.active && whisperSession.video === vidEl && entry.ctx.state === 'suspended') {
+                    entry.ctx.resume().catch(() => {});
+                }
+            }, { passive: true });
+        }
+
         if (entry.ctx.state === 'suspended') {
             await entry.ctx.resume().catch(() => {});
         }
+        if (token !== whisperStartSeq) return;
 
         const startRes = await new Promise(resolve => {
             chrome.runtime.sendMessage(
@@ -175,6 +206,7 @@
                 r => resolve(chrome.runtime.lastError ? { ok: false } : (r || { ok: false }))
             );
         });
+        if (token !== whisperStartSeq) return;
         if (!startRes?.ok) {
             window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
                 detail: { kind: 'error', videoId, error: startRes?.error || 'offscreen unavailable' }

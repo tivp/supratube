@@ -28,7 +28,7 @@ const S = {
     settings: readBridgeSettings(document),
     videoId: null,
     lastUrl: typeof location !== 'undefined' ? location.href : '',
-    adState: { adSpeedActive: false, prevVolume: 1 },
+    adState: { adSpeedActive: false, wasAdShowing: false, prevVolume: 1 },
     sbState: { lastSkippedUuid: null, mutedSegUuid: null, prevVolume: 1 },
     sbSegments: [],
     sbVideoId: null,
@@ -95,6 +95,7 @@ function clearVideoCache() {
     S._video = null;
     S._videoListened = false;
     S.adState.adSpeedActive = false;
+    S.adState.wasAdShowing = false;
     S.qualityState.manualOverride = false;
     S.qualityState.lastFormatId = null;
     S.subsAppliedForVideo = null;
@@ -105,8 +106,10 @@ function clearVideoCache() {
 
 function runAdPass() {
     if (!S.settings.adSkip) return;
-    const wasAdActive = Boolean(S.adState.adSpeedActive);
+    const wasAdActive = Boolean(S.adState.adSpeedActive || S.adState.wasAdShowing);
     const p = getPlayer();
+    const isAdShowingNow = Boolean(p?.classList?.contains?.('ad-showing') || p?.classList?.contains?.('ad-interrupting'));
+    S.adState.wasAdShowing = isAdShowingNow;
     trySkipAd({
         enabled: true,
         player: p,
@@ -115,7 +118,7 @@ function runAdPass() {
         doc: document,
         win: window
     });
-    if (wasAdActive && !S.adState.adSpeedActive && !p?.classList?.contains?.('ad-showing')) {
+    if (wasAdActive && !S.adState.adSpeedActive && !p?.classList?.contains?.('ad-showing') && !p?.classList?.contains?.('ad-interrupting')) {
         apply1080pQuality(p, S.qualityState, S.settings.auto1080p);
         runSubtitlesForCurrentVideo();
     }
@@ -153,7 +156,7 @@ async function runSubtitlesForCurrentVideo() {
         }
         if (getVideoId() !== vid || S.subsUserTouchedVideo === vid) return;
         const activePlayer = getPlayer();
-        if (!activePlayer || activePlayer.classList?.contains?.('ad-showing')) return;
+        if (!activePlayer || activePlayer.classList?.contains?.('ad-showing') || activePlayer.classList?.contains?.('ad-interrupting')) return;
         const activeAudioLang = detectVideoAudioLang({ activeAudioTrack: activePlayer.getAudioTrack?.() });
         if (activeAudioLang) {
             S._lastAudioLang = activeAudioLang;
@@ -335,30 +338,32 @@ function boot() {
             return;
         }
         const p = getPlayer();
-        const tracks = p?.getOption?.('captions', 'tracklist', { includeAsr: true });
-        if (vid && p && !p.isSubtitlesOn?.() && (!Array.isArray(tracks) || !tracks.length) && S.settings.autoSubtitles) {
-            S.subsUserTouchedVideo = vid;
-            Promise.resolve(S.userNativeLang || resolveUserNativeLang())
-                .then(lang => {
-                    S.userNativeLang = lang;
-                    if (getVideoId() !== vid) return;
-                    return applySmartSubtitles(p, {
-                        enabled: S.settings.autoSubtitles,
-                        userLang: lang,
-                        expectedVideoId: vid,
-                        doc: document,
-                        win: window,
-                        gmRequestFn: gmRequest,
-                        manualForce: true
-                    });
-                })
-                .catch(() => {});
-            return;
-        }
+        const wasNativeOn = Boolean(p?.isSubtitlesOn?.());
         S.subsUserTouchedVideo = vid;
         setTimeout(() => {
+            if (getVideoId() !== vid) return;
             const curPlayer = getPlayer();
-            if (curPlayer && typeof curPlayer.isSubtitlesOn === 'function' && !curPlayer.isSubtitlesOn()) {
+            if (!curPlayer) return;
+            const nowOn = Boolean(curPlayer.isSubtitlesOn?.());
+            if (!wasNativeOn && !nowOn && vid && S.settings.autoSubtitles) {
+                Promise.resolve(S.userNativeLang || resolveUserNativeLang())
+                    .then(lang => {
+                        S.userNativeLang = lang;
+                        if (getVideoId() !== vid) return;
+                        return applySmartSubtitles(curPlayer, {
+                            enabled: S.settings.autoSubtitles,
+                            userLang: lang,
+                            expectedVideoId: vid,
+                            doc: document,
+                            win: window,
+                            gmRequestFn: gmRequest,
+                            manualForce: true
+                        });
+                    })
+                    .catch(() => {});
+                return;
+            }
+            if (typeof curPlayer.isSubtitlesOn === 'function' && !nowOn) {
                 clearFallbackCaptions(document, window);
             }
         }, 60);
@@ -379,6 +384,7 @@ function boot() {
                 v.muted = false;
                 v.volume = S.adState.prevVolume;
                 S.adState.adSpeedActive = false;
+                S.adState.wasAdShowing = false;
             }
         }
         refreshProgressBar();

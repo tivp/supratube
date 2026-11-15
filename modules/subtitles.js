@@ -335,6 +335,7 @@ function getFallbackCtrl(win) {
             forceOverlay: false,
             whisperVid: null,
             stopWhisper: null,
+            ccUi: null,
             sameLangVideos: new Set(),
             stopLoop: null,
             watchdogTimer: null,
@@ -1009,6 +1010,156 @@ function ensureFallbackBox(player, doc, win) {
     return box;
 }
 
+const CC_ACTIVE_STYLE_ID = 'supratube-cc-active-style';
+const FILLED_CC_SVG_PATH =
+    'M21 3H3C2.46 3 1.96 3.21 1.58 3.58C1.21 3.96 1 4.46 1 5V19C1 19.53 1.21 20.03 1.58 20.41C1.96 20.78 2.46 21 3 21H21C21.53 21 22.03 20.78 22.41 20.41C22.78 20.03 23 19.53 23 19V5C23 4.46 22.78 3.96 22.41 3.58C22.03 3.21 21.53 3 21 3ZM6 11H8C8.26 11 8.51 11.10 8.70 11.29C8.89 11.48 9 11.73 9 12C9 12.26 8.89 12.51 8.70 12.70C8.51 12.89 8.26 13 8 13H6C5.73 13 5.48 12.89 5.29 12.70C5.10 12.51 5 12.26 5 12C5 11.73 5.10 11.48 5.29 11.29C5.48 11.10 5.73 11 6 11ZM12 11H18C18.26 11 18.51 11.10 18.70 11.29C18.89 11.48 19 11.73 19 12C19 12.26 18.89 12.51 18.70 12.70C18.51 12.89 18.26 13 18 13H12C11.73 13 11.48 12.89 11.29 12.70C11.10 12.51 11 12.26 11 12C11 11.73 11.10 11.48 11.29 11.29C11.48 11.10 11.73 11 12 11ZM16 15H18C18.26 15 18.51 15.10 18.70 15.29C18.89 15.48 19 15.73 19 16C19 16.26 18.89 16.51 18.70 16.70C18.51 16.89 18.26 17 18 17H16C15.73 17 15.48 16.89 15.29 16.70C15.10 16.51 15 16.26 15 16C15 15.73 15.10 15.48 15.29 15.29C15.48 15.10 15.73 15 16 15ZM6 15H12C12.26 15 12.51 15.10 12.70 15.29C12.89 15.48 13 15.73 13 16C13 16.26 12.89 16.51 12.70 16.70C12.51 16.89 12.26 17 12 17H6C5.73 17 5.48 16.89 5.29 16.70C5.10 16.51 5 16.26 5 16C5 15.73 5.10 15.48 5.29 15.29C5.48 15.10 5.73 15 6 15Z';
+const CC_TRACKED_ATTRS = ['aria-pressed', 'aria-disabled', 'aria-label', 'data-tooltip-title', 'data-title-no-tooltip'];
+
+function ensureCcActiveStyle(doc) {
+    if (!doc?.createElement) return;
+    if (doc.getElementById?.(CC_ACTIVE_STYLE_ID)) return;
+    const target = doc.head || doc.documentElement;
+    if (!target?.appendChild) return;
+    const style = doc.createElement('style');
+    style.id = CC_ACTIVE_STYLE_ID;
+    style.textContent = [
+        '.ytp-subtitles-button[data-supratube-cc-active="1"] { opacity: 1 !important; pointer-events: auto !important; cursor: pointer !important; }',
+        '.ytp-subtitles-button[data-supratube-cc-active="1"] svg, .ytp-subtitles-button[data-supratube-cc-active="1"] path { opacity: 1 !important; }'
+    ].join('\n');
+    target.appendChild(style);
+}
+
+function findFallbackCcButton(player, doc) {
+    return player?.querySelector?.('.ytp-subtitles-button') || doc?.querySelector?.('.ytp-subtitles-button') || null;
+}
+
+function applyCcActiveAttrs(ui, doc) {
+    if (!ui?.active || !ui.ccBtn || ui.suppressObs) return;
+    const { ccBtn } = ui;
+    ui.suppressObs = true;
+    try {
+        const label = ui.mode === 'whisper' ? 'Subtítulos IA' : 'Subtítulos';
+        const tooltip = `${label} (c)`;
+        const setIfDiff = (k, v) => {
+            if (ccBtn.getAttribute?.(k) !== v) ccBtn.setAttribute?.(k, v);
+        };
+        setIfDiff('data-supratube-cc-active', '1');
+        setIfDiff('aria-pressed', 'true');
+        setIfDiff('aria-label', tooltip);
+        setIfDiff('data-tooltip-title', tooltip);
+        setIfDiff('data-title-no-tooltip', label);
+        if (ccBtn.hasAttribute?.('aria-disabled') || ccBtn.getAttribute?.('aria-disabled') !== null) {
+            ccBtn.removeAttribute?.('aria-disabled');
+        }
+        if (ccBtn.disabled) ccBtn.disabled = false;
+        if (ccBtn.hasAttribute?.('disabled')) ccBtn.removeAttribute?.('disabled');
+        if (ccBtn.style?.display === 'none') ccBtn.style.display = '';
+
+        const svg = ccBtn.querySelector?.('svg');
+        const path = ccBtn.querySelector?.('svg path');
+        if (svg?.getAttribute?.('viewBox') === '0 0 24 24' && path) {
+            if (ui.origPathD === null) ui.origPathD = path.getAttribute?.('d') ?? null;
+            if (path.getAttribute?.('d') !== FILLED_CC_SVG_PATH) {
+                path.setAttribute?.('d', FILLED_CC_SVG_PATH);
+            }
+        }
+        if (ccBtn.matches?.(':hover')) {
+            const tt = doc?.querySelector?.('.ytp-tooltip-text');
+            if (tt && /subt[ií]tulos no disponibles|captions unavailable|subtitles.*unavailable/i.test(String(tt.textContent || ''))) {
+                tt.textContent = label;
+            }
+        }
+    } finally {
+        ui.suppressObs = false;
+    }
+}
+
+function restoreFallbackCcButton(win) {
+    const ctrl = getFallbackCtrl(win);
+    const ui = ctrl.ccUi;
+    if (!ui) return;
+    ctrl.ccUi = null;
+    ui.active = false;
+    ui.suppressObs = true;
+    try {
+        try { ui.observer?.disconnect?.(); } catch {}
+        const { ccBtn } = ui;
+        if (!ccBtn) return;
+        ccBtn.removeAttribute?.('data-supratube-cc-active');
+        for (const attr of CC_TRACKED_ATTRS) {
+            const prev = ui.origAttrs[attr];
+            if (prev === null || prev === undefined) ccBtn.removeAttribute?.(attr);
+            else ccBtn.setAttribute?.(attr, prev);
+        }
+        ccBtn.disabled = Boolean(ui.origDisabled);
+        if (ui.origDisabled) ccBtn.setAttribute?.('disabled', '');
+        if (ccBtn.style) ccBtn.style.display = ui.origDisplay;
+        if (ui.origPathD !== null) {
+            const path = ccBtn.querySelector?.('svg path');
+            if (path) path.setAttribute?.('d', ui.origPathD);
+        }
+    } finally {
+        ui.suppressObs = false;
+    }
+}
+
+function setFallbackCcActive(player, doc, win, mode = 'layer1') {
+    const ccBtn = findFallbackCcButton(player, doc);
+    if (!ccBtn) return;
+    const ctrl = getFallbackCtrl(win);
+    if (ctrl.ccUi && ctrl.ccUi.ccBtn !== ccBtn) {
+        restoreFallbackCcButton(win);
+    }
+    if (!ctrl.ccUi) {
+        const nativelyActive =
+            ccBtn.getAttribute?.('aria-pressed') === 'true' &&
+            !ccBtn.disabled &&
+            ccBtn.getAttribute?.('aria-disabled') !== 'true' &&
+            ccBtn.style?.display !== 'none' &&
+            !/no disponibles|unavailable/i.test(
+                `${ccBtn.getAttribute?.('aria-label') || ''} ${ccBtn.getAttribute?.('data-tooltip-title') || ''}`
+            );
+        if (nativelyActive) return;
+
+        ensureCcActiveStyle(doc);
+        const origAttrs = {};
+        for (const attr of CC_TRACKED_ATTRS) {
+            origAttrs[attr] = ccBtn.getAttribute?.(attr) ?? null;
+        }
+        const svg = ccBtn.querySelector?.('svg');
+        const path = ccBtn.querySelector?.('svg path');
+        const ui = {
+            ccBtn,
+            origAttrs,
+            origDisabled: Boolean(ccBtn.disabled),
+            origDisplay: ccBtn.style?.display ?? '',
+            origPathD: (svg?.getAttribute?.('viewBox') === '0 0 24 24' && path) ? (path.getAttribute?.('d') ?? null) : null,
+            observer: null,
+            suppressObs: false,
+            active: true,
+            mode
+        };
+        if (typeof win?.MutationObserver === 'function') {
+            try {
+                ui.observer = new win.MutationObserver(() => {
+                    if (ui.active && !ui.suppressObs) applyCcActiveAttrs(ui, doc);
+                });
+                ui.observer.observe(ccBtn, {
+                    attributes: true,
+                    attributeFilter: [...CC_TRACKED_ATTRS, 'disabled', 'style'],
+                    childList: true,
+                    subtree: true
+                });
+            } catch {}
+        }
+        ctrl.ccUi = ui;
+    } else {
+        ctrl.ccUi.mode = mode;
+        ctrl.ccUi.active = true;
+    }
+    applyCcActiveAttrs(ctrl.ccUi, doc);
+}
+
 /** Hide and remove the fallback caption overlay and tear down its sync loop or Whisper session. */
 export function clearFallbackCaptions(doc = typeof document !== 'undefined' ? document : null, win = typeof window !== 'undefined' ? window : null) {
     const ctrl = getFallbackCtrl(win);
@@ -1017,6 +1168,7 @@ export function clearFallbackCaptions(doc = typeof document !== 'undefined' ? do
     ctrl.activeVid = null;
     ctrl.inflightVid = null;
     ctrl.forceOverlay = false;
+    restoreFallbackCcButton(win);
     if (typeof ctrl.stopWhisper === 'function') {
         try { ctrl.stopWhisper(); } catch {}
         ctrl.stopWhisper = null;
@@ -1052,6 +1204,7 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
         try { ctrl.stopLoop(); } catch {}
     }
     ctrl.activeVid = videoId;
+    setFallbackCcActive(player, doc, win, 'layer1');
 
     const renderTick = () => {
         if (ctrl.activeVid !== videoId) return;
@@ -1063,6 +1216,9 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
         if (!ctrl.forceOverlay && typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn() === false) {
             clearFallbackCaptions(doc, win);
             return;
+        }
+        if (!ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
+            setFallbackCcActive(player, doc, win, 'layer1');
         }
         const box = ensureFallbackBox(player, doc, win);
         if (!box) return;
@@ -1127,6 +1283,7 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
     ctrl.whisperVid = videoId;
     ctrl.forceOverlay = true;
     video?.setAttribute?.('data-supratube-whisper-target', videoId);
+    setFallbackCcActive(player, doc, win, 'whisper');
 
     let fadeTimer = null;
     const showLine = (text, autoFadeMs = 0) => {
@@ -1158,6 +1315,9 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
         if (d.videoId && d.videoId !== videoId) return;
         if (ctrl.whisperVid !== videoId) return;
 
+        if (!ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
+            setFallbackCcActive(player, doc, win, 'whisper');
+        }
         if (d.kind === 'same_language' && !manualForce) {
             ctrl.sameLangVideos.add(videoId);
             clearFallbackCaptions(doc, win);
