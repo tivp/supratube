@@ -1476,7 +1476,7 @@ test('resolveUserNativeLang uses fresh cookie without network and falls back acr
         cookieStr: '',
         requestFn: async url => {
             calls++;
-            if (url.includes('ipapi.co')) return { status: 429, text: '' };
+            if (url.includes('ipapi.co/')) return { status: 429, text: '' };
             if (url.includes('freeipapi.com')) {
                 return { status: 200, text: JSON.stringify({ countryCode: 'CL', languages: ['es'], ipAddress: '9.9.9.9' }) };
             }
