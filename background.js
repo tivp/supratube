@@ -351,8 +351,9 @@ async function actualizarScriptsDesdeGithub({ recargarLegado = false } = {}) {
     const mensajeCommit = String(commitData.commit?.message || 'Actualización').split('\n')[0].trim();
     const fechaCommit = commitData.commit?.author?.date || '';
 
+    const rawBase = sha ? `${REPO_RAW_BASE.replace(/\/main$/, '')}/${encodeURIComponent(sha)}` : REPO_RAW_BASE;
     const nonce = Date.now();
-    const resConfig = await fetch(`${REPO_RAW_BASE}/modules/config.js?t=${nonce}`, { cache: 'no-store' });
+    const resConfig = await fetch(`${rawBase}/modules/config.js?t=${nonce}`, { cache: 'no-store' });
     if (!resConfig.ok) {
         throw new Error(`Error al bajar modules/config.js (HTTP ${resConfig.status})`);
     }
@@ -387,7 +388,7 @@ async function actualizarScriptsDesdeGithub({ recargarLegado = false } = {}) {
         listaModulos
             .filter(nombre => nombre !== 'config.js')
             .map(async nombre => {
-                const url = `${REPO_RAW_BASE}/modules/${nombre}?t=${nonce}`;
+                const url = `${rawBase}/modules/${nombre}?t=${nonce}`;
                 const resp = await fetch(url, { cache: 'no-store' });
                 if (!resp.ok) {
                     throw new Error(`Error al bajar modules/${nombre} (HTTP ${resp.status})`);

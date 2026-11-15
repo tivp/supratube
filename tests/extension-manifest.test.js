@@ -177,6 +177,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
     const reloadedTabs = [];
     const scriptedInjections = [];
     const executedCodes = [];
+    const fetchedUrls = [];
     let modernTeardownCount = 0;
 
     // Tab 1: Modern tab (>= v1.0.10) with dead content bridge -> repairs bridge + runs with __supratubeForceReinit
@@ -300,6 +301,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
             }
         },
         fetch: async url => {
+            fetchedUrls.push(url);
             if (url.includes('/commits/main')) {
                 return { ok: true, json: async () => ({ sha: 'sha_new', commit: { message: 'fix: hot reinit' } }) };
             }
@@ -321,6 +323,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
     const result = await sandbox.actualizarScriptsDesdeGithub();
     assert.equal(result.ok, true);
     assert.equal(result.pestanasActualizadas, 2);
+    assert.ok(fetchedUrls.some(u => u.includes('/sha_new/modules/config.js')));
 
     // Dead bridge on tab 101 must have been repaired by re-injecting page-hook.js + content.js
     assert.ok(scriptedInjections.some(s => s.tabId === 101 && s.files.includes('content.js')));
@@ -361,6 +364,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
             }
         },
         fetch: async url => {
+            fetchedUrls.push(url);
             if (url.includes('/commits/main')) {
                 return { ok: true, json: async () => ({ sha: 'sha_old_109', commit: { message: 'v1.0.9' } }) };
             }
