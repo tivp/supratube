@@ -13,8 +13,8 @@
    - Se eliminan por completo el botón flotante (`#et4_tog`), el panel flotante (`#et4_panel`), las notificaciones toast (`#et4_toast`) y el botón de descarga externa del script base `yotube 1.txt`.
    - Toda la automatización corre en segundo plano desde `document_start` en el mundo `MAIN` de la página (`www.youtube.com` y `m.youtube.com`).
    - La **única** adición visual sobre YouTube son los marcadores verdes sobre la barra de progreso del reproductor que indican dónde están los anuncios/patrocinios dentro del video.
-2. **Popup de Chrome estilo `Maximus` / `chan2txt`:**
-   - Conserva la estética limpia y el logo Transformer (`Transfomer Logo.png` / `Transfomer Logo.svg`).
+2. **Popup de Chrome estilo `Maximus` / `chan2txt` con ícono de YouTube de cristal:**
+   - Conserva la estética limpia de `Maximus` / `chan2txt`, reemplazando el logo Transformer por un ícono de YouTube hecho de cristal (`icons/icon-16.png`, `icons/icon-48.png`, `icons/icon-128.png`) tanto en `manifest.json` como en la cabecera de `popup.html`.
    - Muestra el estado de sincronización y el botón **Actualizar los scripts de la extensión** (contra `tivp/supratube`) + botón **Activar permiso UserScripts en Chrome** si el permiso aún no está habilitado.
    - Incluye switches simples por función (todos activados por defecto: Ad Skip, Barra Verde / SponsorBlock, Auto 1080p, Subtítulos automáticos por IP) persistidos en `chrome.storage.local` y sincronizados hacia el mundo `MAIN` vía `content.js`.
 
