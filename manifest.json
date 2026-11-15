@@ -1,0 +1,75 @@
+{
+    "manifest_version": 3,
+    "name": "Supratube | Maximus",
+    "version": "1.0.0",
+    "description": "YouTube sin anuncios, 1080p/Premium automático, barra verde SponsorBlock y subtítulos inteligentes según tu idioma por IP.",
+    "author": "tivp",
+    "icons": {
+        "16": "icons/icon-16.png",
+        "48": "icons/icon-48.png",
+        "128": "icons/icon-128.png"
+    },
+    "action": {
+        "default_popup": "popup.html",
+        "default_icon": "icons/icon-128.png",
+        "default_title": "Supratube | Maximus"
+    },
+    "permissions": [
+        "storage",
+        "scripting",
+        "tabs",
+        "userScripts"
+    ],
+    "host_permissions": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*",
+        "https://youtube.com/*",
+        "https://sponsor.ajay.app/*",
+        "https://ipapi.co/*",
+        "https://freeipapi.com/*",
+        "https://ipwho.is/*",
+        "https://api.country.is/*",
+        "https://raw.githubusercontent.com/*",
+        "https://api.github.com/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "https://www.youtube.com/*",
+                "https://m.youtube.com/*"
+            ],
+            "js": [
+                "page-hook.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "https://www.youtube.com/*",
+                "https://m.youtube.com/*"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "run_at": "document_start",
+            "all_frames": false
+        }
+    ],
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "modules/*.js",
+                "icons/*.png"
+            ],
+            "matches": [
+                "https://www.youtube.com/*",
+                "https://m.youtube.com/*"
+            ]
+        }
+    ]
+}

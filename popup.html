@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>Supratube | Maximus</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 14px 16px;
+            width: 315px;
+            background: #f8fafc;
+            color: #1e293b;
+            font: 13px/1.45 Arial, sans-serif;
+        }
+        .cabecera {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #cbd5e1;
+            margin-bottom: 10px;
+        }
+        .cabecera img {
+            width: 34px;
+            height: 34px;
+            object-fit: contain;
+        }
+        .titulo {
+            font-weight: 700;
+            font-size: 15px;
+            color: #0f172a;
+        }
+        .version {
+            font-size: 11px;
+            color: #64748b;
+        }
+        .controles {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin: 8px 0;
+        }
+        .toggle-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 6px 8px;
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 5px;
+            font-size: 12px;
+            color: #334155;
+            cursor: pointer;
+            user-select: none;
+        }
+        .toggle-row:hover {
+            border-color: #cbd5e1;
+        }
+        .toggle-row input {
+            accent-color: #dc2626;
+            width: 15px;
+            height: 15px;
+            cursor: pointer;
+        }
+        .nota {
+            margin-top: 8px;
+            padding: 7px 9px;
+            background: #e2e8f0;
+            border-radius: 4px;
+            font-size: 11px;
+            color: #334155;
+        }
+        .actualizacion-box {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #cbd5e1;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .btn-actualizar {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #1e3a5f;
+            border-radius: 5px;
+            background: #26394b;
+            color: #ffffff;
+            font: 700 12px Arial, sans-serif;
+            cursor: pointer;
+            transition: background-color 0.15s, opacity 0.15s;
+        }
+        .btn-actualizar:hover:not(:disabled) {
+            background: #1a2937;
+        }
+        .btn-actualizar:disabled {
+            opacity: 0.65;
+            cursor: wait;
+        }
+        .btn-permiso {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid #d97706;
+            border-radius: 4px;
+            background: #fef3c7;
+            color: #92400e;
+            font: 600 11px Arial, sans-serif;
+            cursor: pointer;
+        }
+        .btn-permiso:hover {
+            background: #fde68a;
+        }
+        .estado-sync {
+            padding: 6px 8px;
+            border-radius: 4px;
+            background: #ffffff;
+            border: 1px solid #cbd5e1;
+            font-size: 11px;
+            color: #475569;
+            word-break: break-word;
+        }
+        .estado-sync.ok {
+            background: #ecfdf5;
+            border-color: #34d399;
+            color: #065f46;
+        }
+        .estado-sync.error {
+            background: #fef2f2;
+            border-color: #f87171;
+            color: #991b1b;
+        }
+        .repo-link {
+            font-size: 11px;
+            color: #2563eb;
+            text-decoration: none;
+            align-self: flex-start;
+        }
+        .repo-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="cabecera">
+        <img src="icons/icon-48.png" alt="Supratube">
+        <div>
+            <div class="titulo">Supratube</div>
+            <div class="version">Maximus Motor · v1.0.0</div>
+        </div>
+    </div>
+    <div class="controles">
+        <label class="toggle-row">
+            <span>Saltar y bloquear anuncios</span>
+            <input type="checkbox" data-setting="adSkip" checked>
+        </label>
+        <label class="toggle-row">
+            <span>Saltar patrocinadores (SponsorBlock)</span>
+            <input type="checkbox" data-setting="sponsorBlock" checked>
+        </label>
+        <label class="toggle-row">
+            <span>Barra de navegación verde</span>
+            <input type="checkbox" data-setting="greenBar" checked>
+        </label>
+        <label class="toggle-row">
+            <span>Calidad 1080p / Premium automática</span>
+            <input type="checkbox" data-setting="auto1080p" checked>
+        </label>
+        <label class="toggle-row">
+            <span>Subtítulos automáticos por IP</span>
+            <input type="checkbox" data-setting="autoSubtitles" checked>
+        </label>
+    </div>
+    <div class="nota">
+        100% silencioso en YouTube: cero iconos o paneles flotantes sobre el reproductor.
+    </div>
+    <div class="actualizacion-box">
+        <button id="btn-actualizar-scripts" class="btn-actualizar" type="button">
+            Actualizar los scripts de la extensión
+        </button>
+        <div id="estado-actualizacion" class="estado-sync">
+            Comprobando estado...
+        </div>
+        <button id="btn-permiso-userscripts" class="btn-permiso" type="button" hidden>
+            Activar permiso UserScripts en Chrome
+        </button>
+        <a class="repo-link" href="https://github.com/tivp/supratube" target="_blank" rel="noopener">
+            github.com/tivp/supratube
+        </a>
+    </div>
+    <script type="module" src="popup.js"></script>
+</body>
+</html>
