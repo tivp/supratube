@@ -93,3 +93,80 @@ test('legacy 9-module v1.0.3 GitHub auto-update bundle still provides createTran
     });
     assert.equal(typeof factory, 'function');
 });
+
+test('compileBundle skips duplicate normal run but honors __supratubeForceReinit and invokes __supratubeTeardown', () => {
+    const map = {};
+    for (const name of ORDEN_MODULOS) {
+        map[name] = fs.readFileSync(path.resolve('modules', name), 'utf8');
+    }
+    const bundled = compileBundle(map);
+
+    let tornDown = 0;
+    let fakeBootMarker = false;
+    const noop = () => {};
+    const fakeEl = { dataset: {}, appendChild: noop, querySelector: () => null, querySelectorAll: () => [], remove: noop };
+    const fakeDoc = {
+        readyState: 'loading',
+        documentElement: fakeEl,
+        head: fakeEl,
+        body: fakeEl,
+        cookie: '',
+        addEventListener: noop,
+        removeEventListener: noop,
+        getElementById: () => null,
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        createElement: () => ({ style: {}, setAttribute: noop, appendChild: noop })
+    };
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/', pathname: '/', search: '' },
+        navigator: { language: 'es-419' },
+        fetch: async () => ({ ok: true, json: async () => ({}), text: async () => '' }),
+        Response: function() {},
+        XMLHttpRequest: { prototype: {} },
+        document: fakeDoc,
+        addEventListener: noop,
+        removeEventListener: noop,
+        setTimeout: () => 1,
+        clearTimeout: noop,
+        setInterval: () => 1,
+        clearInterval: noop,
+        URL,
+        __supratubeEjecutado: true,
+        __supratubeTeardown: () => {
+            tornDown++;
+            fakeWin.__supratubeEjecutado = false;
+        }
+    };
+    const ctx = {
+        window: fakeWin,
+        document: fakeDoc,
+        navigator: fakeWin.navigator,
+        location: fakeWin.location,
+        fetch: fakeWin.fetch,
+        XMLHttpRequest: fakeWin.XMLHttpRequest,
+        Response: fakeWin.Response,
+        Event: class {},
+        CustomEvent: class {},
+        AbortController,
+        MutationObserver: class { observe() {} disconnect() {} },
+        setTimeout: fakeWin.setTimeout,
+        clearTimeout: fakeWin.clearTimeout,
+        setInterval: fakeWin.setInterval,
+        clearInterval: fakeWin.clearInterval,
+        URL
+    };
+
+    // Normal duplicate injection while already active MUST no-op.
+    vm.runInNewContext(bundled, ctx);
+    assert.equal(tornDown, 0);
+    assert.equal(typeof fakeWin.__supratubeTeardown, 'function', 'previous spy must remain untouched');
+
+    // Explicit hot-reinit MUST tear down prior instance and reboot cleanly.
+    fakeWin.__supratubeForceReinit = true;
+    vm.runInNewContext(bundled, ctx);
+    fakeBootMarker = fakeWin.__supratubeEjecutado;
+    assert.equal(tornDown, 1);
+    assert.equal(fakeBootMarker, true);
+    assert.equal(fakeWin.__supratubeForceReinit, false);
+});

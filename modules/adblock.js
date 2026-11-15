@@ -67,8 +67,9 @@ export function injectNoAdContextBody(body) {
 let _layer0Installed = false;
 
 export function installLayer0AdPrune(win = typeof window !== 'undefined' ? window : null) {
-    if (!win || _layer0Installed) return;
+    if (!win || _layer0Installed || win.__supratubeLayer0Pruned) return;
     _layer0Installed = true;
+    win.__supratubeLayer0Pruned = true;
 
     try {
         const desc = Object.getOwnPropertyDescriptor(win, 'ytInitialPlayerResponse');
@@ -198,7 +199,7 @@ export function installLayer0AdPrune(win = typeof window !== 'undefined' ? windo
 let _adCssInjected = false;
 
 export function injectAdStyles(doc = typeof document !== 'undefined' ? document : null) {
-    if (_adCssInjected || !doc) return;
+    if (_adCssInjected || !doc || doc.getElementById?.('supratube-ad-css') || doc.documentElement?.dataset?.supratubeAdCss === '1') return;
     const css = `
         ytd-action-companion-ad-renderer, ytd-display-ad-renderer,
         ytd-video-masthead-ad-v3-renderer, ytd-overlay-ad-renderer,
@@ -222,6 +223,7 @@ export function injectAdStyles(doc = typeof document !== 'undefined' ? document 
         if (typeof GM_addStyle === 'function') {
             GM_addStyle(css);
             _adCssInjected = true;
+            if (doc.documentElement?.dataset) doc.documentElement.dataset.supratubeAdCss = '1';
             return;
         }
     } catch {}
@@ -232,6 +234,7 @@ export function injectAdStyles(doc = typeof document !== 'undefined' ? document 
     style.textContent = css;
     target.appendChild(style);
     _adCssInjected = true;
+    if (doc.documentElement?.dataset) doc.documentElement.dataset.supratubeAdCss = '1';
 }
 
 export function isAdPlaying(player) {

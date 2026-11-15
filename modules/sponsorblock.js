@@ -102,7 +102,7 @@ export async function fetchSponsorSegments(videoId, cacheMap = new Map()) {
 let _sbBarCssInjected = false;
 
 export function injectSponsorBarStyles(doc = typeof document !== 'undefined' ? document : null) {
-    if (_sbBarCssInjected || !doc) return;
+    if (_sbBarCssInjected || !doc || doc.getElementById?.('supratube-sb-css') || doc.documentElement?.dataset?.supratubeSbCss === '1') return;
     const css = `
         #supratube-sb-track {
             position: absolute;
@@ -148,6 +148,7 @@ export function injectSponsorBarStyles(doc = typeof document !== 'undefined' ? d
         if (typeof GM_addStyle === 'function') {
             GM_addStyle(css);
             _sbBarCssInjected = true;
+            if (doc.documentElement?.dataset) doc.documentElement.dataset.supratubeSbCss = '1';
             return;
         }
     } catch {}
@@ -158,6 +159,7 @@ export function injectSponsorBarStyles(doc = typeof document !== 'undefined' ? d
     style.textContent = css;
     target.appendChild(style);
     _sbBarCssInjected = true;
+    if (doc.documentElement?.dataset) doc.documentElement.dataset.supratubeSbCss = '1';
 }
 
 export function renderGreenProgressBar(segments, duration, doc = typeof document !== 'undefined' ? document : null, enabled = true) {

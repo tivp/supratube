@@ -12,7 +12,7 @@ export function compileBundle(mapaModulos) {
         return `// --- ${nombre} ---\n${codigo.trim()}`;
     });
 
-    return `(() => {\n'use strict';\nif (window.__supratubeEjecutado) return;\nwindow.__supratubeEjecutado = true;\n\n${bloques.join('\n\n')}\n})();\n`;
+    return `(() => {\n'use strict';\nif (window.__supratubeEjecutado && !window.__supratubeForceReinit) return;\nif (typeof window.__supratubeTeardown === 'function') {\n    try { window.__supratubeTeardown(); } catch {}\n}\nwindow.__supratubeForceReinit = false;\nwindow.__supratubeEjecutado = true;\n\n${bloques.join('\n\n')}\n})();\n`;
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));

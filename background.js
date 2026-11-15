@@ -8,7 +8,7 @@ const SYNC_CHECK_KEY = 'supratube_last_sync_check';
 const AUTO_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 const USER_SCRIPT_ID = 'supratube-github-bundle';
 const MATCHES_YOUTUBE = ['https://www.youtube.com/*', 'https://m.youtube.com/*'];
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.9';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.10';
 
 const ORDEN_MODULOS = [
     'config.js',
@@ -40,6 +40,21 @@ function tieneSoporteUserScripts() {
     return typeof chrome.userScripts !== 'undefined' && typeof chrome.userScripts.register === 'function';
 }
 
+function parseVersionDesdeConfig(codigoConfig) {
+    const match = String(codigoConfig || '').match(/version\s*:\s*['"](\d+\.\d+\.\d+)['"]/);
+    return match ? match[1] : '';
+}
+
+function compararSemver(a, b) {
+    const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
+    const pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length, 3); i++) {
+        const diff = (pa[i] || 0) - (pb[i] || 0);
+        if (diff !== 0) return diff > 0 ? 1 : -1;
+    }
+    return 0;
+}
+
 function parseOrdenModulosDesdeConfig(codigoConfig) {
     const match = String(codigoConfig || '').match(/ORDEN_MODULOS\s*=\s*(?:Object\.freeze\s*\(\s*)?\[([\s\S]*?)\]/);
     if (!match) return ORDEN_MODULOS.slice();
@@ -62,6 +77,10 @@ function esCacheValido(cache) {
     if (cache.extVersion !== EXT_VERSION) {
         return false;
     }
+    const cacheModVersion = parseVersionDesdeConfig(cache.modulos?.['config.js']);
+    if (cacheModVersion && compararSemver(cacheModVersion, EXT_VERSION) < 0) {
+        return false;
+    }
     if (!cache.modulos || typeof cache.modulos !== 'object') {
         return false;
     }
@@ -78,7 +97,7 @@ function compilarBundleDesdeModulos(mapaModulos, listaOrden = ORDEN_MODULOS) {
         return `// --- ${nombre} ---\n${codigo.trim()}`;
     });
 
-    return `(() => {\n'use strict';\nif (window.__supratubeEjecutado) return;\nwindow.__supratubeEjecutado = true;\n\n${bloques.join('\n\n')}\n})();\n`;
+    return `(() => {\n'use strict';\nif (window.__supratubeEjecutado && !window.__supratubeForceReinit) return;\nif (typeof window.__supratubeTeardown === 'function') {\n    try { window.__supratubeTeardown(); } catch {}\n}\nwindow.__supratubeForceReinit = false;\nwindow.__supratubeEjecutado = true;\n\n${bloques.join('\n\n')}\n})();\n`;
 }
 
 async function sincronizarUserScriptRegistrado(codigoCompilado) {
@@ -164,7 +183,7 @@ async function asegurarUserScriptDesdeCache() {
     return { activo: ok, registradoAhora: ok, cache };
 }
 
-async function inyectarScriptLocalEnMain(tabId, frameId) {
+async function inyectarScriptLocalEnMain(tabId, frameId, { forceReinit = false } = {}) {
     if (!tabId) return false;
     const frameIds = typeof frameId === 'number' ? [frameId] : undefined;
     const target = frameIds ? { tabId, frameIds } : { tabId };
@@ -173,9 +192,14 @@ async function inyectarScriptLocalEnMain(tabId, frameId) {
         const [chk] = await chrome.scripting.executeScript({
             target,
             world: 'MAIN',
-            func: () => Boolean(window.__supratubeEjecutado)
+            func: force => {
+                const prev = Boolean(window.__supratubeEjecutado);
+                if (force) window.__supratubeForceReinit = true;
+                return prev;
+            },
+            args: [Boolean(forceReinit)]
         });
-        if (chk?.result) {
+        if (chk?.result && !forceReinit) {
             return true;
         }
         await chrome.scripting.executeScript({
@@ -190,15 +214,72 @@ async function inyectarScriptLocalEnMain(tabId, frameId) {
     }
 }
 
-async function ejecutarCodigoEnPestana(tabId, codigoCompilado) {
+async function asegurarPuenteEnPestana(tabId) {
+    if (!tabId) return false;
+    let bridgeAlive = false;
+    try {
+        if (typeof chrome.tabs?.sendMessage === 'function') {
+            const pong = await chrome.tabs.sendMessage(tabId, { action: 'SUPRATUBE_PING' });
+            bridgeAlive = Boolean(pong?.ok);
+        }
+    } catch {
+        bridgeAlive = false;
+    }
+    if (bridgeAlive) return true;
+    if (typeof chrome.scripting?.executeScript !== 'function') return false;
+    try {
+        await chrome.scripting.executeScript({
+            target: { tabId },
+            world: 'MAIN',
+            files: ['page-hook.js'],
+            injectImmediately: true
+        });
+    } catch {
+        // Ignorar si la pestaña no admite inyección MAIN o ya tiene el hook.
+    }
+    try {
+        await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content.js'],
+            injectImmediately: true
+        });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function probeEstadoBundleEnPestana(tabId) {
+    if (!tabId || typeof chrome.scripting?.executeScript !== 'function') {
+        return { executed: false, hasTeardown: false };
+    }
+    try {
+        const [res] = await chrome.scripting.executeScript({
+            target: { tabId },
+            world: 'MAIN',
+            func: () => ({
+                executed: Boolean(window.__supratubeEjecutado),
+                hasTeardown: typeof window.__supratubeTeardown === 'function'
+            })
+        });
+        return res?.result || { executed: false, hasTeardown: false };
+    } catch {
+        return { executed: false, hasTeardown: false };
+    }
+}
+
+async function ejecutarCodigoEnPestana(tabId, codigoCompilado, { forceReinit = false } = {}) {
     if (!tabId || !codigoCompilado) return false;
+    const payload = forceReinit
+        ? `window.__supratubeForceReinit = true;\n${codigoCompilado}`
+        : codigoCompilado;
 
     if (tieneSoporteUserScripts() && typeof chrome.userScripts.execute === 'function') {
         for (const world of ['MAIN', 'USER_SCRIPT']) {
             try {
                 await chrome.userScripts.execute({
                     target: { tabId },
-                    js: [{ code: codigoCompilado }],
+                    js: [{ code: payload }],
                     world
                 });
                 return true;
@@ -208,10 +289,53 @@ async function ejecutarCodigoEnPestana(tabId, codigoCompilado) {
         }
     }
 
-    return inyectarScriptLocalEnMain(tabId);
+    return inyectarScriptLocalEnMain(tabId, undefined, { forceReinit });
 }
 
-async function actualizarScriptsDesdeGithub() {
+async function limpiarCacheYUserScriptRemoto() {
+    try {
+        if (tieneSoporteUserScripts()) {
+            await chrome.userScripts.unregister({ ids: [USER_SCRIPT_ID] });
+        }
+    } catch {
+        // No había versión previa registrada.
+    }
+    try {
+        await chrome.storage.local.remove?.(CACHE_KEY);
+    } catch {
+        // Ignorar si no había caché previa.
+    }
+}
+
+async function desplegarActualizacionEnPestanas({ codigoCompilado = '', usarLocal = false, recargarLegado = false } = {}) {
+    let pestanasActualizadas = 0;
+    try {
+        const pestanas = await chrome.tabs.query({ url: MATCHES_YOUTUBE });
+        for (const tab of pestanas) {
+            if (!tab.id) continue;
+            const estado = await probeEstadoBundleEnPestana(tab.id);
+            if (recargarLegado && estado.executed && !estado.hasTeardown && typeof chrome.tabs?.reload === 'function') {
+                try {
+                    await chrome.tabs.reload(tab.id);
+                    pestanasActualizadas++;
+                    continue;
+                } catch {
+                    // Respaldo: continuar con reinyección directa.
+                }
+            }
+            await asegurarPuenteEnPestana(tab.id);
+            const ejecutado = usarLocal
+                ? await inyectarScriptLocalEnMain(tab.id, undefined, { forceReinit: true })
+                : await ejecutarCodigoEnPestana(tab.id, codigoCompilado, { forceReinit: true });
+            if (ejecutado) pestanasActualizadas++;
+        }
+    } catch {
+        // Ignorar si no hay pestañas de YouTube abiertas.
+    }
+    return pestanasActualizadas;
+}
+
+async function actualizarScriptsDesdeGithub({ recargarLegado = false } = {}) {
     const resCommit = await fetch(`${REPO_API_COMMIT}?t=${Date.now()}`, {
         cache: 'no-store',
         headers: { Accept: 'application/vnd.github+json' }
@@ -233,7 +357,31 @@ async function actualizarScriptsDesdeGithub() {
         throw new Error(`Error al bajar modules/config.js (HTTP ${resConfig.status})`);
     }
     const configTexto = await resConfig.text();
+    const remoteVersion = parseVersionDesdeConfig(configTexto);
     const listaModulos = parseOrdenModulosDesdeConfig(configTexto);
+
+    if (remoteVersion && compararSemver(remoteVersion, EXT_VERSION) < 0) {
+        await limpiarCacheYUserScriptRemoto();
+        await chrome.storage.local.set({ [SYNC_CHECK_KEY]: Date.now() });
+        const pestanasActualizadas = await desplegarActualizacionEnPestanas({
+            usarLocal: true,
+            recargarLegado
+        });
+        return {
+            ok: true,
+            localVigente: true,
+            cache: {
+                sha,
+                shaCorto,
+                mensajeCommit: `Versión local v${EXT_VERSION} vigente (GitHub aún en v${remoteVersion})`,
+                fechaCommit,
+                actualizadoEn: new Date().toLocaleString('es-CL'),
+                totalModulos: ORDEN_MODULOS.length
+            },
+            userScriptsActivo: tieneSoporteUserScripts(),
+            pestanasActualizadas
+        };
+    }
 
     const restantes = await Promise.all(
         listaModulos
@@ -266,19 +414,11 @@ async function actualizarScriptsDesdeGithub() {
     await chrome.storage.local.set({ [CACHE_KEY]: cache, [SYNC_CHECK_KEY]: Date.now() });
 
     const userScriptsActivo = await sincronizarUserScriptRegistrado(codigoCompilado);
-
-    let pestanasActualizadas = 0;
-    try {
-        const pestanas = await chrome.tabs.query({ url: MATCHES_YOUTUBE });
-        for (const tab of pestanas) {
-            if (tab.id) {
-                const ejecutado = await ejecutarCodigoEnPestana(tab.id, codigoCompilado);
-                if (ejecutado) pestanasActualizadas++;
-            }
-        }
-    } catch {
-        // Ignorar si no hay pestañas de YouTube abiertas.
-    }
+    const pestanasActualizadas = await desplegarActualizacionEnPestanas({
+        codigoCompilado,
+        usarLocal: !userScriptsActivo,
+        recargarLegado
+    });
 
     return {
         ok: true,
@@ -573,7 +713,7 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
     }
 
     if (mensaje.action === 'SUPRATUBE_UPDATE_SCRIPTS') {
-        actualizarScriptsDesdeGithub()
+        actualizarScriptsDesdeGithub({ recargarLegado: true })
             .then(res => enviarRespuesta(res))
             .catch(err =>
                 enviarRespuesta({ ok: false, error: err?.message || 'Error al actualizar desde GitHub' })

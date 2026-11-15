@@ -1,11 +1,15 @@
 (() => {
 'use strict';
-if (window.__supratubeEjecutado) return;
+if (window.__supratubeEjecutado && !window.__supratubeForceReinit) return;
+if (typeof window.__supratubeTeardown === 'function') {
+    try { window.__supratubeTeardown(); } catch {}
+}
+window.__supratubeForceReinit = false;
 window.__supratubeEjecutado = true;
 
 // --- config.js ---
 const CFG = Object.freeze({
-    version: '1.0.9',
+    version: '1.0.10',
     sbApi: 'https://sponsor.ajay.app/api/skipSegments',
     sbCacheTTL: 5 * 60 * 1000,
     geoRefreshMs: 24 * 60 * 60 * 1000,
@@ -401,8 +405,9 @@ function injectNoAdContextBody(body) {
 let _layer0Installed = false;
 
 function installLayer0AdPrune(win = typeof window !== 'undefined' ? window : null) {
-    if (!win || _layer0Installed) return;
+    if (!win || _layer0Installed || win.__supratubeLayer0Pruned) return;
     _layer0Installed = true;
+    win.__supratubeLayer0Pruned = true;
 
     try {
         const desc = Object.getOwnPropertyDescriptor(win, 'ytInitialPlayerResponse');
@@ -532,7 +537,7 @@ function installLayer0AdPrune(win = typeof window !== 'undefined' ? window : nul
 let _adCssInjected = false;
 
 function injectAdStyles(doc = typeof document !== 'undefined' ? document : null) {
-    if (_adCssInjected || !doc) return;
+    if (_adCssInjected || !doc || doc.getElementById?.('supratube-ad-css') || doc.documentElement?.dataset?.supratubeAdCss === '1') return;
     const css = `
         ytd-action-companion-ad-renderer, ytd-display-ad-renderer,
         ytd-video-masthead-ad-v3-renderer, ytd-overlay-ad-renderer,
@@ -556,6 +561,7 @@ function injectAdStyles(doc = typeof document !== 'undefined' ? document : null)
         if (typeof GM_addStyle === 'function') {
             GM_addStyle(css);
             _adCssInjected = true;
+            if (doc.documentElement?.dataset) doc.documentElement.dataset.supratubeAdCss = '1';
             return;
         }
     } catch {}
@@ -566,6 +572,7 @@ function injectAdStyles(doc = typeof document !== 'undefined' ? document : null)
     style.textContent = css;
     target.appendChild(style);
     _adCssInjected = true;
+    if (doc.documentElement?.dataset) doc.documentElement.dataset.supratubeAdCss = '1';
 }
 
 function isAdPlaying(player) {
@@ -763,7 +770,7 @@ async function fetchSponsorSegments(videoId, cacheMap = new Map()) {
 let _sbBarCssInjected = false;
 
 function injectSponsorBarStyles(doc = typeof document !== 'undefined' ? document : null) {
-    if (_sbBarCssInjected || !doc) return;
+    if (_sbBarCssInjected || !doc || doc.getElementById?.('supratube-sb-css') || doc.documentElement?.dataset?.supratubeSbCss === '1') return;
     const css = `
         #supratube-sb-track {
             position: absolute;
@@ -809,6 +816,7 @@ function injectSponsorBarStyles(doc = typeof document !== 'undefined' ? document
         if (typeof GM_addStyle === 'function') {
             GM_addStyle(css);
             _sbBarCssInjected = true;
+            if (doc.documentElement?.dataset) doc.documentElement.dataset.supratubeSbCss = '1';
             return;
         }
     } catch {}
@@ -819,6 +827,7 @@ function injectSponsorBarStyles(doc = typeof document !== 'undefined' ? document
     style.textContent = css;
     target.appendChild(style);
     _sbBarCssInjected = true;
+    if (doc.documentElement?.dataset) doc.documentElement.dataset.supratubeSbCss = '1';
 }
 
 function renderGreenProgressBar(segments, duration, doc = typeof document !== 'undefined' ? document : null, enabled = true) {
@@ -2409,6 +2418,10 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
         }
         if (d.kind === 'progress') {
             if (d.pct > 0 && d.pct < 100) showLine(`Subtítulos IA (${d.pct}%)...`, 0);
+            return;
+        }
+        if (d.kind === 'waiting_play') {
+            showLine('', 0);
             return;
         }
         if (d.kind === 'ready') {
@@ -4795,6 +4808,13 @@ const S = {
     _videoListened: false,
     _adObserver: null,
     _bodyObserver: null,
+    _navObs: null,
+    _obsWaitInterval: null,
+    _mainInterval: null,
+    _subTimers: [],
+    _unsubSettings: null,
+    _abortCtrl: typeof AbortController === 'function' ? new AbortController() : null,
+    _tornDown: false,
     _sbRafId: null,
     _skipRaf: false,
     _navTimer: null,
@@ -4820,10 +4840,7 @@ function getVideo() {
     const p = getPlayer();
     S._video = p ? p.querySelector('video') : document.querySelector('video');
     if (S._video && !S._videoListened) {
-        if (!S._video.__supratubeBound) {
-            S._video.__supratubeBound = true;
-            bindVideoEvents(S._video);
-        }
+        bindVideoEvents(S._video);
         S._videoListened = true;
     }
     return S._video;
@@ -4917,6 +4934,7 @@ async function runSubtitlesForCurrentVideo() {
 }
 
 function bindVideoEvents(video) {
+    const evtOpts = S._abortCtrl?.signal ? { passive: true, signal: S._abortCtrl.signal } : { passive: true };
     video.addEventListener('ended', () => {
         if (S.adState.adSpeedActive) {
             video.playbackRate = 1;
@@ -4924,24 +4942,36 @@ function bindVideoEvents(video) {
             video.volume = S.adState.prevVolume;
             S.adState.adSpeedActive = false;
         }
-    }, { passive: true });
+    }, evtOpts);
 
     video.addEventListener('ratechange', () => {
         const p = getPlayer();
         if (S.settings.adSkip && S.adState.adSpeedActive && p?.classList?.contains('ad-showing')) {
             if (video.playbackRate < 16) video.playbackRate = 16;
         }
-    }, { passive: true });
+    }, evtOpts);
 
     video.addEventListener('canplay', () => {
         const p = getPlayer();
         apply1080pQuality(p, S.qualityState, S.settings.auto1080p);
         refreshProgressBar();
         runSubtitlesForCurrentVideo();
-    }, { passive: true });
+    }, evtOpts);
 
-    video.addEventListener('durationchange', refreshProgressBar, { passive: true });
-    video.addEventListener('loadedmetadata', refreshProgressBar, { passive: true });
+    video.addEventListener('play', () => {
+        if (
+            S.videoId &&
+            S.settings.autoSubtitles &&
+            S.subsUserTouchedVideo !== S.videoId &&
+            !S._subInFlight &&
+            !isFallbackCaptionsActive(window, S.videoId)
+        ) {
+            runSubtitlesForCurrentVideo();
+        }
+    }, evtOpts);
+
+    video.addEventListener('durationchange', refreshProgressBar, evtOpts);
+    video.addEventListener('loadedmetadata', refreshProgressBar, evtOpts);
 }
 
 function sbRafLoop(ts) {
@@ -4968,14 +4998,22 @@ function ensureSBLoop() {
 }
 
 function setupObservers() {
+    clearInterval(S._obsWaitInterval);
+    S._obsWaitInterval = null;
     if (S._adObserver) { S._adObserver.disconnect(); S._adObserver = null; }
     if (S._bodyObserver) { S._bodyObserver.disconnect(); S._bodyObserver = null; }
 
     let tries = 0;
-    const wait = setInterval(() => {
+    S._obsWaitInterval = setInterval(() => {
+        if (S._tornDown) {
+            clearInterval(S._obsWaitInterval);
+            S._obsWaitInterval = null;
+            return;
+        }
         const player = getPlayer();
         if (!player && ++tries < 40) return;
-        clearInterval(wait);
+        clearInterval(S._obsWaitInterval);
+        S._obsWaitInterval = null;
         if (!player) return;
 
         S._adObserver = new MutationObserver(mutations => {
@@ -5035,9 +5073,16 @@ async function loadSponsorForVideo(vid) {
     }
 }
 
+function clearSubTimers() {
+    for (const id of S._subTimers) clearTimeout(id);
+    S._subTimers.length = 0;
+}
+
 function onNavigate() {
     clearTimeout(S._navTimer);
+    clearSubTimers();
     S._navTimer = setTimeout(() => {
+        if (S._tornDown) return;
         clearVideoCache();
         clearFallbackCaptions(document, window);
         const vid = getVideoId();
@@ -5047,11 +5092,12 @@ function onNavigate() {
             loadSponsorForVideo(vid);
             ensureSBLoop();
             [500, 1500, 3000].forEach(delay => {
-                setTimeout(() => {
-                    if (S.videoId !== vid) return;
+                const tid = setTimeout(() => {
+                    if (S._tornDown || S.videoId !== vid) return;
                     apply1080pQuality(getPlayer(), S.qualityState, S.settings.auto1080p);
                     runSubtitlesForCurrentVideo();
                 }, delay);
+                S._subTimers.push(tid);
             });
         } else {
             S.sbSegments = [];
@@ -5061,6 +5107,36 @@ function onNavigate() {
         runAdPass();
         S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: vid });
     }, 350);
+}
+
+/** Cleanly disconnect all active timers, observers, and DOM listeners before hot-reinjection. */
+function teardown() {
+    if (S._tornDown) return;
+    S._tornDown = true;
+    clearTimeout(S._navTimer);
+    S._navTimer = null;
+    clearSubTimers();
+    clearInterval(S._mainInterval);
+    S._mainInterval = null;
+    clearInterval(S._obsWaitInterval);
+    S._obsWaitInterval = null;
+    if (S._sbRafId && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(S._sbRafId);
+    }
+    S._sbRafId = null;
+    try { S._adObserver?.disconnect?.(); } catch {}
+    S._adObserver = null;
+    try { S._bodyObserver?.disconnect?.(); } catch {}
+    S._bodyObserver = null;
+    try { S._navObs?.disconnect?.(); } catch {}
+    S._navObs = null;
+    try { S._unsubSettings?.(); } catch {}
+    S._unsubSettings = null;
+    try { S._abortCtrl?.abort?.(); } catch {}
+    try { S._aiCtrl?.destroy?.(); } catch {}
+    try { S._tdCtrl?.destroy?.(); } catch {}
+    clearFallbackCaptions(document, window);
+    try { window.__supratubeEjecutado = false; } catch {}
 }
 
 function boot() {
@@ -5110,7 +5186,7 @@ function boot() {
     resolveUserNativeLang().then(lang => { S.userNativeLang = lang; }).catch(() => {});
     S._tdCtrl.setEnabled(S.settings.transcriptDownload !== false);
 
-    subscribeSettings(window, document, nextSettings => {
+    S._unsubSettings = subscribeSettings(window, document, nextSettings => {
         S.settings = nextSettings;
         S._tdCtrl.setEnabled(S.settings.transcriptDownload !== false);
         if (!S.settings.autoSubtitles) {
@@ -5141,13 +5217,18 @@ function boot() {
         S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: S.videoId });
     });
 
+    const sig = S._abortCtrl?.signal;
+    const capOpts = sig ? { capture: true, signal: sig } : true;
+    const passiveOpts = sig ? { passive: true, signal: sig } : { passive: true };
+
     document.addEventListener('click', ev => {
         if (!ev.isTrusted) return;
         const item = ev.target?.closest?.('.ytp-quality-menu .ytp-menuitem');
         if (item) S.qualityState.manualOverride = true;
-    }, true);
+    }, capOpts);
 
-    setInterval(() => {
+    S._mainInterval = setInterval(() => {
+        if (S._tornDown) return;
         if (location.href !== S.lastUrl || getVideoId() !== S.videoId) {
             S.lastUrl = location.href;
             onNavigate();
@@ -5175,14 +5256,14 @@ function boot() {
         if (S.settings.transcriptDownload !== false) S._tdCtrl.scan();
     }, 800);
 
-    const navObs = new MutationObserver(() => {
+    S._navObs = new MutationObserver(() => {
         if (location.href !== S.lastUrl) {
             S.lastUrl = location.href;
             onNavigate();
         }
     });
     if (document.body) {
-        navObs.observe(document.body, { childList: true, subtree: false });
+        S._navObs.observe(document.body, { childList: true, subtree: false });
     }
 
     window.addEventListener('yt-navigate-start', () => {
@@ -5191,15 +5272,17 @@ function boot() {
         clearFallbackCaptions(document, window);
         clearVideoCache();
         S._aiCtrl.resetForVideo('', false);
-    }, { passive: true });
-    window.addEventListener('yt-navigate-finish', () => onNavigate(), { passive: true });
-    window.addEventListener('yt-page-data-updated', () => onNavigate(), { passive: true });
+    }, passiveOpts);
+    window.addEventListener('yt-navigate-finish', () => onNavigate(), passiveOpts);
+    window.addEventListener('yt-page-data-updated', () => onNavigate(), passiveOpts);
 
     onNavigate();
 }
 
+try { window.__supratubeTeardown = teardown; } catch {}
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
+    const domOpts = S._abortCtrl?.signal ? { once: true, signal: S._abortCtrl.signal } : { once: true };
+    document.addEventListener('DOMContentLoaded', boot, domOpts);
 } else {
     boot();
 }

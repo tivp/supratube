@@ -64,7 +64,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.9' }),
+                getManifest: () => ({ version: '1.0.10' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -107,7 +107,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
     const storeData = {
         supratube_last_sync_check: Date.now() - (20 * 60 * 1000),
         supratube_github_cache: {
-            extVersion: '1.0.9',
+            extVersion: '1.0.10',
             sha: 'sha_old',
             modulos: modMap,
             codigoCompilado: compileBundle(modMap)
@@ -117,7 +117,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.9' }),
+                getManifest: () => ({ version: '1.0.10' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -165,4 +165,215 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
     assert.equal(storeData.supratube_github_cache.sha, 'sha_new');
     const skippedCooldown = await autoSandbox.verificarActualizacionAutomaticaEnFondo();
     assert.equal(skippedCooldown, false);
+});
+
+test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy pre-teardown tabs, and repairs missing content bridge', async () => {
+    const bg = fs.readFileSync(path.resolve('background.js'), 'utf8');
+    const modMap = {};
+    for (const mod of ORDEN_MODULOS) {
+        modMap[mod] = fs.readFileSync(path.resolve('modules', mod), 'utf8');
+    }
+
+    const reloadedTabs = [];
+    const scriptedInjections = [];
+    const executedCodes = [];
+    let modernTeardownCount = 0;
+
+    // Tab 1: Modern tab (>= v1.0.10) with dead content bridge -> repairs bridge + runs with __supratubeForceReinit
+    // Tab 2: Legacy tab (<= v1.0.9) without __supratubeTeardown -> reloads tab cleanly
+    const tabStates = {
+        101: { executed: true, hasTeardown: true, aliveBridge: false },
+        202: { executed: true, hasTeardown: false, aliveBridge: true }
+    };
+
+    const storeData = {};
+    const sandbox = {
+        chrome: {
+            runtime: {
+                id: 'test-ext',
+                getManifest: () => ({ version: '1.0.10' }),
+                onInstalled: { addListener() {} },
+                onStartup: { addListener() {} },
+                onMessage: { addListener() {} }
+            },
+            storage: {
+                local: {
+                    get: async () => storeData,
+                    set: async obj => Object.assign(storeData, obj),
+                    remove: async () => {}
+                }
+            },
+            tabs: {
+                query: async () => [
+                    { id: 101, url: 'https://www.youtube.com/watch?v=t86sKsR4pnk' },
+                    { id: 202, url: 'https://www.youtube.com/watch?v=abc123def45' }
+                ],
+                sendMessage: async (tabId, msg) => {
+                    if (msg?.action === 'SUPRATUBE_PING' && !tabStates[tabId].aliveBridge) {
+                        throw new Error('Could not establish connection. Receiving end does not exist.');
+                    }
+                    return { ok: true };
+                },
+                reload: async tabId => { reloadedTabs.push(tabId); }
+            },
+            scripting: {
+                executeScript: async opts => {
+                    const tabId = opts?.target?.tabId;
+                    if (opts?.files) {
+                        scriptedInjections.push({ tabId, world: opts.world || 'ISOLATED', files: opts.files });
+                        if (opts.files.includes('content.js')) tabStates[tabId].aliveBridge = true;
+                        return [{ result: true }];
+                    }
+                    if (typeof opts?.func === 'function') {
+                        const st = tabStates[tabId];
+                        return [{ result: { executed: st.executed, hasTeardown: st.hasTeardown } }];
+                    }
+                    return [{ result: false }];
+                }
+            },
+            userScripts: {
+                register: async () => {},
+                unregister: async () => {},
+                getScripts: async () => [],
+                execute: async opts => {
+                    const tabId = opts?.target?.tabId;
+                    const code = opts?.js?.[0]?.code || '';
+                    executedCodes.push({ tabId, code });
+                    // Simulate running inside the tab window using tabStates
+                    const tabWin = {
+                        __supratubeEjecutado: tabStates[tabId].executed,
+                        __supratubeTeardown: tabStates[tabId].hasTeardown ? () => {
+                            modernTeardownCount++;
+                            tabWin.__supratubeEjecutado = false;
+                        } : undefined
+                    };
+                    const noop = () => {};
+                    const fakeEl = { dataset: {}, appendChild: noop, querySelector: () => null, querySelectorAll: () => [], remove: noop };
+                    const fakeDoc = {
+                        readyState: 'loading',
+                        documentElement: fakeEl,
+                        head: fakeEl,
+                        body: fakeEl,
+                        cookie: '',
+                        addEventListener: noop,
+                        removeEventListener: noop,
+                        getElementById: () => null,
+                        querySelector: () => null,
+                        querySelectorAll: () => [],
+                        createElement: () => ({ style: {}, setAttribute: noop, appendChild: noop })
+                    };
+                    Object.assign(tabWin, {
+                        location: { href: 'https://www.youtube.com/watch?v=t86sKsR4pnk', pathname: '/watch', search: '?v=t86sKsR4pnk' },
+                        navigator: { language: 'es-419' },
+                        fetch: async () => ({ ok: true, json: async () => ({}), text: async () => '' }),
+                        Response: function() {},
+                        XMLHttpRequest: { prototype: {} },
+                        document: fakeDoc,
+                        addEventListener: noop,
+                        removeEventListener: noop,
+                        setTimeout: () => 1,
+                        clearTimeout: noop,
+                        setInterval: () => 1,
+                        clearInterval: noop,
+                        URL
+                    });
+                    vm.runInNewContext(code, {
+                        window: tabWin,
+                        document: fakeDoc,
+                        navigator: tabWin.navigator,
+                        location: tabWin.location,
+                        fetch: tabWin.fetch,
+                        XMLHttpRequest: tabWin.XMLHttpRequest,
+                        Response: tabWin.Response,
+                        Event: class {},
+                        CustomEvent: class {},
+                        AbortController,
+                        MutationObserver: class { observe() {} disconnect() {} },
+                        setTimeout: tabWin.setTimeout,
+                        clearTimeout: tabWin.clearTimeout,
+                        setInterval: tabWin.setInterval,
+                        clearInterval: tabWin.clearInterval,
+                        URL
+                    });
+                    tabStates[tabId].executed = tabWin.__supratubeEjecutado;
+                }
+            }
+        },
+        fetch: async url => {
+            if (url.includes('/commits/main')) {
+                return { ok: true, json: async () => ({ sha: 'sha_new', commit: { message: 'fix: hot reinit' } }) };
+            }
+            const name = url.split('/modules/')[1]?.split('?')[0];
+            if (name && modMap[name] !== undefined) {
+                return { ok: true, text: async () => modMap[name] };
+            }
+            return { ok: false, status: 404 };
+        },
+        Map,
+        Promise,
+        Date,
+        AbortController,
+        setTimeout,
+        clearTimeout
+    };
+
+    vm.runInNewContext(bg, sandbox, { filename: 'background.js' });
+    const result = await sandbox.actualizarScriptsDesdeGithub();
+    assert.equal(result.ok, true);
+    assert.equal(result.pestanasActualizadas, 2);
+
+    // Dead bridge on tab 101 must have been repaired by re-injecting page-hook.js + content.js
+    assert.ok(scriptedInjections.some(s => s.tabId === 101 && s.files.includes('content.js')));
+    assert.ok(scriptedInjections.some(s => s.tabId === 101 && s.files.includes('page-hook.js')));
+
+    // Modern tab 101 must be torn down and re-executed in-place without reloading
+    assert.equal(modernTeardownCount, 1);
+    assert.equal(executedCodes.some(e => e.tabId === 101), true);
+    assert.equal(reloadedTabs.includes(101), false);
+
+    // Legacy tab 202 (without __supratubeTeardown) only reloads on explicit manual update (recargarLegado: true)
+    assert.deepEqual(reloadedTabs, []);
+
+    const manualRes = await sandbox.actualizarScriptsDesdeGithub({ recargarLegado: true });
+    assert.equal(manualRes.ok, true);
+    assert.deepEqual(reloadedTabs, [202]);
+
+    // Older remote version (1.0.9 < local 1.0.10) must NOT downgrade local extension or register stale userScript
+    let unregisteredDowngrade = 0;
+    let downgradeRegistered = 0;
+    const oldStoreData = {};
+    const oldRemoteSandbox = {
+        ...sandbox,
+        chrome: {
+            ...sandbox.chrome,
+            storage: {
+                local: {
+                    get: async () => oldStoreData,
+                    set: async obj => Object.assign(oldStoreData, obj),
+                    remove: async k => { delete oldStoreData[k]; }
+                }
+            },
+            userScripts: {
+                register: async () => { downgradeRegistered++; },
+                unregister: async () => { unregisteredDowngrade++; },
+                getScripts: async () => [],
+                execute: async () => {}
+            }
+        },
+        fetch: async url => {
+            if (url.includes('/commits/main')) {
+                return { ok: true, json: async () => ({ sha: 'sha_old_109', commit: { message: 'v1.0.9' } }) };
+            }
+            if (url.includes('/modules/config.js')) {
+                return { ok: true, text: async () => modMap['config.js'].replace("version: '1.0.10'", "version: '1.0.9'") };
+            }
+            return { ok: false, status: 500 };
+        }
+    };
+    vm.runInNewContext(bg, oldRemoteSandbox, { filename: 'background.js' });
+    const dgRes = await oldRemoteSandbox.actualizarScriptsDesdeGithub({ recargarLegado: true });
+    assert.equal(dgRes.ok, true);
+    assert.equal(dgRes.localVigente, true);
+    assert.equal(downgradeRegistered, 0);
+    assert.ok(unregisteredDowngrade >= 1);
 });

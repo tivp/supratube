@@ -1153,3 +1153,150 @@ test('fallback captions sync .ytp-subtitles-button active state, tooltip, and fi
     assert.equal(ccBtn.getAttribute('data-tooltip-title'), 'Subtítulos no disponibles');
     assert.equal(pathEl.getAttribute('d'), origHollowPath);
 });
+
+test('whisper waiting_play keeps CC button active on paused video and content.js does not fail while paused', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const vm = await import('node:vm');
+
+    const ccBtn = {
+        disabled: true,
+        style: { display: 'none' },
+        _attrs: {
+            'aria-pressed': 'false',
+            'aria-disabled': 'true',
+            'data-tooltip-title': 'Subtítulos no disponibles'
+        },
+        getAttribute(k) { return this._attrs[k] ?? null; },
+        setAttribute(k, v) { this._attrs[k] = String(v); },
+        hasAttribute(k) { return k in this._attrs; },
+        removeAttribute(k) { delete this._attrs[k]; },
+        matches: () => false,
+        querySelector: () => null
+    };
+    const listeners = {};
+    const elements = new Map();
+    const createEl = () => ({ style: {}, children: [], setAttribute() {}, appendChild(c) { this.children.push(c); return c; }, remove() {} });
+    const fakeDoc = {
+        head: { appendChild(el) { if (el.id) elements.set(el.id, el); } },
+        documentElement: { dataset: { supratubeWhisperBridge: '1' } },
+        createElement: createEl,
+        getElementById: id => elements.get(id) || null,
+        querySelector: sel => (sel === '.ytp-subtitles-button' ? ccBtn : null),
+        querySelectorAll: () => []
+    };
+    class FakeCustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } }
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/watch?v=pausedVid01', pathname: '/watch', origin: 'https://www.youtube.com' },
+        CustomEvent: FakeCustomEvent,
+        ytcfg: { get: () => '' },
+        fetch: async () => ({ ok: true, status: 200, text: async () => '{}' }),
+        addEventListener(ev, fn) { (listeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { listeners[ev] = (listeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) { for (const fn of (listeners[ev.type] || [])) fn(ev); }
+    };
+    const videoEl = {
+        currentTime: 0,
+        paused: true,
+        readyState: 0,
+        setAttribute() {},
+        removeAttribute() {},
+        addEventListener() {},
+        removeEventListener() {}
+    };
+    const fakePlayer = {
+        id: 'movie_player',
+        clientWidth: 960,
+        isSubtitlesOn: () => false,
+        getVideoData: () => ({ video_id: 'pausedVid01' }),
+        querySelector: sel => {
+            if (sel === '.ytp-subtitles-button') return ccBtn;
+            if (sel === 'video') return videoEl;
+            if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+            return null;
+        },
+        querySelectorAll: () => [],
+        appendChild: el => { if (el.id) elements.set(el.id, el); return el; },
+        getOption: () => [],
+        getPlayerResponse: () => ({ videoDetails: { videoId: 'pausedVid01' } })
+    };
+
+    await applySmartSubtitles(fakePlayer, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: 'pausedVid01',
+        doc: fakeDoc,
+        win: fakeWin
+    });
+    await new Promise(r => setTimeout(r, 35));
+
+    // Dispatch waiting_play -> CC MUST stay active!
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', { detail: { kind: 'waiting_play', videoId: 'pausedVid01' } }));
+    assert.equal(ccBtn.getAttribute('aria-pressed'), 'true');
+    assert.equal(ccBtn.getAttribute('data-supratube-cc-active'), '1');
+
+    // Verify content.js responds to SUPRATUBE_PING and emits waiting_play (not error) while video is paused with 0 audio tracks
+    const csCode = fs.readFileSync(path.resolve('content.js'), 'utf8');
+    const cListeners = {};
+    const cEvents = [];
+    const vidListeners = {};
+    let tracksNow = [];
+    const pausedDomVideo = {
+        isConnected: true,
+        paused: true,
+        ended: false,
+        readyState: 0,
+        captureStream: () => ({ getAudioTracks: () => tracksNow }),
+        addEventListener(ev, fn) { (vidListeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { vidListeners[ev] = (vidListeners[ev] || []).filter(f => f !== fn); }
+    };
+    let onMsgHandler = null;
+    const runtimeSent = [];
+    const cWin = {
+        document: {
+            documentElement: { dataset: {} },
+            querySelector: () => pausedDomVideo
+        },
+        addEventListener(ev, fn) { (cListeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { cListeners[ev] = (cListeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) {
+            cEvents.push(ev.detail);
+            for (const fn of (cListeners[ev.type] || [])) fn(ev);
+        }
+    };
+    cWin.top = cWin.self = cWin;
+    vm.runInNewContext(csCode, {
+        window: cWin,
+        document: cWin.document,
+        CustomEvent: FakeCustomEvent,
+        WeakMap,
+        chrome: {
+            runtime: {
+                id: 'ext1',
+                lastError: null,
+                onMessage: { addListener: fn => { onMsgHandler = fn; } },
+                sendMessage: (msg, cb) => { runtimeSent.push(msg); cb?.({ ok: true }); }
+            },
+            storage: {
+                local: { get: (_k, cb) => cb?.({}) },
+                onChanged: { addListener() {} }
+            }
+        },
+        setTimeout,
+        clearTimeout,
+        setInterval,
+        clearInterval
+    });
+
+    let pingReply = null;
+    onMsgHandler?.({ action: 'SUPRATUBE_PING' }, {}, res => { pingReply = res; });
+    assert.equal(pingReply?.ok, true);
+
+    cWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-cmd', { detail: { action: 'start', videoId: 'pausedVid01', targetLang: 'es' } }));
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(cEvents.some(e => e?.kind === 'waiting_play' && e.videoId === 'pausedVid01'), true);
+    assert.equal(cEvents.some(e => e?.kind === 'error'), false);
+
+    // Stop cleanly so timers inside paused waiter clean up
+    cWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-cmd', { detail: { action: 'stop', videoId: 'pausedVid01' } }));
+});

@@ -7,6 +7,11 @@
         return;
     }
 
+    if (window.__supratubeContentAlive) {
+        return;
+    }
+    window.__supratubeContentAlive = true;
+
     const SETTINGS_KEY = 'supratube_settings';
     const DEFAULT_SETTINGS = {
         adSkip: true,
@@ -124,17 +129,61 @@
         if (vidEl) {
             disconnectProc(captureByVideo.get(vidEl));
         }
-        chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_STOP', videoId: vid }).catch(() => {});
+        try {
+            chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_STOP', videoId: vid }).catch(() => {});
+        } catch {}
     }
 
-    async function waitAudioTracks(vidEl, token) {
+    function readStreamAudioTracks(vidEl) {
+        try {
+            const stream = vidEl.captureStream ? vidEl.captureStream() : vidEl.mozCaptureStream?.();
+            return stream?.getAudioTracks?.() || [];
+        } catch {
+            return [];
+        }
+    }
+
+    function waitForPlaybackBeforeCapture(vidEl, token) {
+        if (!vidEl || (!vidEl.paused && !vidEl.ended)) return Promise.resolve(true);
+        return new Promise(resolve => {
+            let settled = false;
+            const cleanup = ok => {
+                if (settled) return;
+                settled = true;
+                clearInterval(poll);
+                vidEl.removeEventListener('play', onReady);
+                vidEl.removeEventListener('playing', onReady);
+                resolve(ok);
+            };
+            const onReady = () => {
+                if (token !== whisperStartSeq) return cleanup(false);
+                if (!vidEl.paused && !vidEl.ended) cleanup(true);
+            };
+            vidEl.addEventListener('play', onReady, { passive: true });
+            vidEl.addEventListener('playing', onReady, { passive: true });
+            const poll = setInterval(() => {
+                if (token !== whisperStartSeq || !vidEl.isConnected) return cleanup(false);
+                if (!vidEl.paused && !vidEl.ended) cleanup(true);
+            }, 400);
+        });
+    }
+
+    async function waitAudioTracks(vidEl, token, videoId) {
+        const immediate = readStreamAudioTracks(vidEl);
+        if (immediate.length) return immediate;
+
+        if (vidEl.paused && !vidEl.ended) {
+            window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
+                detail: { kind: 'waiting_play', videoId }
+            }));
+            const ready = await waitForPlaybackBeforeCapture(vidEl, token);
+            if (!ready || token !== whisperStartSeq) return [];
+        }
+
         for (let attempt = 0; attempt < 15; attempt++) {
             if (token !== whisperStartSeq) return [];
-            try {
-                const stream = vidEl.captureStream ? vidEl.captureStream() : vidEl.mozCaptureStream?.();
-                const tracks = stream?.getAudioTracks?.() || [];
-                if (tracks.length) return tracks;
-            } catch {}
+            const tracks = readStreamAudioTracks(vidEl);
+            if (tracks.length) return tracks;
             await new Promise(r => setTimeout(r, 350));
         }
         return [];
@@ -156,7 +205,7 @@
 
         let entry = captureByVideo.get(vidEl);
         if (!entry) {
-            const aTracks = await waitAudioTracks(vidEl, token);
+            const aTracks = await waitAudioTracks(vidEl, token, videoId);
             if (token !== whisperStartSeq) return;
             if (!aTracks.length) {
                 window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
@@ -270,7 +319,11 @@
     });
 
     try {
-        chrome.runtime.onMessage.addListener(msg => {
+        chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+            if (msg?.action === 'SUPRATUBE_PING') {
+                sendResponse?.({ ok: true });
+                return false;
+            }
             if (msg?.action === 'SUPRATUBE_WHISPER_EVENT' && msg.payload) {
                 if (msg.payload.kind === 'same_language' && !msg.payload.manualForce) {
                     stopWhisperCapture(msg.payload.videoId || '');

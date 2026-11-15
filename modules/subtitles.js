@@ -1327,6 +1327,10 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
             if (d.pct > 0 && d.pct < 100) showLine(`Subtítulos IA (${d.pct}%)...`, 0);
             return;
         }
+        if (d.kind === 'waiting_play') {
+            showLine('', 0);
+            return;
+        }
         if (d.kind === 'ready') {
             showLine('', 0);
             return;
