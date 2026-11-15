@@ -1,3 +1,4 @@
+import { CFG } from './config.js';
 import { getVideoId, selectActivePlayer, readBridgeSettings, subscribeSettings, gmRequest } from './utils.js';
 import { installLayer0AdPrune, injectAdStyles, trySkipAd, dismissEnforcement } from './adblock.js';
 import { fetchSponsorSegments, renderGreenProgressBar, tickSponsorBlock } from './sponsorblock.js';
@@ -10,6 +11,11 @@ import { createTranscriptDownloadController } from './transcript-download.js';
 installLayer0AdPrune(window);
 installTimedtextMonitor(window);
 injectAdStyles(document);
+
+const resolveTdFactory = () =>
+    typeof createTranscriptDownloadController === 'function'
+        ? createTranscriptDownloadController
+        : (typeof __supratubeTdExports !== 'undefined' ? __supratubeTdExports?.createTranscriptDownloadController : null);
 
 const S = {
     settings: readBridgeSettings(document),
@@ -27,14 +33,17 @@ const S = {
     _subInFlight: null,
     _lastAudioLang: null,
     _aiCtrl: createAiSummaryController({ doc: document, win: window }),
-    _tdCtrl: typeof createTranscriptDownloadController === 'function'
-        ? createTranscriptDownloadController({
-            doc: document,
-            win: window,
-            getUserLang: () => S.userNativeLang || 'es',
-            requestFn: gmRequest
-        })
-        : { setEnabled() {}, scan() {}, destroy() {} },
+    _tdCtrl: (() => {
+        const tdFactory = resolveTdFactory();
+        return typeof tdFactory === 'function'
+            ? tdFactory({
+                doc: document,
+                win: window,
+                getUserLang: () => S.userNativeLang || 'es',
+                requestFn: gmRequest
+            })
+            : { setEnabled() {}, scan() {}, destroy() {} };
+    })(),
     _player: null,
     _video: null,
     _videoListened: false,
@@ -306,6 +315,9 @@ function onNavigate() {
 }
 
 function boot() {
+    if (document?.documentElement?.dataset && CFG?.version) {
+        document.documentElement.dataset.supratubeVersion = CFG.version;
+    }
     injectAdStyles(document);
     bindManualCaptionListeners(document, window, null, () => {
         S.subsUserTouchedVideo = S.videoId;

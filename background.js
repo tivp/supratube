@@ -4,9 +4,11 @@ const REPO_API_COMMIT = 'https://api.github.com/repos/tivp/supratube/commits/mai
 const REPO_RAW_BASE = 'https://raw.githubusercontent.com/tivp/supratube/main';
 const CACHE_KEY = 'supratube_github_cache';
 const SETTINGS_KEY = 'supratube_settings';
+const SYNC_CHECK_KEY = 'supratube_last_sync_check';
+const AUTO_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 const USER_SCRIPT_ID = 'supratube-github-bundle';
 const MATCHES_YOUTUBE = ['https://www.youtube.com/*', 'https://m.youtube.com/*'];
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.5';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.6';
 
 const ORDEN_MODULOS = [
     'config.js',
@@ -32,6 +34,7 @@ const DEFAULT_SETTINGS_SYNC = {
 };
 
 const controladoresActivos = new Map();
+let autoSyncEnCurso = null;
 
 function tieneSoporteUserScripts() {
     return typeof chrome.userScripts !== 'undefined' && typeof chrome.userScripts.register === 'function';
@@ -260,7 +263,7 @@ async function actualizarScriptsDesdeGithub() {
         codigoCompilado
     };
 
-    await chrome.storage.local.set({ [CACHE_KEY]: cache });
+    await chrome.storage.local.set({ [CACHE_KEY]: cache, [SYNC_CHECK_KEY]: Date.now() });
 
     const userScriptsActivo = await sincronizarUserScriptRegistrado(codigoCompilado);
 
@@ -292,7 +295,56 @@ async function actualizarScriptsDesdeGithub() {
     };
 }
 
+async function verificarActualizacionAutomaticaEnFondo({ forzar = false } = {}) {
+    if (!tieneSoporteUserScripts()) return false;
+    if (autoSyncEnCurso) return autoSyncEnCurso;
+
+    autoSyncEnCurso = (async () => {
+        try {
+            const datos = await chrome.storage.local.get([SYNC_CHECK_KEY, CACHE_KEY]);
+            const ultimoChequeo = Number(datos?.[SYNC_CHECK_KEY] || 0);
+            if (!forzar && ultimoChequeo && Date.now() - ultimoChequeo < AUTO_SYNC_INTERVAL_MS) {
+                return false;
+            }
+            await chrome.storage.local.set({ [SYNC_CHECK_KEY]: Date.now() });
+
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 4000);
+            let resCommit;
+            try {
+                resCommit = await fetch(`${REPO_API_COMMIT}?t=${Date.now()}`, {
+                    cache: 'no-store',
+                    headers: { Accept: 'application/vnd.github+json' },
+                    signal: ctrl.signal
+                });
+            } finally {
+                clearTimeout(timer);
+            }
+            if (!resCommit?.ok) return false;
+            const commitData = await resCommit.json();
+            const remoteSha = String(commitData?.sha || '');
+            const cache = datos?.[CACHE_KEY];
+            if (!remoteSha || (esCacheValido(cache) && cache.sha === remoteSha)) {
+                return false;
+            }
+            await actualizarScriptsDesdeGithub();
+            return true;
+        } catch {
+            return false;
+        } finally {
+            autoSyncEnCurso = null;
+        }
+    })();
+
+    return autoSyncEnCurso;
+}
+
 asegurarUserScriptDesdeCache().catch(() => {});
+
+chrome.runtime.onStartup?.addListener(() => {
+    asegurarUserScriptDesdeCache().catch(() => {});
+    verificarActualizacionAutomaticaEnFondo({ forzar: true }).catch(() => {});
+});
 
 chrome.runtime.onInstalled.addListener(async details => {
     try {
@@ -433,6 +485,7 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
                         await ejecutarCodigoEnPestana(sender.tab.id, info.cache.codigoCompilado);
                     }
                     enviarRespuesta({ inyectadoRemoto: true });
+                    verificarActualizacionAutomaticaEnFondo().catch(() => {});
                     return;
                 }
 
@@ -441,6 +494,7 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
                     inyectadoLocalMain = await inyectarScriptLocalEnMain(sender.tab.id, sender.frameId);
                 }
                 enviarRespuesta({ inyectadoRemoto: false, inyectadoLocalMain });
+                verificarActualizacionAutomaticaEnFondo().catch(() => {});
             })
             .catch(() => {
                 enviarRespuesta({ inyectadoRemoto: false, inyectadoLocalMain: false });

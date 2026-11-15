@@ -3,7 +3,7 @@
 import { DEFAULT_SETTINGS } from './modules/config.js';
 
 const SETTINGS_KEY = 'supratube_settings';
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.5';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.6';
 const checkboxes = Array.from(document.querySelectorAll('input[data-setting]'));
 const btnActualizar = document.getElementById('btn-actualizar-scripts');
 const estadoEl = document.getElementById('estado-actualizacion');
@@ -64,6 +64,10 @@ function pintarEstadoGuardado(respuesta) {
         mostrarEstado(
             `Sincronizado #${c.shaCorto} (${c.mensajeCommit}) · ${c.actualizadoEn}${avisoPermiso}`,
             respuesta.userScriptsActivo ? 'ok' : ''
+        );
+    } else if (!respuesta.userScriptsActivo) {
+        mostrarEstado(
+            `Usando módulos locales v${EXT_VERSION}. Activa "Permitir scripts de usuario" para auto-actualizar desde GitHub.`
         );
     } else {
         mostrarEstado(`Usando módulos locales v${EXT_VERSION}. Pulsa el botón para traer la última versión de GitHub.`);

@@ -46,8 +46,9 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.5' }),
+                getManifest: () => ({ version: '1.0.6' }),
                 onInstalled: { addListener() {} },
+                onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
             },
             storage: {
@@ -83,4 +84,67 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
     assert.ok(unregistered >= 1);
     const parsedMods = sandbox.parseOrdenModulosDesdeConfig(modMap['config.js']);
     assert.deepEqual(Array.from(parsedMods), Array.from(ORDEN_MODULOS));
+
+    let syncCalls = 0;
+    const storeData = {
+        supratube_last_sync_check: Date.now() - (20 * 60 * 1000),
+        supratube_github_cache: {
+            extVersion: '1.0.6',
+            sha: 'sha_old',
+            modulos: modMap,
+            codigoCompilado: compileBundle(modMap)
+        }
+    };
+    const autoSandbox = {
+        chrome: {
+            runtime: {
+                id: 'test-ext',
+                getManifest: () => ({ version: '1.0.6' }),
+                onInstalled: { addListener() {} },
+                onStartup: { addListener() {} },
+                onMessage: { addListener() {} }
+            },
+            storage: {
+                local: {
+                    get: async keys => {
+                        const out = {};
+                        const arr = Array.isArray(keys) ? keys : [keys];
+                        for (const k of arr) out[k] = storeData[k];
+                        return out;
+                    },
+                    set: async obj => Object.assign(storeData, obj),
+                    remove: async k => { delete storeData[k]; }
+                }
+            },
+            tabs: { query: async () => [] },
+            userScripts: {
+                register: async () => { syncCalls++; },
+                unregister: async () => {},
+                getScripts: async () => [{ id: 'supratube-github-bundle' }]
+            }
+        },
+        fetch: async url => {
+            if (url.includes('/commits/main')) {
+                return { ok: true, json: async () => ({ sha: 'sha_new', commit: { message: 'fix: update' } }) };
+            }
+            const name = url.split('/modules/')[1]?.split('?')[0];
+            if (name && modMap[name] !== undefined) {
+                return { ok: true, text: async () => modMap[name] };
+            }
+            return { ok: false, status: 404 };
+        },
+        Map,
+        Promise,
+        Date,
+        AbortController,
+        setTimeout,
+        clearTimeout
+    };
+    vm.runInNewContext(bg, autoSandbox, { filename: 'background.js' });
+    const updated = await autoSandbox.verificarActualizacionAutomaticaEnFondo();
+    assert.equal(updated, true);
+    assert.equal(syncCalls, 1);
+    assert.equal(storeData.supratube_github_cache.sha, 'sha_new');
+    const skippedCooldown = await autoSandbox.verificarActualizacionAutomaticaEnFondo();
+    assert.equal(skippedCooldown, false);
 });
