@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Supratube | Maximus",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "YouTube sin anuncios, 1080p/Premium automático, barra verde SponsorBlock y subtítulos inteligentes según tu idioma por IP.",
     "author": "tivp",
     "icons": {
@@ -30,7 +30,9 @@
         "https://ipwho.is/*",
         "https://api.country.is/*",
         "https://raw.githubusercontent.com/*",
-        "https://api.github.com/*"
+        "https://api.github.com/*",
+        "https://translate.googleapis.com/*",
+        "https://clients5.google.com/*"
     ],
     "background": {
         "service_worker": "background.js"

@@ -17,6 +17,8 @@ test('manifest.json is valid MV3 with crystal icons, userScripts, and required h
     assert.ok(manifest.host_permissions.includes('https://sponsor.ajay.app/*'));
     assert.ok(manifest.host_permissions.includes('https://raw.githubusercontent.com/*'));
     assert.ok(manifest.host_permissions.includes('https://ipapi.co/*'));
+    assert.ok(manifest.host_permissions.includes('https://translate.googleapis.com/*'));
+    assert.ok(manifest.host_permissions.includes('https://clients5.google.com/*'));
     for (const rel of ['icons/icon-16.png', 'icons/icon-48.png', 'icons/icon-128.png', 'background.js', 'content.js', 'page-hook.js', 'popup.html', 'popup.js']) {
         assert.equal(fs.existsSync(path.resolve(rel)), true, `${rel} must exist`);
     }

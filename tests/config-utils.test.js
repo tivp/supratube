@@ -12,7 +12,8 @@ import {
     normalizeBaseLang,
     extractLangFromAudioTrackId,
     readCookie,
-    buildCookieString
+    buildCookieString,
+    gmRequest
 } from '../modules/utils.js';
 
 test('ORDEN_MODULOS lists all 8 runtime modules ending with main.js', () => {
@@ -95,4 +96,46 @@ test('readCookie and buildCookieString roundtrip encoded cookie values', () => {
     assert.match(cookieLine, /Max-Age=604800/);
     const pair = cookieLine.split(';')[0];
     assert.equal(readCookie(`PREF=tz=UTC; ${pair}`, 'supratube_geo_lang'), '{"lang":"es","cc":"CL"}');
+});
+
+test('gmRequest forwards POST body to both GM_xmlhttpRequest and fetch', async () => {
+    let seenGm = null;
+    const prevGm = globalThis.GM_xmlhttpRequest;
+    const prevFetch = globalThis.fetch;
+    try {
+        globalThis.GM_xmlhttpRequest = opts => {
+            seenGm = opts;
+            opts.onload?.({ status: 200, responseText: 'ok-gm' });
+            return { abort() {} };
+        };
+        const gmRes = await gmRequest('https://translate.googleapis.com/translate_a/single', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'q=hola',
+            anonymous: true
+        });
+        assert.equal(gmRes.status, 200);
+        assert.equal(seenGm.url, 'https://translate.googleapis.com/translate_a/single');
+        assert.equal(seenGm.data, 'q=hola');
+
+        delete globalThis.GM_xmlhttpRequest;
+        let seenFetch = null;
+        globalThis.fetch = async (url, init) => {
+            seenFetch = { url, init };
+            return { status: 200, text: async () => 'ok-fetch' };
+        };
+        const fetchRes = await gmRequest('https://translate.googleapis.com/translate_a/single', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'q=hola',
+            anonymous: true
+        });
+        assert.equal(fetchRes.status, 200);
+        assert.equal(seenFetch.url, 'https://translate.googleapis.com/translate_a/single');
+        assert.equal(seenFetch.init.body, 'q=hola');
+    } finally {
+        if (prevGm === undefined) delete globalThis.GM_xmlhttpRequest;
+        else globalThis.GM_xmlhttpRequest = prevGm;
+        globalThis.fetch = prevFetch;
+    }
 });

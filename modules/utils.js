@@ -136,12 +136,14 @@ export function gmRequest(url, opts = {}) {
     const method = opts.method || 'GET';
     const timeout = Number(opts.timeout) || 10000;
     const headers = opts.headers || { Accept: 'application/json' };
+    const payloadBody = opts.body ?? opts.data;
     if (typeof GM_xmlhttpRequest === 'function') {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method,
                 url,
                 headers,
+                data: payloadBody,
                 timeout,
                 anonymous: Boolean(opts.anonymous),
                 onload(res) {
@@ -161,6 +163,7 @@ export function gmRequest(url, opts = {}) {
     return fetch(url, {
         method,
         headers,
+        body: (method === 'GET' || method === 'HEAD') ? undefined : payloadBody,
         credentials: opts.anonymous ? 'omit' : 'include',
         signal: ctrl?.signal
     })

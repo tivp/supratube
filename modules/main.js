@@ -1,11 +1,12 @@
-import { getVideoId, selectActivePlayer, readBridgeSettings, subscribeSettings } from './utils.js';
+import { getVideoId, selectActivePlayer, readBridgeSettings, subscribeSettings, gmRequest } from './utils.js';
 import { installLayer0AdPrune, injectAdStyles, trySkipAd, dismissEnforcement } from './adblock.js';
 import { fetchSponsorSegments, renderGreenProgressBar, tickSponsorBlock } from './sponsorblock.js';
 import { apply1080pQuality } from './quality.js';
 import { resolveUserNativeLang } from './geo-lang.js';
-import { bindManualCaptionListeners, applySmartSubtitles } from './subtitles.js';
+import { bindManualCaptionListeners, applySmartSubtitles, installTimedtextMonitor, clearFallbackCaptions } from './subtitles.js';
 
 installLayer0AdPrune(window);
+installTimedtextMonitor(window);
 injectAdStyles(document);
 
 const S = {
@@ -122,7 +123,9 @@ async function runSubtitlesForCurrentVideo() {
             enabled: S.settings.autoSubtitles,
             userLang: S.userNativeLang,
             expectedVideoId: vid,
-            doc: document
+            doc: document,
+            win: window,
+            gmRequestFn: gmRequest
         });
         if (applied) {
             S.subsAppliedForVideo = vid;
@@ -255,6 +258,7 @@ function onNavigate() {
     clearTimeout(S._navTimer);
     S._navTimer = setTimeout(() => {
         clearVideoCache();
+        clearFallbackCaptions(document, window);
         const vid = getVideoId();
         S.videoId = vid;
 
@@ -281,11 +285,20 @@ function boot() {
     injectAdStyles(document);
     bindManualCaptionListeners(document, window, null, () => {
         S.subsUserTouchedVideo = S.videoId;
+        setTimeout(() => {
+            const p = getPlayer();
+            if (p && typeof p.isSubtitlesOn === 'function' && !p.isSubtitlesOn()) {
+                clearFallbackCaptions(document, window);
+            }
+        }, 60);
     });
     resolveUserNativeLang().then(lang => { S.userNativeLang = lang; }).catch(() => {});
 
     subscribeSettings(window, document, nextSettings => {
         S.settings = nextSettings;
+        if (!S.settings.autoSubtitles) {
+            clearFallbackCaptions(document, window);
+        }
         if (!S.settings.adSkip) {
             const v = getVideo();
             if (v && S.adState.adSpeedActive) {
