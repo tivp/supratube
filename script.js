@@ -5,7 +5,7 @@ window.__supratubeEjecutado = true;
 
 // --- config.js ---
 const CFG = Object.freeze({
-    version: '1.0.7',
+    version: '1.0.8',
     sbApi: 'https://sponsor.ajay.app/api/skipSegments',
     sbCacheTTL: 5 * 60 * 1000,
     geoRefreshMs: 24 * 60 * 60 * 1000,
@@ -1416,12 +1416,23 @@ function getFallbackCtrl(win) {
         host.__supratubeFallbackCtrl = {
             activeVid: null,
             inflightVid: null,
+            forceOverlay: false,
+            whisperVid: null,
+            stopWhisper: null,
+            sameLangVideos: new Set(),
             stopLoop: null,
             watchdogTimer: null,
             cache: new Map()
         };
     }
     return host.__supratubeFallbackCtrl;
+}
+
+/** Return true while fallback or live Whisper captions are actively driving subtitles for videoId. */
+function isFallbackCaptionsActive(win = typeof window !== 'undefined' ? window : null, videoId = '') {
+    const ctrl = getFallbackCtrl(win);
+    if (!videoId) return Boolean(ctrl.activeVid || ctrl.whisperVid);
+    return ctrl.activeVid === videoId || ctrl.whisperVid === videoId;
 }
 
 function setBoundedCache(map, key, value, limit = 20) {
@@ -1597,16 +1608,18 @@ function recordTimedtextOutcome(win, rawUrl, status, bodyText) {
     const tlang = normalizeBaseLang(parsedUrl.searchParams.get('tlang'));
     const st = getTtState(win);
 
-    if (tlang) {
-        const cleanUrl = new URL(parsedUrl.toString());
-        cleanUrl.searchParams.delete('tlang');
-        cleanUrl.searchParams.set('fmt', 'json3');
+    const cleanUrl = new URL(parsedUrl.toString());
+    cleanUrl.searchParams.delete('tlang');
+    cleanUrl.searchParams.set('fmt', 'json3');
+    if (tlang || parsedUrl.searchParams.has('pot')) {
         st.rawUrlsByVid.set(vid, cleanUrl.toString());
     }
 
     const cues = (status >= 200 && status < 300) ? parseTimedtextResponseText(bodyText) : [];
     if (status >= 400 || cues.length === 0) {
-        if (!tlang) st.directBlockedByVid.add(vid);
+        if (!tlang && (status >= 400 || !parsedUrl.searchParams.has('pot'))) {
+            st.directBlockedByVid.add(vid);
+        }
         st.failedByVid.set(vid, { status, hasTlang: Boolean(tlang), lang, ts: Date.now() });
         const cb = st.onFailureCallbacks.get(vid);
         if (typeof cb === 'function') {
@@ -1962,15 +1975,45 @@ async function fetchTranscriptViaGetPanel(videoId, win) {
     return parseTranscriptPanelResponse(data);
 }
 
-async function obtainRawSegmentsForVideo(videoId, win) {
+function collectPerformanceTimedtextUrl(win, videoId) {
+    try {
+        const entries = win?.performance?.getEntriesByType?.('resource') || [];
+        for (let i = entries.length - 1; i >= 0; i--) {
+            const name = String(entries[i]?.name || '');
+            if (!TIMEDTEXT_URL_RE.test(name)) continue;
+            const parsed = new URL(name);
+            if (parsed.searchParams.get('v') !== videoId) continue;
+            if (!parsed.searchParams.has('pot')) continue;
+            parsed.searchParams.delete('tlang');
+            parsed.searchParams.set('fmt', 'json3');
+            return parsed.toString();
+        }
+    } catch {}
+    return '';
+}
+
+async function obtainRawSegmentsForVideo(videoId, win, opts = {}) {
+    if (typeof __supratubeTdExports?.tdRecoverRawSubtitleCues === 'function') {
+        try {
+            return await __supratubeTdExports.tdRecoverRawSubtitleCues({
+                videoId,
+                userLang: opts.userLang || 'es',
+                captionTracksHint: opts.captionTracks || [],
+                doc: opts.doc || null,
+                win,
+                requestFn: opts.requestFn || gmRequest
+            });
+        } catch {}
+    }
+
     const st = getTtState(win);
     const cachedOrigin = st.originCuesByVid.get(videoId);
     if (cachedOrigin?.cues?.length) {
-        return { lang: cachedOrigin.lang, segments: cachedOrigin.cues };
+        return { lang: cachedOrigin.lang, segments: cachedOrigin.cues, alreadyTranslated: false, audioLang: '', captionTracks: [] };
     }
 
-    const rawUrl = st.rawUrlsByVid.get(videoId);
-    if (rawUrl && !st.directBlockedByVid.has(videoId) && typeof win?.fetch === 'function') {
+    const rawUrl = st.rawUrlsByVid.get(videoId) || collectPerformanceTimedtextUrl(win, videoId);
+    if (rawUrl && (!st.directBlockedByVid.has(videoId) || rawUrl.includes('pot=')) && typeof win?.fetch === 'function') {
         try {
             const resp = await win.fetch(rawUrl, { credentials: 'include' });
             if (resp?.ok) {
@@ -1979,14 +2022,14 @@ async function obtainRawSegmentsForVideo(videoId, win) {
                 if (cues.length) {
                     const lang = normalizeBaseLang(new URL(rawUrl).searchParams.get('lang'));
                     st.originCuesByVid.set(videoId, { lang, cues, ts: Date.now() });
-                    return { lang, segments: cues };
+                    return { lang, segments: cues, alreadyTranslated: false, audioLang: '', captionTracks: [] };
                 }
             }
         } catch {}
     }
 
     const panelSegs = await fetchTranscriptViaGetPanel(videoId, win).catch(() => []);
-    return { lang: '', segments: panelSegs };
+    return { lang: '', segments: panelSegs, alreadyTranslated: false, audioLang: '', captionTracks: [] };
 }
 
 function getActiveVideoIdSafe(player, win) {
@@ -2050,13 +2093,19 @@ function ensureFallbackBox(player, doc, win) {
     return box;
 }
 
-/** Hide and remove the fallback caption overlay and tear down its sync loop. */
+/** Hide and remove the fallback caption overlay and tear down its sync loop or Whisper session. */
 function clearFallbackCaptions(doc = typeof document !== 'undefined' ? document : null, win = typeof window !== 'undefined' ? window : null) {
     const ctrl = getFallbackCtrl(win);
     clearTimeout(ctrl.watchdogTimer);
     ctrl.watchdogTimer = null;
     ctrl.activeVid = null;
     ctrl.inflightVid = null;
+    ctrl.forceOverlay = false;
+    if (typeof ctrl.stopWhisper === 'function') {
+        try { ctrl.stopWhisper(); } catch {}
+        ctrl.stopWhisper = null;
+    }
+    ctrl.whisperVid = null;
     if (typeof ctrl.stopLoop === 'function') {
         try { ctrl.stopLoop(); } catch {}
         ctrl.stopLoop = null;
@@ -2095,7 +2144,7 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
             clearFallbackCaptions(doc, win);
             return;
         }
-        if (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn() === false) {
+        if (!ctrl.forceOverlay && typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn() === false) {
             clearFallbackCaptions(doc, win);
             return;
         }
@@ -2118,6 +2167,7 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
     const timer = typeof setInterval === 'function' ? setInterval(() => {
         if (ctrl.activeVid === videoId && !video.paused) renderTick();
     }, 180) : null;
+    if (timer && typeof timer.unref === 'function') timer.unref();
 
     ctrl.stopLoop = () => {
         video.removeEventListener?.('timeupdate', onTime);
@@ -2136,8 +2186,112 @@ function buildChunksForSegments(segments, translatedByIdx, maxChars) {
     return chunks;
 }
 
-async function runFallbackSubtitles({ player, videoId, sourceLang, userLang, doc, win, requestFn }) {
+function dispatchWhisperCmd(win, detail) {
+    if (!win || typeof win.dispatchEvent !== 'function') return false;
+    const Ev = typeof win.CustomEvent === 'function' ? win.CustomEvent : (typeof CustomEvent === 'function' ? CustomEvent : null);
+    if (!Ev) return false;
+    win.dispatchEvent(new Ev('supratube-whisper-cmd', { detail }));
+    return true;
+}
+
+function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, manualForce = false }) {
+    if (doc?.documentElement?.dataset?.supratubeWhisperBridge !== '1') return false;
     const ctrl = getFallbackCtrl(win);
+    if (ctrl.whisperVid === videoId) return true;
+    if (typeof ctrl.stopWhisper === 'function') {
+        try { ctrl.stopWhisper(); } catch {}
+        ctrl.stopWhisper = null;
+    }
+    if (typeof ctrl.stopLoop === 'function') {
+        try { ctrl.stopLoop(); } catch {}
+        ctrl.stopLoop = null;
+    }
+
+    ctrl.activeVid = videoId;
+    ctrl.whisperVid = videoId;
+    ctrl.forceOverlay = true;
+    video?.setAttribute?.('data-supratube-whisper-target', videoId);
+
+    let fadeTimer = null;
+    const showLine = (text, autoFadeMs = 0) => {
+        if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
+        const curVid = getActiveVideoIdSafe(player, win);
+        if ((curVid && curVid !== videoId) || hasVisibleNativeCaptions(player)) {
+            clearFallbackCaptions(doc, win);
+            return;
+        }
+        const box = ensureFallbackBox(player, doc, win);
+        if (!box) return;
+        const segEl = box.children?.[0];
+        if (segEl) segEl.textContent = text;
+        box.style.display = text ? 'block' : 'none';
+        clearTimeout(fadeTimer);
+        if (text && autoFadeMs > 0) {
+            fadeTimer = setTimeout(() => {
+                if (ctrl.whisperVid === videoId) {
+                    const el = doc?.getElementById?.(FALLBACK_BOX_ID);
+                    if (el) el.style.display = 'none';
+                }
+            }, autoFadeMs);
+        }
+    };
+
+    const onEvt = ev => {
+        const d = ev?.detail;
+        if (!d || typeof d !== 'object') return;
+        if (d.videoId && d.videoId !== videoId) return;
+        if (ctrl.whisperVid !== videoId) return;
+
+        if (d.kind === 'same_language' && !manualForce) {
+            ctrl.sameLangVideos.add(videoId);
+            clearFallbackCaptions(doc, win);
+            return;
+        }
+        if (d.kind === 'progress') {
+            if (d.pct > 0 && d.pct < 100) showLine(`Subtítulos IA (${d.pct}%)...`, 0);
+            return;
+        }
+        if (d.kind === 'ready') {
+            showLine('', 0);
+            return;
+        }
+        if (d.kind === 'caption') {
+            const txt = String(d.translated || d.raw || '').trim();
+            if (txt) showLine(txt, 4500);
+            return;
+        }
+        if (d.kind === 'error') {
+            clearFallbackCaptions(doc, win);
+        }
+    };
+
+    win?.addEventListener?.('supratube-whisper-evt', onEvt);
+    ctrl.stopWhisper = () => {
+        clearTimeout(fadeTimer);
+        win?.removeEventListener?.('supratube-whisper-evt', onEvt);
+        video?.removeAttribute?.('data-supratube-whisper-target');
+        dispatchWhisperCmd(win, { action: 'stop', videoId });
+    };
+
+    dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: userLang, manualForce: Boolean(manualForce) });
+    return true;
+}
+
+async function runFallbackSubtitles({
+    player,
+    videoId,
+    sourceLang,
+    userLang,
+    captionTracks = [],
+    doc,
+    win,
+    requestFn,
+    forceOverlay = false,
+    allowWhisper = false,
+    manualForce = false
+}) {
+    const ctrl = getFallbackCtrl(win);
+    if (ctrl.sameLangVideos.has(videoId) && !manualForce) return;
     if (ctrl.activeVid === videoId || ctrl.inflightVid === videoId) return;
     if (hasVisibleNativeCaptions(player)) return;
     const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
@@ -2152,15 +2306,45 @@ async function runFallbackSubtitles({ player, videoId, sourceLang, userLang, doc
 
         let chunks = ctrl.cache.get(cacheKey) || null;
         if (chunks?.length) {
+            ctrl.forceOverlay = Boolean(forceOverlay);
             startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks: () => chunks });
             return;
         }
 
-        const { lang: detectedSrcLang, segments } = await obtainRawSegmentsForVideo(videoId, win);
-        if (!segments.length || getActiveVideoIdSafe(player, win) !== videoId) return;
-        if (hasVisibleNativeCaptions(player)) return;
+        const recovered = await obtainRawSegmentsForVideo(videoId, win, { userLang: targetBase, captionTracks, doc, requestFn });
+        const segments = recovered?.segments || [];
+        if (getActiveVideoIdSafe(player, win) !== videoId || hasVisibleNativeCaptions(player)) return;
 
-        const srcLang = normalizeBaseLang(detectedSrcLang || sourceLang) || 'auto';
+        const recoveredAudioLang = normalizeBaseLang(
+            recovered?.audioLang ||
+            sourceLang ||
+            detectVideoAudioLang({ captionTracks: recovered?.captionTracks || [] })
+        );
+        if (!manualForce && recoveredAudioLang && recoveredAudioLang === targetBase) {
+            ctrl.sameLangVideos.add(videoId);
+            clearFallbackCaptions(doc, win);
+            return;
+        }
+
+        if (!segments.length) {
+            if (allowWhisper) {
+                startWhisperLiveFallback({ player, video, videoId, userLang: targetBase, doc, win, manualForce });
+            }
+            return;
+        }
+
+        ctrl.forceOverlay = Boolean(forceOverlay);
+        const segLang = normalizeBaseLang(recovered?.lang || sourceLang);
+        const alreadyInTarget = Boolean(recovered?.alreadyTranslated) || (segLang && segLang === targetBase);
+
+        if (alreadyInTarget) {
+            chunks = buildChunksForSegments(segments, segments.map(s => s.text), maxChars);
+            setBoundedCache(ctrl.cache, cacheKey, chunks);
+            startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks: () => chunks });
+            return;
+        }
+
+        const srcLang = segLang || 'auto';
         const translated = new Array(segments.length);
         const curTime = Number(video.currentTime) || 0;
         let firstIdx = segments.findIndex(s => s.end > curTime);
@@ -2205,7 +2389,7 @@ async function runFallbackSubtitles({ player, videoId, sourceLang, userLang, doc
     }
 }
 
-function armFallbackWatchdog({ player, decision, videoId, userLang, doc, win, requestFn, delayMs = 1800 }) {
+function armFallbackWatchdog({ player, decision, videoId, userLang, captionTracks, doc, win, requestFn, delayMs = 1800, skipWhisperFallback = false }) {
     if (!videoId || (!player?.querySelector && !doc?.querySelector)) return;
     const st = getTtState(win);
     const ctrl = getFallbackCtrl(win);
@@ -2219,7 +2403,18 @@ function armFallbackWatchdog({ player, decision, videoId, userLang, doc, win, re
         if (getActiveVideoIdSafe(player, win) !== videoId) return;
         if (hasVisibleNativeCaptions(player)) return;
         if (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn() === false) return;
-        runFallbackSubtitles({ player, videoId, sourceLang, userLang, doc, win, requestFn }).catch(() => {});
+        runFallbackSubtitles({
+            player,
+            videoId,
+            sourceLang,
+            userLang,
+            captionTracks,
+            doc,
+            win,
+            requestFn,
+            forceOverlay: true,
+            allowWhisper: !skipWhisperFallback
+        }).catch(() => {});
     };
 
     if (st.failedByVid.has(videoId) && st.healthyLangByVid.get(videoId) !== targetBase) {
@@ -2267,9 +2462,18 @@ function bindManualCaptionListeners(
         try { doc.__supratubeOnManualCaption?.(); } catch {}
     };
 
+    const isDisabledCcClick = ev => {
+        const controls = ev.target?.closest?.('.ytp-right-controls, .ytp-chrome-controls');
+        if (!controls || typeof ev.clientX !== 'number') return false;
+        const cc = controls.querySelector?.('.ytp-subtitles-button');
+        if (!cc?.disabled && cc?.getAttribute?.('aria-disabled') !== 'true') return false;
+        const r = cc.getBoundingClientRect?.();
+        return Boolean(r && r.width > 0 && ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom);
+    };
+
     doc.addEventListener('click', ev => {
         if (!ev.isTrusted) return;
-        if (ev.target?.closest?.('.ytp-subtitles-button') || isShortsCaptionMenuClick(ev.target)) {
+        if (ev.target?.closest?.('.ytp-subtitles-button') || isShortsCaptionMenuClick(ev.target) || isDisabledCcClick(ev)) {
             clearAutoFlag();
         }
     }, true);
@@ -2328,6 +2532,11 @@ async function applySmartSubtitles(player, deps = {}) {
         playerResponse: pr
     });
 
+    const ctrl = getFallbackCtrl(win);
+    if (targetVideoId && ctrl.sameLangVideos.has(targetVideoId) && !deps.manualForce) {
+        return false;
+    }
+
     const decision = chooseSubtitleAction({
         videoLang,
         userLang: deps.userLang,
@@ -2337,7 +2546,28 @@ async function applySmartSubtitles(player, deps = {}) {
         autoActivatedByScript
     });
 
-    if (decision.action === 'noop') return false;
+    if (decision.action === 'noop') {
+        const baseVideo = normalizeBaseLang(videoLang);
+        const baseUser = normalizeBaseLang(deps.userLang);
+        if (!baseUser || (baseVideo && baseVideo === baseUser) || deps.skipFallbackCheck || !targetVideoId) {
+            return false;
+        }
+        if (captionsCurrentlyOn && !deps.manualForce) return false;
+        runFallbackSubtitles({
+            player,
+            videoId: targetVideoId,
+            sourceLang: videoLang || '',
+            userLang: deps.userLang,
+            captionTracks,
+            doc,
+            win,
+            requestFn,
+            forceOverlay: true,
+            allowWhisper: !deps.skipWhisperFallback,
+            manualForce: Boolean(deps.manualForce)
+        }).catch(() => {});
+        return true;
+    }
 
     if (decision.action === 'disable') {
         clearFallbackCaptions(doc, win);
@@ -2386,10 +2616,12 @@ async function applySmartSubtitles(player, deps = {}) {
             decision,
             videoId: targetVideoId,
             userLang: deps.userLang,
+            captionTracks,
             doc,
             win,
             requestFn,
-            delayMs: deps.fallbackWatchdogMs ?? 1800
+            delayMs: deps.fallbackWatchdogMs ?? 1800,
+            skipWhisperFallback: Boolean(deps.skipWhisperFallback)
         });
     }
 
@@ -2431,6 +2663,19 @@ const __supratubeTdExports = (() => {
                 deviceModel: 'iPhone16,2',
                 osName: 'iPhone',
                 osVersion: '17.5.1.21F90',
+                hl: 'es',
+                gl: 'ES'
+            }
+        },
+        {
+            name: 'ANDROID_VR',
+            id: '28',
+            context: {
+                clientName: 'ANDROID_VR',
+                clientVersion: '1.62.27',
+                androidSdkVersion: 32,
+                osName: 'Android',
+                osVersion: '12L',
                 hl: 'es',
                 gl: 'ES'
             }
@@ -2852,6 +3097,12 @@ const __supratubeTdExports = (() => {
                 if (sum) {
                     if (!title && sum.title) title = sum.title;
                     if (publishDate === '0000-00-00' && sum.publishDate !== '0000-00-00') publishDate = sum.publishDate;
+                    if (!audioLang) {
+                        audioLang = detectVideoAudioLang({
+                            adaptiveFormats: sum.adaptiveFormats,
+                            captionTracks: sum.captionTracks
+                        });
+                    }
                     if (sum.captionTracks.length) {
                         clientTrackSets.push({ source: cli.name, tracks: sum.captionTracks });
                         if (!captionTracks.length) captionTracks = sum.captionTracks;
@@ -3078,6 +3329,136 @@ const __supratubeTdExports = (() => {
         return translated;
     }
 
+    function tdIsServerTranslatedResponse(cues, returnedLang, origLang, baseUser) {
+        if (!returnedLang || origLang === baseUser) return false;
+        if (baseUser !== 'es') return true;
+        return tdLooksLikeSpanish(cues);
+    }
+
+    /** Shared 7-layer YouTube caption/transcript recovery used by both live subtitles and TXT export. */
+    async function tdRecoverRawSubtitleCues({
+        videoId,
+        userLang = 'es',
+        titleHint = '',
+        dateHint = '0000-00-00',
+        captionTracksHint = [],
+        doc = typeof document !== 'undefined' ? document : null,
+        win = typeof window !== 'undefined' ? window : null,
+        requestFn = gmRequest
+    } = {}) {
+        const vid = String(videoId || getVideoId(win?.location?.href || '') || '').trim();
+        const baseUser = normalizeBaseLang(userLang) || 'es';
+        const meta = await tdResolveVideoMetadata({ videoId: vid, titleHint, dateHint, doc, win, requestFn });
+        if (!meta.captionTracks.length && Array.isArray(captionTracksHint) && captionTracksHint.length) {
+            meta.captionTracks = captionTracksHint;
+            if (!meta.audioLang) {
+                meta.audioLang = detectVideoAudioLang({ captionTracks: meta.captionTracks });
+            }
+        }
+        const chosen = chooseTranscriptDownloadTrack(meta.captionTracks, baseUser);
+
+        let cues = [];
+        let sourceLang = '';
+        let alreadyTranslated = false;
+        const st = getTtState(win);
+
+        // Layer 1a: Live timedtext cache captured during playback.
+        const cachedOrigin = st.originCuesByVid.get(vid);
+        if (cachedOrigin?.cues?.length) {
+            const cachedBase = normalizeBaseLang(cachedOrigin.lang);
+            if (!chosen || normalizeBaseLang(chosen.languageCode) === cachedBase || cachedBase === baseUser) {
+                cues = cachedOrigin.cues;
+                sourceLang = cachedBase;
+            }
+        }
+
+        // Layer 1b: Captured / PerformanceObserver PO-token timedtext URL.
+        const perfRawUrl = st.rawUrlsByVid.get(vid) || collectPerformanceTimedtextUrl(win, vid);
+        if (!cues.length && perfRawUrl && (!st.directBlockedByVid.has(vid) || perfRawUrl.includes('pot=')) && typeof win?.fetch === 'function') {
+            try {
+                const resp = await win.fetch(perfRawUrl, { credentials: 'include' });
+                if (resp?.ok) {
+                    const parsed = parseTimedtextResponseText(await resp.text());
+                    if (parsed.length) {
+                        cues = parsed;
+                        sourceLang = normalizeBaseLang(new URL(perfRawUrl).searchParams.get('lang'));
+                        st.originCuesByVid.set(vid, { lang: sourceLang, cues: parsed, ts: Date.now() });
+                    }
+                }
+            } catch {}
+        }
+
+        // Layer 1c: Direct track fetch on active tracks; retry via ANDROID/IOS/ANDROID_VR/MWEB on empty/429.
+        const rateLimited = st.directBlockedByVid.has(vid);
+        if (!cues.length && chosen?.baseUrl && !rateLimited) {
+            const directRes = await tdFetchTrackCues(chosen.baseUrl, baseUser, chosen.needsTranslate, win, requestFn);
+            if (!directRes?.rateLimited && directRes?.cues?.length) {
+                cues = directRes.cues;
+                const origLang = normalizeBaseLang(chosen.languageCode);
+                const serverTranslated = tdIsServerTranslatedResponse(cues, directRes.lang, origLang, baseUser);
+                alreadyTranslated = serverTranslated;
+                sourceLang = serverTranslated ? normalizeBaseLang(directRes.lang) : origLang;
+            }
+        }
+
+        if (!cues.length) {
+            const cfg = tdGetYtCfg(win);
+            const mobileTracks = await tdFetchMobileCaptionTracks(vid, cfg, win, requestFn);
+            if (mobileTracks.length) {
+                if (!meta.captionTracks.length) meta.captionTracks = mobileTracks;
+                if (!meta.audioLang) meta.audioLang = detectVideoAudioLang({ captionTracks: mobileTracks });
+                const mobileChosen = chooseTranscriptDownloadTrack(mobileTracks, baseUser);
+                const mobRes = await tdFetchTrackCues(mobileChosen.baseUrl, baseUser, mobileChosen.needsTranslate, win, requestFn);
+                if (mobRes?.cues?.length) {
+                    cues = mobRes.cues;
+                    const origLang = normalizeBaseLang(mobileChosen.languageCode);
+                    const serverTranslated = tdIsServerTranslatedResponse(cues, mobRes.lang, origLang, baseUser);
+                    alreadyTranslated = serverTranslated;
+                    sourceLang = serverTranslated ? normalizeBaseLang(mobRes.lang) : origLang;
+                }
+            }
+        }
+
+        // Layer 1d: Innertube /youtubei/v1/get_panel (PAmodern_transcript_view).
+        if (!cues.length) {
+            const panelCues = await fetchTranscriptViaGetPanel(vid, win).catch(() => []);
+            if (panelCues.length) {
+                cues = panelCues;
+                sourceLang = tdInferCueLang({ explicitLang: '', cues: panelCues, meta, baseUser });
+            }
+        }
+
+        // Layer 1e: Innertube /next + /youtubei/v1/get_transcript.
+        if (!cues.length) {
+            const trCues = await tdFetchViaGetTranscript(vid, chosen, doc, win, requestFn);
+            if (trCues.length) {
+                cues = trCues;
+                sourceLang = tdInferCueLang({ explicitLang: '', cues: trCues, meta, baseUser });
+            }
+        }
+
+        // Layer 1f: Active /watch DOM transcript panel segments.
+        if (!cues.length && !isShortsUrl(win?.location?.pathname || '') && getVideoId(win?.location?.href || '') === vid) {
+            const domCues = tdReadDomTranscriptSegments(doc);
+            if (domCues.length) {
+                cues = domCues;
+                sourceLang = tdInferCueLang({ explicitLang: '', cues: domCues, meta, baseUser });
+            }
+        }
+
+        const effectiveSource = sourceLang || tdInferCueLang({ explicitLang: '', cues, meta, baseUser });
+        return {
+            videoId: vid,
+            segments: cues,
+            cues,
+            lang: effectiveSource,
+            alreadyTranslated,
+            audioLang: meta.audioLang || detectVideoAudioLang({ captionTracks: meta.captionTracks }),
+            captionTracks: meta.captionTracks,
+            meta
+        };
+    }
+
     /** Multi-layer single video / Short transcript extractor, translator, and .txt formatter. */
     async function extractVideoTranscript({
         videoId,
@@ -3096,81 +3477,17 @@ const __supratubeTdExports = (() => {
         }
 
         const baseUser = normalizeBaseLang(userLang) || 'es';
-        const meta = await tdResolveVideoMetadata({ videoId: vid, titleHint, dateHint, doc, win, requestFn });
-        const chosen = chooseTranscriptDownloadTrack(meta.captionTracks, baseUser);
-
-        let cues = [];
-        let sourceLang = '';
-        const st = getTtState(win);
-
-        // Layer 1: Live timedtext cache captured during playback.
-        const cachedOrigin = st.originCuesByVid.get(vid);
-        if (cachedOrigin?.cues?.length) {
-            const cachedBase = normalizeBaseLang(cachedOrigin.lang);
-            if (!chosen || normalizeBaseLang(chosen.languageCode) === cachedBase || cachedBase === baseUser) {
-                cues = cachedOrigin.cues;
-                sourceLang = cachedBase;
-            }
-        }
-
-        // Layer 2: Direct track fetch on active tracks; on 429 or missing direct URL, retry via ANDROID/IOS/MWEB clients.
-        let rateLimited = st.directBlockedByVid.has(vid);
-        if (!cues.length && chosen?.baseUrl && !rateLimited) {
-            const directRes = await tdFetchTrackCues(chosen.baseUrl, baseUser, chosen.needsTranslate, win, requestFn);
-            if (directRes?.rateLimited) {
-                rateLimited = true;
-            } else if (directRes?.cues?.length) {
-                cues = directRes.cues;
-                const origLang = normalizeBaseLang(chosen.languageCode);
-                const serverTranslated = directRes.lang && origLang !== baseUser &&
-                    (baseUser !== 'es' || cues.length < 2 || tdLooksLikeSpanish(cues));
-                sourceLang = serverTranslated ? normalizeBaseLang(directRes.lang) : origLang;
-            }
-        }
-
-        if (!cues.length) {
-            const cfg = tdGetYtCfg(win);
-            const mobileTracks = await tdFetchMobileCaptionTracks(vid, cfg, win, requestFn);
-            if (mobileTracks.length) {
-                if (!meta.captionTracks.length) meta.captionTracks = mobileTracks;
-                const mobileChosen = chooseTranscriptDownloadTrack(mobileTracks, baseUser);
-                const mobRes = await tdFetchTrackCues(mobileChosen.baseUrl, baseUser, mobileChosen.needsTranslate, win, requestFn);
-                if (mobRes?.cues?.length) {
-                    cues = mobRes.cues;
-                    const origLang = normalizeBaseLang(mobileChosen.languageCode);
-                    const serverTranslated = mobRes.lang && origLang !== baseUser &&
-                        (baseUser !== 'es' || cues.length < 2 || tdLooksLikeSpanish(cues));
-                    sourceLang = serverTranslated ? normalizeBaseLang(mobRes.lang) : origLang;
-                }
-            }
-        }
-
-        // Layer 3: Innertube /youtubei/v1/get_panel (PAmodern_transcript_view).
-        if (!cues.length) {
-            const panelCues = await fetchTranscriptViaGetPanel(vid, win).catch(() => []);
-            if (panelCues.length) {
-                cues = panelCues;
-                sourceLang = tdInferCueLang({ explicitLang: '', cues: panelCues, meta, baseUser });
-            }
-        }
-
-        // Layer 4: Innertube /next + /youtubei/v1/get_transcript.
-        if (!cues.length) {
-            const trCues = await tdFetchViaGetTranscript(vid, chosen, doc, win, requestFn);
-            if (trCues.length) {
-                cues = trCues;
-                sourceLang = tdInferCueLang({ explicitLang: '', cues: trCues, meta, baseUser });
-            }
-        }
-
-        // Layer 5: Active /watch DOM transcript panel segments.
-        if (!cues.length && !isShortsUrl(win?.location?.pathname || '') && getVideoId(win?.location?.href || '') === vid) {
-            const domCues = tdReadDomTranscriptSegments(doc);
-            if (domCues.length) {
-                cues = domCues;
-                sourceLang = tdInferCueLang({ explicitLang: '', cues: domCues, meta, baseUser });
-            }
-        }
+        const recovered = await tdRecoverRawSubtitleCues({
+            videoId: vid,
+            userLang: baseUser,
+            titleHint,
+            dateHint,
+            doc,
+            win,
+            requestFn
+        });
+        let cues = recovered.cues;
+        const meta = recovered.meta;
 
         if (!cues.length) {
             const err = new Error('Este video no tiene transcripción ni subtítulos disponibles');
@@ -3178,9 +3495,9 @@ const __supratubeTdExports = (() => {
             throw err;
         }
 
-        let translated = false;
-        const effectiveSource = tdInferCueLang({ explicitLang: sourceLang, cues, meta, baseUser });
-        if (effectiveSource !== baseUser) {
+        let translated = Boolean(recovered.alreadyTranslated);
+        const effectiveSource = tdInferCueLang({ explicitLang: recovered.lang, cues, meta, baseUser });
+        if (!translated && effectiveSource !== baseUser) {
             cues = await tdTranslateCuesInBatches(cues, effectiveSource, baseUser, requestFn);
             translated = true;
         }
@@ -3818,6 +4135,7 @@ const __supratubeTdExports = (() => {
         sanitizeTranscriptFilename,
         chooseTranscriptDownloadTrack,
         buildGetTranscriptParamsCandidates,
+        tdRecoverRawSubtitleCues,
         extractVideoTranscript,
         createTranscriptDownloadController
     };
@@ -4588,10 +4906,38 @@ function boot() {
     }
     injectAdStyles(document);
     bindManualCaptionListeners(document, window, null, () => {
-        S.subsUserTouchedVideo = S.videoId;
+        const vid = S.videoId;
+        const wasFallback = isFallbackCaptionsActive(window, vid);
+        if (wasFallback) {
+            S.subsUserTouchedVideo = vid;
+            clearFallbackCaptions(document, window);
+            return;
+        }
+        const p = getPlayer();
+        const tracks = p?.getOption?.('captions', 'tracklist', { includeAsr: true });
+        if (vid && p && !p.isSubtitlesOn?.() && (!Array.isArray(tracks) || !tracks.length) && S.settings.autoSubtitles) {
+            S.subsUserTouchedVideo = vid;
+            Promise.resolve(S.userNativeLang || resolveUserNativeLang())
+                .then(lang => {
+                    S.userNativeLang = lang;
+                    if (getVideoId() !== vid) return;
+                    return applySmartSubtitles(p, {
+                        enabled: S.settings.autoSubtitles,
+                        userLang: lang,
+                        expectedVideoId: vid,
+                        doc: document,
+                        win: window,
+                        gmRequestFn: gmRequest,
+                        manualForce: true
+                    });
+                })
+                .catch(() => {});
+            return;
+        }
+        S.subsUserTouchedVideo = vid;
         setTimeout(() => {
-            const p = getPlayer();
-            if (p && typeof p.isSubtitlesOn === 'function' && !p.isSubtitlesOn()) {
+            const curPlayer = getPlayer();
+            if (curPlayer && typeof curPlayer.isSubtitlesOn === 'function' && !curPlayer.isSubtitlesOn()) {
                 clearFallbackCaptions(document, window);
             }
         }, 60);
@@ -4676,6 +5022,7 @@ function boot() {
     window.addEventListener('yt-navigate-start', () => {
         S.sbVideoId = null;
         S.sbSegments = [];
+        clearFallbackCaptions(document, window);
         clearVideoCache();
         S._aiCtrl.resetForVideo('', false);
     }, { passive: true });

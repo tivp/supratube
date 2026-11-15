@@ -708,3 +708,300 @@ test('decodeHtmlEntities and parseTimedtextResponseText decode XML/JSON3/WebVTT 
         ]
     );
 });
+
+test('applySmartSubtitles recovers hidden ANDROID captions when tracklist is empty and displays translated overlay with isSubtitlesOn=false', async () => {
+    const elements = new Map();
+    const createEl = tag => ({
+        tagName: tag.toUpperCase(),
+        id: '',
+        className: '',
+        textContent: '',
+        style: {},
+        dataset: {},
+        children: [],
+        setAttribute(k, v) { this[k] = v; },
+        getAttribute(k) { return this[k] ?? null; },
+        appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+        remove() {
+            if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(c => c !== this);
+            if (this.id) elements.delete(this.id);
+        },
+        querySelectorAll: () => []
+    });
+
+    const videoEl = {
+        currentTime: 2.0,
+        paused: false,
+        listeners: {},
+        addEventListener(ev, fn) { (this.listeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { this.listeners[ev] = (this.listeners[ev] || []).filter(f => f !== fn); }
+    };
+    const fakePlayer = {
+        id: 'movie_player',
+        clientWidth: 1000,
+        children: [],
+        loadModule: () => {},
+        // Simulate YouTube "Subtítulos no disponibles": player permanently reports subs OFF and empty tracks
+        isSubtitlesOn: () => false,
+        getVideoData: () => ({ video_id: 'tgbNymZ7vqY' }),
+        querySelector: sel => {
+            if (sel === 'video') return videoEl;
+            if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+            if (sel === '.ytp-subtitles-button') return { disabled: true, getAttribute: () => 'Subtítulos no disponibles' };
+            return null;
+        },
+        querySelectorAll: () => [],
+        appendChild(el) {
+            this.children.push(el);
+            el.parentNode = this;
+            if (el.id) elements.set(el.id, el);
+            return el;
+        },
+        getOption: () => [],
+        setOption: () => {},
+        getPlayerResponse: () => ({
+            videoDetails: { videoId: 'tgbNymZ7vqY', title: 'Hidden Subs Video' }
+        })
+    };
+
+    const fakeDoc = {
+        documentElement: { dataset: {} },
+        createElement: createEl,
+        getElementById: id => elements.get(id) || null,
+        querySelector: () => null,
+        querySelectorAll: () => []
+    };
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/watch?v=tgbNymZ7vqY', search: '?v=tgbNymZ7vqY', pathname: '/watch', origin: 'https://www.youtube.com' },
+        ytcfg: {
+            get: k => ({
+                INNERTUBE_CONTEXT: { client: { clientName: 'WEB', clientVersion: '2.20261112.10.00' } },
+                INNERTUBE_CONTEXT_CLIENT_NAME: 1,
+                INNERTUBE_CONTEXT_CLIENT_VERSION: '2.20261112.10.00',
+                INNERTUBE_API_KEY: 'AIzaTestKey'
+            })[k]
+        },
+        fetch: async (url, init) => {
+            const u = String(url);
+            if (u.includes('/youtubei/v1/player')) {
+                const body = JSON.parse(String(init?.body || '{}'));
+                if (body?.context?.client?.clientName === 'ANDROID') {
+                    return {
+                        ok: true,
+                        status: 200,
+                        text: async () => JSON.stringify({
+                            videoDetails: { videoId: 'tgbNymZ7vqY', title: 'Hidden Subs Video' },
+                            captions: {
+                                playerCaptionsTracklistRenderer: {
+                                    captionTracks: [{ languageCode: 'en', kind: 'asr', baseUrl: 'https://www.youtube.com/api/timedtext?v=tgbNymZ7vqY&lang=en&x=android' }]
+                                }
+                            }
+                        })
+                    };
+                }
+                return { ok: true, status: 200, text: async () => '{}' };
+            }
+            if (u.includes('x=android')) {
+                return {
+                    ok: true,
+                    status: 200,
+                    text: async () => JSON.stringify({
+                        events: [{ tStartMs: 1000, dDurationMs: 4000, segs: [{ utf8: 'Why dont you come see me' }] }]
+                    })
+                };
+            }
+            return { ok: false, status: 404, text: async () => '' };
+        }
+    };
+
+    try {
+        const applied = await applySmartSubtitles(fakePlayer, {
+            enabled: true,
+            userLang: 'es',
+            expectedVideoId: 'tgbNymZ7vqY',
+            doc: fakeDoc,
+            win: fakeWin,
+            skipWhisperFallback: true,
+            gmRequestFn: async url => {
+                if (String(url).includes('translate.googleapis.com')) {
+                    return { status: 200, text: JSON.stringify({ sentences: [{ trans: 'Por qué no vienes a verme' }] }) };
+                }
+                return { status: 404, text: '' };
+            }
+        });
+
+        assert.equal(applied, true);
+        for (let w = 0; w < 20 && !elements.get('supratube-fallback-captions'); w++) {
+            await new Promise(r => setTimeout(r, 15));
+        }
+        const box = elements.get('supratube-fallback-captions');
+        assert.ok(box, 'fallback box must mount even when player.isSubtitlesOn() === false');
+        assert.equal(box.children[0]?.textContent, 'Por qué no vienes a verme');
+    } finally {
+        clearFallbackCaptions(fakeDoc, fakeWin);
+    }
+    assert.equal(elements.get('supratube-fallback-captions'), undefined);
+});
+
+test('applySmartSubtitles skips Layer 1 captions when recovered ANDROID metadata shows audio matches user IP language (es)', async () => {
+    const elements = new Map();
+    const createEl = tag => ({
+        tagName: tag.toUpperCase(),
+        id: '',
+        style: {},
+        dataset: {},
+        children: [],
+        setAttribute(k, v) { this[k] = v; },
+        getAttribute(k) { return this[k] ?? null; },
+        appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+        remove() { if (this.id) elements.delete(this.id); },
+        querySelectorAll: () => []
+    });
+    const fakePlayer = {
+        id: 'movie_player',
+        isSubtitlesOn: () => false,
+        getVideoData: () => ({ video_id: 'esVid000001' }),
+        querySelector: sel => (sel === 'video' ? { currentTime: 1, paused: false, addEventListener() {}, removeEventListener() {} } : null),
+        querySelectorAll: () => [],
+        appendChild(el) { if (el.id) elements.set(el.id, el); return el; },
+        getOption: () => [],
+        getPlayerResponse: () => ({ videoDetails: { videoId: 'esVid000001' } })
+    };
+    const fakeDoc = {
+        documentElement: { dataset: {} },
+        createElement: createEl,
+        getElementById: id => elements.get(id) || null
+    };
+    let fetchedPlayer = false;
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/watch?v=esVid000001', pathname: '/watch', origin: 'https://www.youtube.com' },
+        ytcfg: { get: () => '' },
+        fetch: async url => {
+            if (String(url).includes('/youtubei/v1/player')) {
+                fetchedPlayer = true;
+                return {
+                    ok: true,
+                    status: 200,
+                    text: async () => JSON.stringify({
+                        videoDetails: { videoId: 'esVid000001' },
+                        captions: {
+                            playerCaptionsTracklistRenderer: {
+                                captionTracks: [{ languageCode: 'es-419', kind: 'asr', baseUrl: 'https://www.youtube.com/api/timedtext?v=esVid000001&lang=es-419' }]
+                            }
+                        }
+                    })
+                };
+            }
+            return { ok: false, status: 404, text: async () => '' };
+        }
+    };
+
+    await applySmartSubtitles(fakePlayer, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: 'esVid000001',
+        doc: fakeDoc,
+        win: fakeWin,
+        skipWhisperFallback: true
+    });
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(fetchedPlayer, true);
+    assert.equal(elements.get('supratube-fallback-captions'), undefined);
+});
+
+test('applySmartSubtitles launches Layer 2 Whisper bridge on truly uncaptioned videos, renders live captions, aborts on same_language, and stops cleanly', async () => {
+    const elements = new Map();
+    const createEl = tag => ({
+        tagName: tag.toUpperCase(),
+        id: '',
+        style: {},
+        dataset: {},
+        children: [],
+        setAttribute(k, v) { this[k] = v; },
+        getAttribute(k) { return this[k] ?? null; },
+        appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+        remove() {
+            if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(c => c !== this);
+            if (this.id) elements.delete(this.id);
+        },
+        querySelectorAll: () => []
+    });
+
+    const videoEl = {
+        currentTime: 2.0,
+        paused: false,
+        attrs: {},
+        setAttribute(k, v) { this.attrs[k] = v; },
+        removeAttribute(k) { delete this.attrs[k]; },
+        addEventListener() {},
+        removeEventListener() {}
+    };
+    const fakePlayer = {
+        id: 'movie_player',
+        clientWidth: 1000,
+        children: [],
+        isSubtitlesOn: () => false,
+        getVideoData: () => ({ video_id: 'noSubsVid01' }),
+        querySelector: sel => (sel === 'video' ? videoEl : (sel === '#supratube-fallback-captions' ? (elements.get('supratube-fallback-captions') || null) : null)),
+        querySelectorAll: () => [],
+        appendChild(el) { this.children.push(el); el.parentNode = this; if (el.id) elements.set(el.id, el); return el; },
+        getOption: () => [],
+        getPlayerResponse: () => ({ videoDetails: { videoId: 'noSubsVid01' } })
+    };
+
+    const cmds = [];
+    const listeners = {};
+    const fakeDoc = {
+        documentElement: { dataset: { supratubeWhisperBridge: '1' } },
+        createElement: createEl,
+        getElementById: id => elements.get(id) || null,
+        querySelector: () => null,
+        querySelectorAll: () => []
+    };
+    class FakeCustomEvent {
+        constructor(type, init = {}) {
+            this.type = type;
+            this.detail = init.detail;
+        }
+    }
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/watch?v=noSubsVid01', pathname: '/watch', origin: 'https://www.youtube.com' },
+        CustomEvent: FakeCustomEvent,
+        ytcfg: { get: () => '' },
+        fetch: async () => ({ ok: true, status: 200, text: async () => '{}' }),
+        addEventListener(ev, fn) { (listeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { listeners[ev] = (listeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) {
+            if (ev.type === 'supratube-whisper-cmd') cmds.push(ev.detail);
+            for (const fn of (listeners[ev.type] || [])) fn(ev);
+        }
+    };
+
+    await applySmartSubtitles(fakePlayer, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: 'noSubsVid01',
+        doc: fakeDoc,
+        win: fakeWin
+    });
+
+    await new Promise(r => setTimeout(r, 30));
+    assert.ok(cmds.some(c => c.action === 'start' && c.videoId === 'noSubsVid01' && c.targetLang === 'es'));
+    assert.equal(videoEl.attrs['data-supratube-whisper-target'], 'noSubsVid01');
+
+    // Emit live Whisper caption event:
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'caption', videoId: 'noSubsVid01', mode: 'final', raw: 'Hello world.', translated: 'Hola mundo.' }
+    }));
+    const box = elements.get('supratube-fallback-captions');
+    assert.ok(box);
+    assert.equal(box.children[0]?.textContent, 'Hola mundo.');
+    assert.equal(box.style.display, 'block');
+
+    // Emit same_language event in auto mode -> aborts Whisper cleanly and hides overlay:
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'same_language', videoId: 'noSubsVid01', lang: 'es' }
+    }));
+    assert.ok(cmds.some(c => c.action === 'stop' && c.videoId === 'noSubsVid01'));
+    assert.equal(elements.get('supratube-fallback-captions'), undefined);
+});

@@ -25,6 +25,7 @@
         };
         if (document.documentElement) {
             document.documentElement.dataset.supratubeBridge = '1';
+            document.documentElement.dataset.supratubeWhisperBridge = '1';
             document.documentElement.dataset.supratubeSettings = JSON.stringify(merged);
         }
         if (dispatchEvent) {
@@ -96,6 +97,158 @@
             // La pestaña pudo cerrarse antes de abortar.
         }
     });
+
+    const captureByVideo = new WeakMap();
+    let whisperSession = { active: false, videoId: '', video: null, connected: false };
+
+    function disconnectProc(entry) {
+        if (!entry) return;
+        try {
+            entry.proc.onaudioprocess = null;
+            if (entry.connected) {
+                entry.src.disconnect(entry.proc);
+                entry.proc.disconnect(entry.mute);
+                entry.connected = false;
+            }
+        } catch {}
+    }
+
+    function stopWhisperCapture(videoId = '') {
+        if (!whisperSession.active) return;
+        if (videoId && whisperSession.videoId && videoId !== whisperSession.videoId) return;
+        const vid = whisperSession.videoId;
+        const vidEl = whisperSession.video;
+        whisperSession = { active: false, videoId: '', video: null, connected: false };
+        if (vidEl) {
+            disconnectProc(captureByVideo.get(vidEl));
+        }
+        chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_STOP', videoId: vid }).catch(() => {});
+    }
+
+    async function startWhisperCapture({ videoId, targetLang = 'es', manualForce = false }) {
+        if (!videoId) return;
+        const vidEl =
+            document.querySelector(`video[data-supratube-whisper-target="${videoId}"]`) ||
+            document.querySelector('ytd-reel-video-renderer[is-active] video') ||
+            document.querySelector('video.html5-main-video') ||
+            document.querySelector('video');
+        if (!vidEl) return;
+
+        if (whisperSession.active && whisperSession.videoId !== videoId) {
+            stopWhisperCapture(whisperSession.videoId);
+        }
+
+        let entry = captureByVideo.get(vidEl);
+        if (!entry) {
+            const stream = vidEl.captureStream ? vidEl.captureStream() : vidEl.mozCaptureStream?.();
+            const aTracks = stream?.getAudioTracks?.() || [];
+            if (!aTracks.length) return;
+
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) return;
+            const ctx = new Ctx({ sampleRate: 16000 });
+            const src = ctx.createMediaStreamSource(new MediaStream(aTracks));
+            const proc = ctx.createScriptProcessor(4096, 1, 1);
+            const mute = ctx.createGain();
+            mute.gain.value = 0;
+            mute.connect(ctx.destination);
+            entry = { ctx, src, proc, mute, connected: false, boundSeek: false };
+            captureByVideo.set(vidEl, entry);
+        }
+
+        if (!entry.boundSeek) {
+            entry.boundSeek = true;
+            vidEl.addEventListener('seeked', () => {
+                if (whisperSession.active && whisperSession.video === vidEl) {
+                    chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_RESET', videoId: whisperSession.videoId }).catch(() => {});
+                }
+            }, { passive: true });
+        }
+
+        if (entry.ctx.state === 'suspended') {
+            await entry.ctx.resume().catch(() => {});
+        }
+
+        const startRes = await new Promise(resolve => {
+            chrome.runtime.sendMessage(
+                { action: 'SUPRATUBE_WHISPER_START', videoId, targetLang, manualForce: Boolean(manualForce) },
+                r => resolve(chrome.runtime.lastError ? { ok: false } : (r || { ok: false }))
+            );
+        });
+        if (!startRes?.ok) {
+            window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
+                detail: { kind: 'error', videoId, error: startRes?.error || 'offscreen unavailable' }
+            }));
+            return;
+        }
+
+        whisperSession = { active: true, videoId, video: vidEl, connected: true };
+        let batch = [];
+        let len = 0;
+
+        entry.proc.onaudioprocess = ev => {
+            if (!whisperSession.active || whisperSession.videoId !== videoId || whisperSession.video !== vidEl) return;
+            if (vidEl.paused || vidEl.ended) {
+                batch = [];
+                len = 0;
+                return;
+            }
+            const ch = ev.inputBuffer.getChannelData(0);
+            batch.push(new Float32Array(ch));
+            len += ch.length;
+            if (len >= 4000) {
+                const out = new Float32Array(len);
+                let o = 0;
+                let sum = 0;
+                for (let i = 0; i < batch.length; i++) {
+                    const b = batch[i];
+                    out.set(b, o);
+                    o += b.length;
+                    for (let j = 0; j < b.length; j++) sum += b[j] * b[j];
+                }
+                batch = [];
+                len = 0;
+                chrome.runtime.sendMessage({
+                    action: 'SUPRATUBE_WHISPER_PCM',
+                    videoId,
+                    samples: Array.from(out),
+                    videoTime: Number(vidEl.currentTime) || 0,
+                    rms: Math.sqrt(sum / out.length)
+                }).catch(() => {});
+            }
+        };
+
+        if (!entry.connected) {
+            entry.src.connect(entry.proc);
+            entry.proc.connect(entry.mute);
+            entry.connected = true;
+        }
+    }
+
+    window.addEventListener('supratube-whisper-cmd', e => {
+        const d = e?.detail;
+        if (!d || typeof d !== 'object') return;
+        if (d.action === 'start') {
+            void startWhisperCapture(d);
+        } else if (d.action === 'stop') {
+            stopWhisperCapture(d.videoId || '');
+        } else if (d.action === 'reset' && d.videoId && whisperSession.videoId === d.videoId) {
+            chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_RESET', videoId: d.videoId }).catch(() => {});
+        }
+    });
+
+    try {
+        chrome.runtime.onMessage.addListener(msg => {
+            if (msg?.action === 'SUPRATUBE_WHISPER_EVENT' && msg.payload) {
+                if (msg.payload.kind === 'same_language' && !msg.payload.manualForce) {
+                    stopWhisperCapture(msg.payload.videoId || '');
+                }
+                window.dispatchEvent(new CustomEvent('supratube-whisper-evt', { detail: msg.payload }));
+            }
+        });
+    } catch {
+        // Ignorar si la extensión acaba de recargarse.
+    }
 
     try {
         chrome.runtime.sendMessage({ action: 'SUPRATUBE_INIT_TAB' }, () => {

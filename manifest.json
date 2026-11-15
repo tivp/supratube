@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Supratube | Maximus",
-    "version": "1.0.7",
+    "version": "1.0.8",
     "description": "YouTube sin anuncios, 1080p/Premium automático, barra verde SponsorBlock, subtítulos por IP, IA y descarga TXT.",
     "author": "tivp",
     "icons": {
@@ -18,7 +18,8 @@
         "storage",
         "scripting",
         "tabs",
-        "userScripts"
+        "userScripts",
+        "offscreen"
     ],
     "host_permissions": [
         "https://www.youtube.com/*",
@@ -32,8 +33,16 @@
         "https://raw.githubusercontent.com/*",
         "https://api.github.com/*",
         "https://translate.googleapis.com/*",
-        "https://clients5.google.com/*"
+        "https://clients5.google.com/*",
+        "https://huggingface.co/*",
+        "https://*.huggingface.co/*",
+        "https://*.hf.co/*",
+        "https://cdn-lfs.huggingface.com/*",
+        "https://cdn-lfs-us-1.hf.co/*"
     ],
+    "content_security_policy": {
+        "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    },
     "background": {
         "service_worker": "background.js"
     },

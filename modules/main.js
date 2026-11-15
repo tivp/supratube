@@ -4,7 +4,14 @@ import { installLayer0AdPrune, injectAdStyles, trySkipAd, dismissEnforcement } f
 import { fetchSponsorSegments, renderGreenProgressBar, tickSponsorBlock } from './sponsorblock.js';
 import { apply1080pQuality } from './quality.js';
 import { resolveUserNativeLang } from './geo-lang.js';
-import { bindManualCaptionListeners, applySmartSubtitles, installTimedtextMonitor, clearFallbackCaptions, detectVideoAudioLang } from './subtitles.js';
+import {
+    bindManualCaptionListeners,
+    applySmartSubtitles,
+    installTimedtextMonitor,
+    clearFallbackCaptions,
+    isFallbackCaptionsActive,
+    detectVideoAudioLang
+} from './subtitles.js';
 import { createAiSummaryController } from './ai-summary.js';
 import { createTranscriptDownloadController } from './transcript-download.js';
 
@@ -320,10 +327,38 @@ function boot() {
     }
     injectAdStyles(document);
     bindManualCaptionListeners(document, window, null, () => {
-        S.subsUserTouchedVideo = S.videoId;
+        const vid = S.videoId;
+        const wasFallback = isFallbackCaptionsActive(window, vid);
+        if (wasFallback) {
+            S.subsUserTouchedVideo = vid;
+            clearFallbackCaptions(document, window);
+            return;
+        }
+        const p = getPlayer();
+        const tracks = p?.getOption?.('captions', 'tracklist', { includeAsr: true });
+        if (vid && p && !p.isSubtitlesOn?.() && (!Array.isArray(tracks) || !tracks.length) && S.settings.autoSubtitles) {
+            S.subsUserTouchedVideo = vid;
+            Promise.resolve(S.userNativeLang || resolveUserNativeLang())
+                .then(lang => {
+                    S.userNativeLang = lang;
+                    if (getVideoId() !== vid) return;
+                    return applySmartSubtitles(p, {
+                        enabled: S.settings.autoSubtitles,
+                        userLang: lang,
+                        expectedVideoId: vid,
+                        doc: document,
+                        win: window,
+                        gmRequestFn: gmRequest,
+                        manualForce: true
+                    });
+                })
+                .catch(() => {});
+            return;
+        }
+        S.subsUserTouchedVideo = vid;
         setTimeout(() => {
-            const p = getPlayer();
-            if (p && typeof p.isSubtitlesOn === 'function' && !p.isSubtitlesOn()) {
+            const curPlayer = getPlayer();
+            if (curPlayer && typeof curPlayer.isSubtitlesOn === 'function' && !curPlayer.isSubtitlesOn()) {
                 clearFallbackCaptions(document, window);
             }
         }, 60);
@@ -408,6 +443,7 @@ function boot() {
     window.addEventListener('yt-navigate-start', () => {
         S.sbVideoId = null;
         S.sbSegments = [];
+        clearFallbackCaptions(document, window);
         clearVideoCache();
         S._aiCtrl.resetForVideo('', false);
     }, { passive: true });

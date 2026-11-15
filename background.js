@@ -8,7 +8,7 @@ const SYNC_CHECK_KEY = 'supratube_last_sync_check';
 const AUTO_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 const USER_SCRIPT_ID = 'supratube-github-bundle';
 const MATCHES_YOUTUBE = ['https://www.youtube.com/*', 'https://m.youtube.com/*'];
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.7';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.8';
 
 const ORDEN_MODULOS = [
     'config.js',
@@ -378,8 +378,112 @@ chrome.runtime.onInstalled.addListener(async details => {
     asegurarUserScriptDesdeCache().catch(() => {});
 });
 
+let whisperOffscreenPromise = null;
+let activeWhisperTabId = null;
+let activeWhisperVideoId = '';
+
+async function ensureWhisperOffscreen() {
+    if (!chrome.offscreen?.createDocument) {
+        throw new Error('offscreen API no disponible');
+    }
+    if (typeof chrome.runtime.getContexts === 'function') {
+        const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+        if (contexts.length > 0) return;
+    }
+    if (!whisperOffscreenPromise) {
+        whisperOffscreenPromise = chrome.offscreen
+            .createDocument({
+                url: 'offscreen.html',
+                reasons: ['WORKERS', 'AUDIO_PLAYBACK'],
+                justification: 'Ejecutar Whisper WebGPU/WASM local cuando YouTube no tiene subtítulos'
+            })
+            .finally(() => {
+                whisperOffscreenPromise = null;
+            });
+    }
+    await whisperOffscreenPromise;
+}
+
+if (chrome.tabs?.onRemoved?.addListener) {
+    chrome.tabs.onRemoved.addListener(tabId => {
+        if (tabId === activeWhisperTabId) {
+            const vid = activeWhisperVideoId;
+            activeWhisperTabId = null;
+            activeWhisperVideoId = '';
+            chrome.runtime.sendMessage({ target: 'offscreen', type: 'STOP', videoId: vid }).catch(() => {});
+        }
+    });
+}
+
 chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
     if (!mensaje || typeof mensaje !== 'object') return false;
+    if (mensaje.target === 'offscreen') return false;
+
+    if (mensaje.action === 'SUPRATUBE_WHISPER_START') {
+        if (!sender.tab?.id || !mensaje.videoId) {
+            enviarRespuesta({ ok: false, error: 'Falta tabId o videoId' });
+            return false;
+        }
+        activeWhisperTabId = sender.tab.id;
+        activeWhisperVideoId = String(mensaje.videoId);
+        ensureWhisperOffscreen()
+            .then(() =>
+                chrome.runtime.sendMessage({
+                    target: 'offscreen',
+                    type: 'INIT',
+                    videoId: activeWhisperVideoId,
+                    targetLang: mensaje.targetLang || 'es',
+                    manualForce: Boolean(mensaje.manualForce)
+                })
+            )
+            .then(() => enviarRespuesta({ ok: true }))
+            .catch(err => enviarRespuesta({ ok: false, error: err?.message || 'Error iniciando Whisper' }));
+        return true;
+    }
+
+    if (mensaje.action === 'SUPRATUBE_WHISPER_PCM') {
+        if (sender.tab?.id === activeWhisperTabId && mensaje.videoId === activeWhisperVideoId) {
+            chrome.runtime
+                .sendMessage({
+                    target: 'offscreen',
+                    type: 'PCM',
+                    videoId: activeWhisperVideoId,
+                    samples: mensaje.samples,
+                    videoTime: mensaje.videoTime,
+                    rms: mensaje.rms
+                })
+                .catch(() => {});
+        }
+        return false;
+    }
+
+    if (mensaje.action === 'SUPRATUBE_WHISPER_RESET') {
+        if (sender.tab?.id === activeWhisperTabId && mensaje.videoId === activeWhisperVideoId) {
+            chrome.runtime.sendMessage({ target: 'offscreen', type: 'RESET', videoId: activeWhisperVideoId }).catch(() => {});
+        }
+        return false;
+    }
+
+    if (mensaje.action === 'SUPRATUBE_WHISPER_STOP') {
+        if (!activeWhisperTabId || sender.tab?.id === activeWhisperTabId) {
+            const vid = mensaje.videoId || activeWhisperVideoId;
+            if (!mensaje.videoId || mensaje.videoId === activeWhisperVideoId) {
+                activeWhisperTabId = null;
+                activeWhisperVideoId = '';
+            }
+            chrome.runtime.sendMessage({ target: 'offscreen', type: 'STOP', videoId: vid }).catch(() => {});
+        }
+        return false;
+    }
+
+    if (mensaje.type === 'SUPRATUBE_WHISPER_EVENT') {
+        if (activeWhisperTabId !== null && chrome.tabs?.sendMessage) {
+            chrome.tabs
+                .sendMessage(activeWhisperTabId, { action: 'SUPRATUBE_WHISPER_EVENT', payload: mensaje.payload })
+                .catch(() => {});
+        }
+        return false;
+    }
 
     if (mensaje.action === 'SUPRATUBE_ABORT') {
         const ctrl = controladoresActivos.get(mensaje.requestId);

@@ -14,12 +14,30 @@ test('manifest.json is valid MV3 with crystal icons, userScripts, and required h
     assert.ok(manifest.permissions.includes('userScripts'));
     assert.ok(manifest.permissions.includes('storage'));
     assert.ok(manifest.permissions.includes('scripting'));
+    assert.ok(manifest.permissions.includes('offscreen'));
     assert.ok(manifest.host_permissions.includes('https://sponsor.ajay.app/*'));
     assert.ok(manifest.host_permissions.includes('https://raw.githubusercontent.com/*'));
     assert.ok(manifest.host_permissions.includes('https://ipapi.co/*'));
     assert.ok(manifest.host_permissions.includes('https://translate.googleapis.com/*'));
     assert.ok(manifest.host_permissions.includes('https://clients5.google.com/*'));
-    for (const rel of ['icons/icon-16.png', 'icons/icon-48.png', 'icons/icon-128.png', 'background.js', 'content.js', 'page-hook.js', 'popup.html', 'popup.js']) {
+    assert.ok(manifest.host_permissions.includes('https://huggingface.co/*'));
+    assert.ok(manifest.host_permissions.includes('https://*.hf.co/*'));
+    assert.match(String(manifest.content_security_policy?.extension_pages || ''), /wasm-unsafe-eval/);
+    for (const rel of [
+        'icons/icon-16.png',
+        'icons/icon-48.png',
+        'icons/icon-128.png',
+        'background.js',
+        'content.js',
+        'page-hook.js',
+        'popup.html',
+        'popup.js',
+        'offscreen.html',
+        'offscreen.bundle.js',
+        'worker.bundle.js',
+        'vendor/ort-wasm-simd-threaded.asyncify.mjs',
+        'vendor/ort-wasm-simd-threaded.asyncify.wasm'
+    ]) {
         assert.equal(fs.existsSync(path.resolve(rel)), true, `${rel} must exist`);
     }
 });
@@ -46,7 +64,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.7' }),
+                getManifest: () => ({ version: '1.0.8' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -89,7 +107,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
     const storeData = {
         supratube_last_sync_check: Date.now() - (20 * 60 * 1000),
         supratube_github_cache: {
-            extVersion: '1.0.7',
+            extVersion: '1.0.8',
             sha: 'sha_old',
             modulos: modMap,
             codigoCompilado: compileBundle(modMap)
@@ -99,7 +117,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.7' }),
+                getManifest: () => ({ version: '1.0.8' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
