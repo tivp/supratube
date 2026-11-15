@@ -27,12 +27,14 @@ const S = {
     _subInFlight: null,
     _lastAudioLang: null,
     _aiCtrl: createAiSummaryController({ doc: document, win: window }),
-    _tdCtrl: createTranscriptDownloadController({
-        doc: document,
-        win: window,
-        getUserLang: () => S.userNativeLang || 'es',
-        requestFn: gmRequest
-    }),
+    _tdCtrl: typeof createTranscriptDownloadController === 'function'
+        ? createTranscriptDownloadController({
+            doc: document,
+            win: window,
+            getUserLang: () => S.userNativeLang || 'es',
+            requestFn: gmRequest
+        })
+        : { setEnabled() {}, scan() {}, destroy() {} },
     _player: null,
     _video: null,
     _videoListened: false,

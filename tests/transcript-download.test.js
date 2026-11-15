@@ -9,7 +9,9 @@ import {
     chooseTranscriptDownloadTrack,
     buildGetTranscriptParamsCandidates,
     extractVideoTranscript,
-    createTranscriptDownloadController
+    createTranscriptDownloadController,
+    TD_HEROICON_SVG_URL,
+    TD_HEROICON_FALLBACK_URL
 } from '../modules/transcript-download.js';
 import { getTtState } from '../modules/subtitles.js';
 
@@ -107,6 +109,9 @@ function createMenuFakeDom({ pathname = '/shorts/KBIKtrmM80Y', search = '', vide
         getAttribute(k) {
             if (k === 'id' && this.id) return this.id;
             return this.attrs.get(k) ?? null;
+        }
+        hasAttribute(k) {
+            return this.attrs.has(k);
         }
         removeAttribute(k) {
             if (k === 'id') this.id = '';
@@ -454,16 +459,28 @@ test('controller injects Descargar transcripción in Shorts root dropdown (not s
     const { doc, win } = createMenuFakeDom({ pathname: '/shorts/KBIKtrmM80Y', videoTitle: 'Dr Who' });
 
     const sheet = doc.createElement('yt-sheet-view-model');
-    sheet.style.maxHeight = '336px';
+    sheet.style.maxHeight = '455.762px';
     sheet.style.maxWidth = '150px';
+    doc.documentElement.setAttribute('dark', '');
     const header = doc.createElement('div');
     header.className = 'ytContextualSheetLayoutHeaderContainer';
     const list = doc.createElement('yt-list-view-model');
     list.setAttribute('role', 'menu');
-    for (const label of ['Descripción', 'Subtítulos', 'Denunciar']) {
-        const it = doc.createElement('yt-list-item-view-model');
-        it.textContent = label;
-        list.appendChild(it);
+    for (const label of ['Descripción', 'Modo ambiente', 'Subtítulos', 'Denunciar']) {
+        if (label === 'Modo ambiente') {
+            const sw = doc.createElement('switch-list-item-view-model');
+            const inner = doc.createElement('yt-list-item-view-model');
+            inner.textContent = label;
+            sw.appendChild(inner);
+            list.appendChild(sw);
+        } else {
+            const it = doc.createElement('yt-list-item-view-model');
+            const titleSpan = doc.createElement('span');
+            titleSpan.className = 'ytAttributedStringHost ytListItemViewModelTitle';
+            titleSpan.textContent = label;
+            it.appendChild(titleSpan);
+            list.appendChild(it);
+        }
     }
     sheet.appendChild(header);
     sheet.appendChild(list);
@@ -507,11 +524,19 @@ test('controller injects Descargar transcripción in Shorts root dropdown (not s
     const injectedShorts = shortsDd.querySelectorAll('[data-supratube-td-item="1"]');
     assert.equal(injectedShorts.length, 1);
     assert.ok(injectedShorts[0].classList.contains('supratube-td-shorts'));
+    assert.ok(injectedShorts[0].classList.contains('supratube-td-dark'));
+    assert.equal(injectedShorts[0].querySelector('svg'), null);
+    const imgIcon = injectedShorts[0].querySelector('img.supratube-td-icon-img');
+    assert.ok(imgIcon);
+    assert.match(TD_HEROICON_SVG_URL, /^https:\/\/.*heroicons.*\.svg/i);
+    assert.equal(imgIcon.src, TD_HEROICON_SVG_URL);
+    imgIcon.dispatchEvent({ type: 'error' });
+    assert.equal(imgIcon.src, TD_HEROICON_FALLBACK_URL);
     assert.equal(subDd.querySelectorAll('[data-supratube-td-item="1"]').length, 0);
-    // Inserted immediately after Subtítulos.
-    assert.equal(list.children[2].getAttribute('data-supratube-td-item'), '1');
+    // Inserted immediately after Subtítulos (Descripción[0], Modo ambiente[1], Subtítulos[2], injected[3]).
+    assert.equal(list.children[3].getAttribute('data-supratube-td-item'), '1');
     // Expanded tight inline sizing so item is not clipped or wrapped narrowly.
-    assert.ok(parseFloat(sheet.style.maxHeight) > 336);
+    assert.ok(parseFloat(sheet.style.maxHeight) > 455.762);
     assert.ok(parseFloat(sheet.style.maxWidth) >= 240);
 
     // Repeated scans must remain idempotent.

@@ -17,6 +17,8 @@ export const TD_STYLE_ID = 'supratube-td-style';
 export const TD_ITEM_ATTR = 'data-supratube-td-item';
 export const TD_TOAST_ID = 'supratube-td-toast';
 export const TD_BLOCK_SIZE = 200;
+export const TD_HEROICON_SVG_URL = 'https://api.iconify.design/heroicons/arrow-down-tray.svg';
+export const TD_HEROICON_FALLBACK_URL = 'https://cdn.jsdelivr.net/npm/heroicons@2.2.0/24/outline/arrow-down-tray.svg';
 
 export const TD_INNERTUBE_CLIENTS = Object.freeze([
     {
@@ -907,6 +909,9 @@ function tdEnsureStyles(doc) {
             padding: 0 12px 0 16px;
             min-height: 36px;
         }
+        [${TD_ITEM_ATTR}="1"].supratube-td-dark {
+            color: var(--yt-spec-text-primary, #f1f1f1);
+        }
         [${TD_ITEM_ATTR}="1"]:hover,
         [${TD_ITEM_ATTR}="1"]:focus-visible {
             background-color: var(--yt-spec-10-percent-layer, rgba(128, 128, 128, 0.14));
@@ -923,8 +928,19 @@ function tdEnsureStyles(doc) {
             width: 24px;
             height: 24px;
             flex-shrink: 0;
-            fill: currentColor;
             color: inherit;
+        }
+        [${TD_ITEM_ATTR}="1"] .supratube-td-icon-img {
+            display: block;
+            width: 22px;
+            height: 22px;
+            object-fit: contain;
+            pointer-events: none;
+            filter: brightness(0) invert(0.06);
+        }
+        html[dark] [${TD_ITEM_ATTR}="1"] .supratube-td-icon-img,
+        [${TD_ITEM_ATTR}="1"].supratube-td-dark .supratube-td-icon-img {
+            filter: brightness(0) invert(0.945);
         }
         [${TD_ITEM_ATTR}="1"] .supratube-td-label {
             flex: 1 1 auto;
@@ -972,29 +988,41 @@ function tdShowToast(doc, message, kind = 'ok', durationMs = 3200) {
     }, durationMs);
 }
 
-function tdBuildDownloadIconSvg(doc) {
-    const svgNs = 'http://www.w3.org/2000/svg';
+function tdBuildDownloadIcon(doc) {
     const wrap = doc.createElement('span');
     wrap.className = 'supratube-td-icon';
     wrap.setAttribute('aria-hidden', 'true');
-    const createSvg = typeof doc.createElementNS === 'function'
-        ? tag => doc.createElementNS(svgNs, tag)
-        : tag => doc.createElement(tag);
-    const svg = createSvg('svg');
-    svg.setAttribute('viewBox', '0 0 24 24');
-    svg.setAttribute('width', '24');
-    svg.setAttribute('height', '24');
-    svg.setAttribute('focusable', 'false');
-    svg.setAttribute('aria-hidden', 'true');
-    const path = createSvg('path');
-    // Material transcript / text-file icon cleanly matching YouTube 24px stroke geometry.
-    path.setAttribute(
-        'd',
-        'M6 2a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8.414a2 2 0 0 0-.586-1.414l-4.414-4.414A2 2 0 0 0 13.586 2H6Zm0 2h7v4a1 1 0 0 0 1 1h4v11H6V4Zm2 7a1 1 0 0 0 0 2h8a1 1 0 1 0 0-2H8Zm0 4a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2H8Z'
-    );
-    svg.appendChild(path);
-    wrap.appendChild(svg);
+    const img = doc.createElement('img');
+    img.className = 'supratube-td-icon-img';
+    img.src = TD_HEROICON_SVG_URL;
+    img.setAttribute('src', TD_HEROICON_SVG_URL);
+    img.setAttribute('width', '22');
+    img.setAttribute('height', '22');
+    img.setAttribute('alt', '');
+    img.setAttribute('aria-hidden', 'true');
+    img.setAttribute('decoding', 'async');
+    img.setAttribute('referrerpolicy', 'no-referrer');
+    let usedFallback = false;
+    img.addEventListener?.('error', () => {
+        if (usedFallback) return;
+        usedFallback = true;
+        img.src = TD_HEROICON_FALLBACK_URL;
+        img.setAttribute('src', TD_HEROICON_FALLBACK_URL);
+    });
+    wrap.appendChild(img);
     return wrap;
+}
+
+function tdIsDarkTheme(doc, sibColor) {
+    const m = String(sibColor || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (m) {
+        const lum = 0.299 * Number(m[1]) + 0.587 * Number(m[2]) + 0.114 * Number(m[3]);
+        return lum > 128;
+    }
+    return Boolean(
+        doc?.documentElement?.hasAttribute?.('dark') ||
+        doc?.documentElement?.hasAttribute?.('darker-dark-theme')
+    );
 }
 
 function tdIsDropdownVisible(dropdown, win) {
@@ -1013,7 +1041,7 @@ function tdIsShortsSubmenu(sheet, listEl) {
     const header = sheet?.querySelector?.('.ytContextualSheetLayoutHeaderContainer');
     if (header) {
         const hdrText = String(header.textContent || '').trim();
-        if (hdrText.length > 0 || (header.children && header.children.length > 0)) {
+        if (hdrText.length > 0 || Boolean(header.querySelector?.('h2, yt-panel-header-view-model'))) {
             return true;
         }
     }
@@ -1144,10 +1172,10 @@ function tdFindInsertionRef(listEl, kind) {
     return null;
 }
 
-function tdCreateMenuItem(doc, kind, siblingHeight, siblingColor, onActivate) {
+function tdCreateMenuItem(doc, kind, siblingHeight, siblingColor, isDark, onActivate) {
     const btn = doc.createElement('button');
     btn.type = 'button';
-    btn.className = `supratube-td-menuitem supratube-td-${kind === 'watch' ? 'watch' : 'shorts'}`;
+    btn.className = `supratube-td-menuitem supratube-td-${kind === 'watch' ? 'watch' : 'shorts'}${isDark ? ' supratube-td-dark' : ''}`;
     btn.setAttribute('role', 'menuitem');
     btn.setAttribute(TD_ITEM_ATTR, '1');
     if (siblingHeight >= 34 && siblingHeight <= 56) {
@@ -1157,7 +1185,7 @@ function tdCreateMenuItem(doc, kind, siblingHeight, siblingColor, onActivate) {
         btn.style.color = siblingColor;
     }
 
-    const icon = tdBuildDownloadIconSvg(doc);
+    const icon = tdBuildDownloadIcon(doc);
     const label = doc.createElement('span');
     label.className = 'supratube-td-label';
     label.textContent = 'Descargar transcripción';
@@ -1193,6 +1221,7 @@ export function createTranscriptDownloadController({
         const watchBtn = target.closest('ytd-menu-renderer.ytd-watch-metadata button, ytd-video-primary-info-renderer ytd-menu-renderer button');
         if (watchBtn) {
             lastTrigger = { kind: 'watch', ts: Date.now() };
+            scheduleScan();
             return;
         }
         const forbidden = target.closest(TD_FORBIDDEN_CONTAINER_SEL);
@@ -1205,6 +1234,7 @@ export function createTranscriptDownloadController({
             const al = `${shortsBtn.getAttribute?.('aria-label') || ''} ${shortsBtn.title || ''}`;
             if (/m[aá]s|more|acciones|actions|menu/i.test(al)) {
                 lastTrigger = { kind: 'shorts', ts: Date.now() };
+                scheduleScan();
             }
         }
     };
@@ -1283,7 +1313,29 @@ export function createTranscriptDownloadController({
             return;
         }
 
-        const dropdowns = doc.querySelectorAll?.('tp-yt-iron-dropdown') || [];
+        const collectMenuHosts = () => {
+            const seen = new Set();
+            const out = [];
+            const dropdowns = doc.querySelectorAll?.('tp-yt-iron-dropdown') || [];
+            for (let i = 0; i < dropdowns.length; i++) {
+                if (!seen.has(dropdowns[i])) {
+                    seen.add(dropdowns[i]);
+                    out.push(dropdowns[i]);
+                }
+            }
+            const sheets = doc.querySelectorAll?.('yt-sheet-view-model') || [];
+            for (let i = 0; i < sheets.length; i++) {
+                if (sheets[i].closest?.('tp-yt-iron-dropdown')) continue;
+                const host = sheets[i].parentElement || sheets[i];
+                if (!seen.has(host)) {
+                    seen.add(host);
+                    out.push(host);
+                }
+            }
+            return out;
+        };
+
+        const dropdowns = collectMenuHosts();
         for (let i = 0; i < dropdowns.length; i++) {
             const dd = dropdowns[i];
             if (!tdIsDropdownVisible(dd, win)) {
@@ -1302,11 +1354,12 @@ export function createTranscriptDownloadController({
 
             const sampleItem = match.listEl.querySelector?.('yt-list-item-view-model, ytd-menu-service-item-renderer, tp-yt-paper-item');
             const sibH = sampleItem?.getBoundingClientRect?.().height || (match.kind === 'watch' ? 36 : 40);
-            const sampleTextHost = sampleItem?.querySelector?.('.yt-core-attributed-string, yt-formatted-string') || sampleItem;
+            const sampleTextHost = sampleItem?.querySelector?.('.ytListItemViewModelTitle, .ytAttributedStringHost, .yt-core-attributed-string, yt-formatted-string') || sampleItem;
             const sibColor = sampleTextHost && typeof win?.getComputedStyle === 'function'
                 ? (win.getComputedStyle(sampleTextHost)?.color || '')
                 : '';
-            const itemEl = tdCreateMenuItem(doc, match.kind, Math.round(sibH), sibColor, (btn, labelEl) => {
+            const isDark = tdIsDarkTheme(doc, sibColor);
+            const itemEl = tdCreateMenuItem(doc, match.kind, Math.round(sibH), sibColor, isDark, (btn, labelEl) => {
                 handleActivate(btn, labelEl, dd);
             });
             const refNode = tdFindInsertionRef(match.listEl, match.kind);
@@ -1332,7 +1385,7 @@ export function createTranscriptDownloadController({
         if (!observer && typeof win?.MutationObserver === 'function') {
             doc.addEventListener?.('click', onDocClickCapture, true);
             observer = new win.MutationObserver(() => scheduleScan());
-            const root = doc.querySelector?.('ytd-popup-container') || doc.body || doc.documentElement;
+            const root = doc.body || doc.documentElement || doc.querySelector?.('ytd-popup-container');
             if (root) {
                 observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'aria-hidden'] });
             }

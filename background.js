@@ -3,8 +3,10 @@
 const REPO_API_COMMIT = 'https://api.github.com/repos/tivp/supratube/commits/main';
 const REPO_RAW_BASE = 'https://raw.githubusercontent.com/tivp/supratube/main';
 const CACHE_KEY = 'supratube_github_cache';
+const SETTINGS_KEY = 'supratube_settings';
 const USER_SCRIPT_ID = 'supratube-github-bundle';
 const MATCHES_YOUTUBE = ['https://www.youtube.com/*', 'https://m.youtube.com/*'];
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.5';
 
 const ORDEN_MODULOS = [
     'config.js',
@@ -19,15 +21,53 @@ const ORDEN_MODULOS = [
     'main.js'
 ];
 
+const DEFAULT_SETTINGS_SYNC = {
+    adSkip: true,
+    sponsorBlock: true,
+    greenBar: true,
+    auto1080p: true,
+    autoSubtitles: true,
+    aiSummary: true,
+    transcriptDownload: true
+};
+
 const controladoresActivos = new Map();
 
 function tieneSoporteUserScripts() {
     return typeof chrome.userScripts !== 'undefined' && typeof chrome.userScripts.register === 'function';
 }
 
-// Empaqueta los 8 módulos ESM en una sola IIFE para ejecutarla en el mundo MAIN.
-function compilarBundleDesdeModulos(mapaModulos) {
-    const bloques = ORDEN_MODULOS.map(nombre => {
+function parseOrdenModulosDesdeConfig(codigoConfig) {
+    const match = String(codigoConfig || '').match(/ORDEN_MODULOS\s*=\s*(?:Object\.freeze\s*\(\s*)?\[([\s\S]*?)\]/);
+    if (!match) return ORDEN_MODULOS.slice();
+    const encontrados = [];
+    const itemRe = /['"]([a-zA-Z0-9_.-]+\.js)['"]/g;
+    let m;
+    while ((m = itemRe.exec(match[1])) !== null) {
+        if (!encontrados.includes(m[1])) encontrados.push(m[1]);
+    }
+    if (encontrados.includes('config.js') && encontrados.includes('main.js') && encontrados.length >= 2) {
+        return encontrados;
+    }
+    return ORDEN_MODULOS.slice();
+}
+
+function esCacheValido(cache) {
+    if (!cache || typeof cache.codigoCompilado !== 'string' || !cache.codigoCompilado) {
+        return false;
+    }
+    if (cache.extVersion !== EXT_VERSION) {
+        return false;
+    }
+    if (!cache.modulos || typeof cache.modulos !== 'object') {
+        return false;
+    }
+    return ORDEN_MODULOS.every(nombre => typeof cache.modulos[nombre] === 'string' && cache.modulos[nombre].length > 0);
+}
+
+// Empaqueta los módulos ESM en una sola IIFE para ejecutarla en el mundo MAIN.
+function compilarBundleDesdeModulos(mapaModulos, listaOrden = ORDEN_MODULOS) {
+    const bloques = listaOrden.map(nombre => {
         let codigo = String(mapaModulos[nombre] || '');
         codigo = codigo.replace(/^import\s+[\s\S]*?\bfrom\s+['"][^'"]+['"];?[ \t]*(?:\r?\n|$)/gm, '');
         codigo = codigo.replace(/^import\s+['"][^'"]+['"];?[ \t]*(?:\r?\n|$)/gm, '');
@@ -92,7 +132,19 @@ async function asegurarUserScriptDesdeCache() {
 
     const datos = await chrome.storage.local.get(CACHE_KEY);
     const cache = datos[CACHE_KEY] || null;
-    if (!cache?.codigoCompilado) {
+    if (!esCacheValido(cache)) {
+        try {
+            await chrome.userScripts.unregister({ ids: [USER_SCRIPT_ID] });
+        } catch {
+            // No había versión previa registrada.
+        }
+        if (cache) {
+            try {
+                await chrome.storage.local.remove?.(CACHE_KEY);
+            } catch {
+                // Ignorar error de limpieza.
+            }
+        }
         return { activo: false, registradoAhora: false, cache: null };
     }
 
@@ -172,22 +224,33 @@ async function actualizarScriptsDesdeGithub() {
     const mensajeCommit = String(commitData.commit?.message || 'Actualización').split('\n')[0].trim();
     const fechaCommit = commitData.commit?.author?.date || '';
 
-    const entradas = await Promise.all(
-        ORDEN_MODULOS.map(async nombre => {
-            const url = `${REPO_RAW_BASE}/modules/${nombre}?t=${Date.now()}`;
-            const resp = await fetch(url, { cache: 'no-store' });
-            if (!resp.ok) {
-                throw new Error(`Error al bajar modules/${nombre} (HTTP ${resp.status})`);
-            }
-            const texto = await resp.text();
-            return [nombre, texto];
-        })
+    const nonce = Date.now();
+    const resConfig = await fetch(`${REPO_RAW_BASE}/modules/config.js?t=${nonce}`, { cache: 'no-store' });
+    if (!resConfig.ok) {
+        throw new Error(`Error al bajar modules/config.js (HTTP ${resConfig.status})`);
+    }
+    const configTexto = await resConfig.text();
+    const listaModulos = parseOrdenModulosDesdeConfig(configTexto);
+
+    const restantes = await Promise.all(
+        listaModulos
+            .filter(nombre => nombre !== 'config.js')
+            .map(async nombre => {
+                const url = `${REPO_RAW_BASE}/modules/${nombre}?t=${nonce}`;
+                const resp = await fetch(url, { cache: 'no-store' });
+                if (!resp.ok) {
+                    throw new Error(`Error al bajar modules/${nombre} (HTTP ${resp.status})`);
+                }
+                const texto = await resp.text();
+                return [nombre, texto];
+            })
     );
 
-    const modulos = Object.fromEntries(entradas);
-    const codigoCompilado = compilarBundleDesdeModulos(modulos);
+    const modulos = { 'config.js': configTexto, ...Object.fromEntries(restantes) };
+    const codigoCompilado = compilarBundleDesdeModulos(modulos, listaModulos);
 
     const cache = {
+        extVersion: EXT_VERSION,
         sha,
         shaCorto,
         mensajeCommit,
@@ -222,7 +285,7 @@ async function actualizarScriptsDesdeGithub() {
             mensajeCommit: cache.mensajeCommit,
             fechaCommit: cache.fechaCommit,
             actualizadoEn: cache.actualizadoEn,
-            totalModulos: ORDEN_MODULOS.length
+            totalModulos: listaModulos.length
         },
         userScriptsActivo,
         pestanasActualizadas
@@ -231,7 +294,35 @@ async function actualizarScriptsDesdeGithub() {
 
 asegurarUserScriptDesdeCache().catch(() => {});
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async details => {
+    try {
+        const prev = await chrome.storage.local.get(SETTINGS_KEY);
+        const mergedSettings = {
+            ...DEFAULT_SETTINGS_SYNC,
+            ...(prev?.[SETTINGS_KEY] && typeof prev[SETTINGS_KEY] === 'object' ? prev[SETTINGS_KEY] : {})
+        };
+        await chrome.storage.local.set({ [SETTINGS_KEY]: mergedSettings });
+    } catch {
+        // Ignorar si storage aún no está listo.
+    }
+
+    if (details?.reason === 'update' || details?.reason === 'install') {
+        try {
+            if (tieneSoporteUserScripts()) {
+                await chrome.userScripts.unregister({ ids: [USER_SCRIPT_ID] });
+            }
+        } catch {
+            // No había versión previa registrada.
+        }
+        try {
+            await chrome.storage.local.remove?.(CACHE_KEY);
+        } catch {
+            // Ignorar si no había caché previa.
+        }
+        actualizarScriptsDesdeGithub().catch(() => {});
+        return;
+    }
+
     asegurarUserScriptDesdeCache().catch(() => {});
 });
 

@@ -3,6 +3,7 @@
 import { DEFAULT_SETTINGS } from './modules/config.js';
 
 const SETTINGS_KEY = 'supratube_settings';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.5';
 const checkboxes = Array.from(document.querySelectorAll('input[data-setting]'));
 const btnActualizar = document.getElementById('btn-actualizar-scripts');
 const estadoEl = document.getElementById('estado-actualizacion');
@@ -48,7 +49,7 @@ function mostrarEstado(texto, tipo = '') {
 
 function pintarEstadoGuardado(respuesta) {
     if (!respuesta || !respuesta.ok) {
-        mostrarEstado(respuesta?.error || 'Usando versión local v1.0.3');
+        mostrarEstado(respuesta?.error || `Usando versión local v${EXT_VERSION}`);
         return;
     }
 
@@ -65,13 +66,13 @@ function pintarEstadoGuardado(respuesta) {
             respuesta.userScriptsActivo ? 'ok' : ''
         );
     } else {
-        mostrarEstado('Usando módulos locales v1.0.3. Pulsa el botón para traer la última versión de GitHub.');
+        mostrarEstado(`Usando módulos locales v${EXT_VERSION}. Pulsa el botón para traer la última versión de GitHub.`);
     }
 }
 
 chrome.runtime.sendMessage({ action: 'SUPRATUBE_GET_STATUS' }, respuesta => {
     if (chrome.runtime.lastError) {
-        mostrarEstado('Usando versión local v1.0.3');
+        mostrarEstado(`Usando versión local v${EXT_VERSION}`);
         return;
     }
     pintarEstadoGuardado(respuesta);

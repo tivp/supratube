@@ -24,7 +24,7 @@ test('manifest.json is valid MV3 with crystal icons, userScripts, and required h
     }
 });
 
-test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and compiles identical bundle', () => {
+test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and compiles identical bundle', async () => {
     const bg = fs.readFileSync(path.resolve('background.js'), 'utf8');
     assert.match(bg, /repos\/tivp\/supratube\/commits\/main/);
     assert.match(bg, /raw\.githubusercontent\.com\/tivp\/supratube\/main/);
@@ -35,11 +35,33 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
     assert.doesNotThrow(() => new vm.Script(fs.readFileSync(path.resolve('page-hook.js'), 'utf8'), { filename: 'page-hook.js' }));
     assert.doesNotThrow(() => new vm.Script(fs.readFileSync(path.resolve('content.js'), 'utf8'), { filename: 'content.js' }));
 
+    let unregistered = 0;
+    const staleCache = {
+        sha: 'oldsha',
+        extVersion: '1.0.3',
+        modulos: { 'config.js': '', 'main.js': '' },
+        codigoCompilado: '(() => {})()'
+    };
     const sandbox = {
         chrome: {
-            runtime: { id: 'test-ext', onInstalled: { addListener() {} }, onMessage: { addListener() {} } },
-            storage: { local: { get: async () => ({}), set: async () => {} } },
-            userScripts: { register: async () => {}, unregister: async () => {}, getScripts: async () => [] }
+            runtime: {
+                id: 'test-ext',
+                getManifest: () => ({ version: '1.0.5' }),
+                onInstalled: { addListener() {} },
+                onMessage: { addListener() {} }
+            },
+            storage: {
+                local: {
+                    get: async () => ({ supratube_github_cache: staleCache }),
+                    set: async () => {},
+                    remove: async () => {}
+                }
+            },
+            userScripts: {
+                register: async () => {},
+                unregister: async () => { unregistered++; },
+                getScripts: async () => [{ id: 'supratube-github-bundle' }]
+            }
         },
         fetch: async () => ({ ok: false, status: 500 }),
         Map,
@@ -55,4 +77,10 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         modMap[mod] = fs.readFileSync(path.resolve('modules', mod), 'utf8');
     }
     assert.equal(sandbox.compilarBundleDesdeModulos(modMap), compileBundle(modMap));
+    assert.equal(sandbox.esCacheValido(staleCache), false);
+    const cacheCheck = await sandbox.asegurarUserScriptDesdeCache();
+    assert.equal(cacheCheck.activo, false);
+    assert.ok(unregistered >= 1);
+    const parsedMods = sandbox.parseOrdenModulosDesdeConfig(modMap['config.js']);
+    assert.deepEqual(Array.from(parsedMods), Array.from(ORDEN_MODULOS));
 });
