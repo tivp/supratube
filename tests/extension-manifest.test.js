@@ -381,3 +381,26 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
     assert.equal(downgradeRegistered, 0);
     assert.ok(unregisteredDowngrade >= 1);
 });
+
+test('SupraTube branding, simple humane copy, and transparent credits stay consistent across manifest, popup, and README', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.resolve('manifest.json'), 'utf8'));
+    const popupHtml = fs.readFileSync(path.resolve('popup.html'), 'utf8');
+    const readme = fs.readFileSync(path.resolve('README.md'), 'utf8');
+
+    assert.equal(manifest.name, 'SupraTube');
+    assert.equal(manifest.action.default_title, 'SupraTube');
+    assert.doesNotMatch(manifest.name, /maximus/i);
+    assert.match(manifest.description, /vanilla/i);
+
+    assert.match(popupHtml, /<title>SupraTube<\/title>/);
+    assert.match(popupHtml, /<div class="titulo">SupraTube<\/div>/);
+    assert.doesNotMatch(popupHtml, /Maximus Motor/i);
+    assert.match(popupHtml, /Gemini 4 Hydrogen Extra/);
+
+    assert.match(readme, /^#\s+SupraTube/m);
+    assert.match(readme, /conserven?d?o lo vanilla|conservando lo vanilla/i);
+    assert.match(readme, /Gemini 4 Hydrogen Extra en Antigravity/i);
+    assert.match(readme, /greasyfork\.org\/en\/scripts\/561432/);
+    assert.match(readme, /greasyfork\.org\/scripts\/508784/);
+    assert.match(readme, /greasyfork\.org\/scripts\/537017/);
+});

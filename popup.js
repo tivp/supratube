@@ -1,4 +1,4 @@
-// Popup de Supratube: toggles persistentes y sincronización de módulos desde GitHub.
+// Popup de SupraTube: toggles persistentes y sincronización de módulos desde GitHub.
 
 import { DEFAULT_SETTINGS } from './modules/config.js';
 
