@@ -237,15 +237,20 @@
 
         if (!entry.boundPlay) {
             entry.boundPlay = true;
-            vidEl.addEventListener('play', () => {
-                if (whisperSession.active && whisperSession.video === vidEl && entry.ctx.state === 'suspended') {
+            const tryResume = () => {
+                if (entry.ctx.state === 'suspended') {
                     entry.ctx.resume().catch(() => {});
                 }
+            };
+            vidEl.addEventListener('play', () => {
+                if (whisperSession.active && whisperSession.video === vidEl) tryResume();
             }, { passive: true });
+            window.addEventListener('pointerdown', tryResume, { passive: true });
+            window.addEventListener('keydown', tryResume, { passive: true });
         }
 
         if (entry.ctx.state === 'suspended') {
-            await entry.ctx.resume().catch(() => {});
+            entry.ctx.resume().catch(() => {});
         }
         if (token !== whisperStartSeq) return;
 

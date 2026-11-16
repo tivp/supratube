@@ -10,7 +10,10 @@ import {
     installTimedtextMonitor,
     clearFallbackCaptions,
     isFallbackCaptionsActive,
-    detectVideoAudioLang
+    detectVideoAudioLang,
+    ensureAiSubtitleButton,
+    removeAiSubtitleButtons,
+    startManualAiCaptions
 } from './subtitles.js';
 import { createAiSummaryController } from './ai-summary.js';
 import { createTranscriptDownloadController } from './transcript-download.js';
@@ -145,6 +148,41 @@ function refreshProgressBar() {
         document,
         Boolean(S.settings.sponsorBlock && S.settings.greenBar)
     );
+}
+
+function syncIaButton() {
+    if (!S.videoId || !S.settings.autoSubtitles) {
+        removeAiSubtitleButtons(document);
+        return;
+    }
+    ensureAiSubtitleButton({
+        player: getPlayer(),
+        doc: document,
+        win: window,
+        enabled: true,
+        onToggle: () => {
+            const vid = getVideoId() || S.videoId;
+            const p = getPlayer();
+            if (!vid || !p) return;
+            const lang = S.userNativeLang || (typeof navigator !== 'undefined' ? String(navigator.language || '').split('-')[0].toLowerCase() : '') || 'es';
+            const started = startManualAiCaptions({
+                player: p,
+                videoId: vid,
+                userLang: lang,
+                doc: document,
+                win: window
+            });
+            if (started) {
+                S.subsAppliedForVideo = vid;
+                S.subsUserTouchedVideo = null;
+            } else {
+                S.subsUserTouchedVideo = vid;
+            }
+            if (!S.userNativeLang) {
+                resolveUserNativeLang().then(l => { S.userNativeLang = l; }).catch(() => {});
+            }
+        }
+    });
 }
 
 async function runSubtitlesForCurrentVideo() {
@@ -343,16 +381,19 @@ function onNavigate() {
         if (vid) {
             loadSponsorForVideo(vid);
             ensureSBLoop();
+            syncIaButton();
             [500, 1500, 3000].forEach(delay => {
                 const tid = setTimeout(() => {
                     if (S._tornDown || S.videoId !== vid) return;
                     apply1080pQuality(getPlayer(), S.qualityState, S.settings.auto1080p);
+                    syncIaButton();
                     runSubtitlesForCurrentVideo();
                 }, delay);
                 S._subTimers.push(tid);
             });
         } else {
             S.sbSegments = [];
+            removeAiSubtitleButtons(document);
             refreshProgressBar();
         }
         setupObservers();
@@ -388,6 +429,7 @@ function teardown() {
     try { S._aiCtrl?.destroy?.(); } catch {}
     try { S._tdCtrl?.destroy?.(); } catch {}
     clearFallbackCaptions(document, window);
+    removeAiSubtitleButtons(document);
     try { window.__supratubeEjecutado = false; } catch {}
 }
 
@@ -467,6 +509,7 @@ function boot() {
             }
         }
         S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: S.videoId });
+        syncIaButton();
     });
 
     const sig = S._abortCtrl?.signal;
@@ -506,6 +549,7 @@ function boot() {
         }
         S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: S.videoId });
         if (S.settings.transcriptDownload !== false) S._tdCtrl.scan();
+        syncIaButton();
     }, 800);
 
     S._navObs = new MutationObserver(() => {

@@ -17,7 +17,10 @@ import {
     parseTimedtextResponseText,
     getTtState,
     fetchTranscriptViaGetPanel,
-    encodeBase64Bytes
+    encodeBase64Bytes,
+    ensureAiSubtitleButton,
+    removeAiSubtitleButtons,
+    startManualAiCaptions
 } from '../modules/subtitles.js';
 
 test('detectVideoAudioLang inspects active dubbed audio track first, then default audio, then asr caption', () => {
@@ -1552,4 +1555,245 @@ test('Shorts subtitles use larger readable font size for both native CSS and fal
     const px = parseInt(fb.children[0].style.fontSize, 10);
     assert.ok(px >= 19, `expected Shorts fallback font >= 19px, got ${px}`);
     clearFallbackCaptions(fakeDoc, fakeWin);
+});
+
+test('IA caption button mounts beside native CC button, toggles manual forced Whisper (ignoring same_language), and syncs icon state', async () => {
+    const fs = await import('node:fs');
+    const vm = await import('node:vm');
+    const makeAttrs = (init = {}) => {
+        const map = { ...init };
+        return {
+            _attrs: map,
+            setAttribute(k, v) { map[k] = String(v); },
+            getAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null; },
+            hasAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k); },
+            removeAttribute(k) { delete map[k]; }
+        };
+    };
+    const elements = new Map();
+    const createMockNode = (tag) => {
+        const listeners = {};
+        const node = {
+            tagName: String(tag).toUpperCase(),
+            id: '',
+            className: '',
+            type: '',
+            style: {},
+            children: [],
+            parentElement: null,
+            ...makeAttrs(),
+            get nextSibling() {
+                if (!this.parentElement) return null;
+                const i = this.parentElement.children.indexOf(this);
+                return i >= 0 ? (this.parentElement.children[i + 1] || null) : null;
+            },
+            appendChild(child) {
+                child.parentElement = this;
+                this.children.push(child);
+                if (child.id) elements.set(child.id, child);
+                return child;
+            },
+            insertBefore(child, ref) {
+                child.parentElement = this;
+                this.children = this.children.filter(c => c !== child);
+                if (ref) {
+                    const idx = this.children.indexOf(ref);
+                    if (idx >= 0) this.children.splice(idx, 0, child);
+                    else this.children.push(child);
+                } else {
+                    this.children.push(child);
+                }
+                if (child.id) elements.set(child.id, child);
+                return child;
+            },
+            replaceChildren() { this.children = []; },
+            remove() {
+                if (this.parentElement) {
+                    this.parentElement.children = this.parentElement.children.filter(c => c !== this);
+                }
+                if (this.id) elements.delete(this.id);
+            },
+            querySelector(sel) {
+                const match = el => {
+                    if (sel.startsWith('#') && el.id === sel.slice(1)) return true;
+                    if (sel.startsWith('.') && String(el.className || '').split(/\s+/).includes(sel.slice(1))) return true;
+                    if (el.tagName?.toLowerCase() === sel.toLowerCase()) return true;
+                    return false;
+                };
+                for (const c of this.children) {
+                    if (match(c)) return c;
+                    const found = c.querySelector?.(sel);
+                    if (found) return found;
+                }
+                return null;
+            },
+            querySelectorAll(sel) {
+                const out = [];
+                const walk = root => {
+                    for (const c of (root.children || [])) {
+                        if (
+                            (sel.includes('#') && c.id === sel.match(/#([^\s,]+)/)?.[1]) ||
+                            (sel.includes('.') && String(c.className || '').split(/\s+/).some(cls => sel.includes(`.${cls}`)))
+                        ) {
+                            out.push(c);
+                        }
+                        walk(c);
+                    }
+                };
+                walk(this);
+                return out;
+            },
+            addEventListener(ev, fn) { (listeners[ev] ||= []).push(fn); },
+            removeEventListener(ev, fn) { listeners[ev] = (listeners[ev] || []).filter(f => f !== fn); },
+            click() {
+                for (const fn of (listeners.click || [])) fn({ preventDefault() {}, stopPropagation() {} });
+            }
+        };
+        return node;
+    };
+
+    const controlsRoot = createMockNode('div');
+    controlsRoot.className = 'ytp-right-controls';
+    const leftGroup = createMockNode('div');
+    leftGroup.className = 'ytp-right-controls-left';
+    const ccBtn = createMockNode('button');
+    ccBtn.className = 'ytp-subtitles-button ytp-button';
+    ccBtn.disabled = true;
+    ccBtn.setAttribute('aria-pressed', 'false');
+    ccBtn.closest = sel => (sel === '.ytp-right-controls' ? controlsRoot : null);
+    const settingsBtn = createMockNode('button');
+    settingsBtn.className = 'ytp-settings-button ytp-button';
+    leftGroup.appendChild(ccBtn);
+    controlsRoot.appendChild(leftGroup);
+    controlsRoot.appendChild(settingsBtn);
+
+    const fakeDoc = {
+        head: createMockNode('head'),
+        documentElement: { dataset: { supratubeWhisperBridge: '1' } },
+        createElement: tag => createMockNode(tag),
+        createElementNS: (_ns, tag) => createMockNode(tag),
+        getElementById: id => elements.get(id) || null,
+        querySelector: sel => controlsRoot.querySelector(sel) || elements.get(sel.replace(/^#/, '')) || null,
+        querySelectorAll: sel => controlsRoot.querySelectorAll(sel)
+    };
+    const listeners = {};
+    const cmds = [];
+    class FakeCustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } }
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/watch?v=fEt2anArPb4', pathname: '/watch', origin: 'https://www.youtube.com' },
+        CustomEvent: FakeCustomEvent,
+        addEventListener(ev, fn) { (listeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { listeners[ev] = (listeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) {
+            if (ev.type === 'supratube-whisper-cmd') cmds.push(ev.detail);
+            for (const fn of (listeners[ev.type] || [])) fn(ev);
+        }
+    };
+    const fakePlayer = {
+        id: 'movie_player',
+        clientWidth: 960,
+        getVideoData: () => ({ video_id: 'fEt2anArPb4' }),
+        querySelector: sel => {
+            if (sel === 'video') return { currentTime: 2, paused: false, setAttribute() {}, removeAttribute() {} };
+            if (sel === '.ytp-subtitles-button') return ccBtn;
+            if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+            return null;
+        },
+        querySelectorAll: () => [],
+        appendChild: el => { if (el.id) elements.set(el.id, el); return el; }
+    };
+
+    const iaBtn = ensureAiSubtitleButton({
+        player: fakePlayer,
+        doc: fakeDoc,
+        win: fakeWin,
+        enabled: true,
+        onToggle: () => startManualAiCaptions({ player: fakePlayer, videoId: 'fEt2anArPb4', userLang: 'es', doc: fakeDoc, win: fakeWin })
+    });
+    assert.ok(iaBtn);
+    assert.equal(ccBtn.nextSibling, iaBtn);
+    assert.equal(iaBtn.getAttribute('data-active'), '0');
+    assert.equal(iaBtn.querySelector('svg')?.getAttribute('data-ia-mode'), '0');
+
+    // Calling ensureAiSubtitleButton again must not duplicate the button
+    const iaBtn2 = ensureAiSubtitleButton({ player: fakePlayer, doc: fakeDoc, win: fakeWin, enabled: true });
+    assert.equal(iaBtn2, iaBtn);
+    assert.equal(leftGroup.children.length, 2);
+
+    // Click IA button -> immediately starts forced Whisper session & lights up icon
+    iaBtn.click();
+    assert.equal(iaBtn.getAttribute('data-active'), '1');
+    assert.equal(iaBtn.getAttribute('aria-pressed'), 'true');
+    assert.equal(iaBtn.querySelector('svg')?.getAttribute('data-ia-mode'), '1');
+    assert.equal(ccBtn.getAttribute('aria-pressed'), 'true');
+    assert.ok(cmds.some(c => c.action === 'start' && c.videoId === 'fEt2anArPb4' && c.manualForce === true));
+    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Iniciando subtítulos IA...');
+
+    // same_language event MUST NOT kill manual forced Whisper session
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'same_language', videoId: 'fEt2anArPb4', lang: 'es' }
+    }));
+    assert.equal(iaBtn.getAttribute('data-active'), '1');
+    assert.equal(cmds.some(c => c.action === 'stop'), false);
+
+    // Clicking again stops Whisper & restores inactive outline IA icon
+    iaBtn.click();
+    assert.equal(iaBtn.getAttribute('data-active'), '0');
+    assert.equal(iaBtn.querySelector('svg')?.getAttribute('data-ia-mode'), '0');
+    assert.ok(cmds.some(c => c.action === 'stop' && c.videoId === 'fEt2anArPb4'));
+
+    removeAiSubtitleButtons(fakeDoc);
+    assert.equal(leftGroup.children.length, 1);
+
+    // Also verify content.js does not block SUPRATUBE_WHISPER_START when AudioContext.resume() stays pending
+    const csCode = fs.readFileSync(new URL('../content.js', import.meta.url), 'utf8');
+    const sent = [];
+    const domVideo = {
+        isConnected: true,
+        paused: false,
+        ended: false,
+        captureStream: () => ({ getAudioTracks: () => [{ kind: 'audio' }] }),
+        addEventListener() {}
+    };
+    const cListeners = {};
+    const cWin = {
+        document: { documentElement: { dataset: {} }, querySelector: () => domVideo },
+        addEventListener(ev, fn) { (cListeners[ev] ||= []).push(fn); },
+        dispatchEvent() {}
+    };
+    cWin.AudioContext = class {
+        constructor() { this.state = 'suspended'; this.destination = {}; }
+        resume() { return new Promise(() => {}); }
+        createMediaStreamSource() { return { connect() {} }; }
+        createScriptProcessor() { return { connect() {}, disconnect() {}, onaudioprocess: null }; }
+        createGain() { return { gain: { value: 0 }, connect() {} }; }
+    };
+    cWin.top = cWin.self = cWin;
+    vm.runInNewContext(csCode, {
+        window: cWin,
+        document: cWin.document,
+        AudioContext: cWin.AudioContext,
+        MediaStream: class { constructor(t) { this.tracks = t; } },
+        Float32Array,
+        CustomEvent: FakeCustomEvent,
+        WeakMap,
+        chrome: {
+            runtime: {
+                id: 'ext1',
+                lastError: null,
+                onMessage: { addListener() {} },
+                sendMessage: (msg, cb) => { sent.push(msg); cb?.({ ok: true }); }
+            },
+            storage: { local: { get: (_k, cb) => cb?.({}) }, onChanged: { addListener() {} } }
+        },
+        setTimeout,
+        clearTimeout,
+        setInterval,
+        clearInterval
+    });
+    for (const fn of (cListeners['supratube-whisper-cmd'] || [])) {
+        fn({ detail: { action: 'start', videoId: 'fEt2anArPb4', targetLang: 'es', manualForce: true } });
+    }
+    await new Promise(r => setTimeout(r, 30));
+    assert.ok(sent.some(m => m.action === 'SUPRATUBE_WHISPER_START' && m.videoId === 'fEt2anArPb4' && m.manualForce === true));
 });

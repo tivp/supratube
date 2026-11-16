@@ -2160,6 +2160,204 @@ function ensureShortsCaptionStyle(doc) {
     ].join('\n'));
 }
 
+const IA_CC_BTN_ID = 'supratube-ia-cc-btn';
+const IA_CC_STYLE_ID = 'supratube-ia-cc-style';
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const IA_GLYPHS_PATH = 'M6.8 7.8H8.8V16.2H6.8ZM13 7.8H15L17.2 16.2H15.3L14.8 14.3H13.2L12.7 16.2H10.8ZM14 9.6L13.45 12.7H14.55Z';
+const IA_OUTLINE_BOX_PATH = 'M4.5 4H19.5A2.5 2.5 0 0 1 22 6.5V17.5A2.5 2.5 0 0 1 19.5 20H4.5A2.5 2.5 0 0 1 2 17.5V6.5A2.5 2.5 0 0 1 4.5 4Z';
+const IA_FILLED_CUTOUT_PATH = `M3.5 3H20.5A2.5 2.5 0 0 1 23 5.5V18.5A2.5 2.5 0 0 1 20.5 21H3.5A2.5 2.5 0 0 1 1 18.5V5.5A2.5 2.5 0 0 1 3.5 3Z ${IA_GLYPHS_PATH}`;
+
+function ensureIaButtonStyle(doc) {
+    ensureDocStyle(doc, IA_CC_STYLE_ID, [
+        '.supratube-ia-cc-btn { display: inline-flex !important; align-items: center !important; justify-content: center !important; opacity: 0.92 !important; color: #fff !important; cursor: pointer !important; vertical-align: middle !important; }',
+        '.supratube-ia-cc-btn:hover, .supratube-ia-cc-btn[data-active="1"] { opacity: 1 !important; }',
+        '.supratube-ia-cc-btn .ytp-subtitles-button-icon { display: inline-flex; align-items: center; justify-content: center; }'
+    ].join('\n'));
+}
+
+function createSvgNode(doc, tag, attrs = {}) {
+    const el = typeof doc.createElementNS === 'function' ? doc.createElementNS(SVG_NS, tag) : doc.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+        el.setAttribute?.(k, String(v));
+    }
+    return el;
+}
+
+function renderIaButtonIcon(btn, doc, active) {
+    if (!btn || !doc) return;
+    let wrap = btn.querySelector?.('.ytp-subtitles-button-icon');
+    if (!wrap) {
+        wrap = doc.createElement('div');
+        wrap.className = 'ytp-subtitles-button-icon';
+        btn.appendChild?.(wrap);
+    }
+    wrap.setAttribute?.('fill-opacity', '1');
+    let svg = wrap.querySelector?.('svg');
+    if (!svg) {
+        svg = createSvgNode(doc, 'svg', { fill: 'none', height: 24, viewBox: '0 0 24 24', width: 24 });
+        wrap.appendChild?.(svg);
+    }
+
+    const modeKey = active ? '1' : '0';
+    if (svg.getAttribute?.('data-ia-mode') === modeKey) return;
+    svg.setAttribute?.('data-ia-mode', modeKey);
+    svg.replaceChildren?.();
+
+    if (active) {
+        svg.appendChild?.(createSvgNode(doc, 'path', {
+            d: IA_FILLED_CUTOUT_PATH,
+            fill: 'white',
+            'fill-rule': 'evenodd',
+            'clip-rule': 'evenodd'
+        }));
+    } else {
+        svg.appendChild?.(createSvgNode(doc, 'path', {
+            d: IA_OUTLINE_BOX_PATH,
+            fill: 'none',
+            stroke: 'white',
+            'stroke-width': '1.8'
+        }));
+        svg.appendChild?.(createSvgNode(doc, 'path', {
+            d: IA_GLYPHS_PATH,
+            fill: 'white',
+            'fill-rule': 'evenodd',
+            'clip-rule': 'evenodd'
+        }));
+    }
+}
+
+function applyIaButtonState(btn, doc, active) {
+    if (!btn) return;
+    const label = active ? 'Desactivar subtítulos IA' : 'Subtítulos IA';
+    btn.setAttribute?.('data-active', active ? '1' : '0');
+    btn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+    btn.setAttribute?.('aria-label', label);
+    btn.setAttribute?.('title', label);
+    btn.setAttribute?.('data-tooltip-title', label);
+    btn.setAttribute?.('data-title-no-tooltip', label);
+    renderIaButtonIcon(btn, doc, active);
+}
+
+/** Sync active state of all injected SupraTube IA caption buttons with current Whisper session. */
+function syncAiSubtitleButtonState(
+    doc = typeof document !== 'undefined' ? document : null,
+    win = typeof window !== 'undefined' ? window : null
+) {
+    if (!doc) return;
+    const ctrl = getFallbackCtrl(win);
+    const active = Boolean(ctrl.whisperVid && ctrl.activeVid === ctrl.whisperVid);
+    const nodes = [];
+    if (typeof doc.querySelectorAll === 'function') {
+        try {
+            const list = doc.querySelectorAll(`.${IA_CC_BTN_ID}, #${IA_CC_BTN_ID}`);
+            if (list) nodes.push(...list);
+        } catch {}
+    }
+    if (!nodes.length && typeof doc.getElementById === 'function') {
+        const single = doc.getElementById(IA_CC_BTN_ID);
+        if (single) nodes.push(single);
+    }
+    for (const btn of nodes) {
+        applyIaButtonState(btn, doc, active);
+    }
+}
+
+/** Remove all SupraTube IA caption buttons (on teardown or disabling feature). */
+function removeAiSubtitleButtons(doc = typeof document !== 'undefined' ? document : null) {
+    if (!doc?.querySelectorAll) return;
+    try {
+        for (const el of Array.from(doc.querySelectorAll(`.${IA_CC_BTN_ID}, #${IA_CC_BTN_ID}`))) {
+            el.remove?.();
+        }
+    } catch {}
+}
+
+/** Mount the IA subtitles button beside the native YouTube CC button on Watch controls. */
+function ensureAiSubtitleButton({
+    player,
+    doc = typeof document !== 'undefined' ? document : null,
+    win = typeof window !== 'undefined' ? window : null,
+    enabled = true,
+    onToggle = null
+} = {}) {
+    if (!doc || !win) return null;
+    if (!enabled || !player || player.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || '')) {
+        removeAiSubtitleButtons(doc);
+        return null;
+    }
+
+    const ctrl = getFallbackCtrl(win);
+    if (typeof onToggle === 'function') ctrl.onIaToggle = onToggle;
+
+    const ccBtn = findFallbackCcButton(player, doc);
+    const parent = ccBtn?.parentElement;
+    if (!ccBtn || !parent) return null;
+    if (typeof ccBtn.closest === 'function' && !ccBtn.closest('.ytp-right-controls')) return null;
+
+    ensureIaButtonStyle(doc);
+
+    let btn = parent.querySelector?.(`#${IA_CC_BTN_ID}`) || doc.getElementById?.(IA_CC_BTN_ID) || null;
+    if (!btn) {
+        btn = doc.createElement('button');
+        btn.id = IA_CC_BTN_ID;
+        btn.type = 'button';
+        btn.className = `ytp-button ${IA_CC_BTN_ID}`;
+        btn.setAttribute?.('data-priority', '5');
+        btn.addEventListener?.('click', ev => {
+            ev?.preventDefault?.();
+            ev?.stopPropagation?.();
+            getFallbackCtrl(win).onIaToggle?.(win, doc);
+        });
+    }
+
+    if (btn.parentElement !== parent || ccBtn.nextSibling !== btn) {
+        parent.insertBefore?.(btn, ccBtn.nextSibling || null);
+    }
+
+    const active = Boolean(ctrl.whisperVid && ctrl.activeVid === ctrl.whisperVid);
+    applyIaButtonState(btn, doc, active);
+    return btn;
+}
+
+/** Toggle live Whisper AI captions manually on the active video, even if the video has no tracks or matches user language. */
+function startManualAiCaptions({
+    player,
+    videoId,
+    userLang = 'es',
+    doc = typeof document !== 'undefined' ? document : null,
+    win = typeof window !== 'undefined' ? window : null
+} = {}) {
+    if (!player || !videoId || !doc || !win) return false;
+    const ctrl = getFallbackCtrl(win);
+    if (ctrl.whisperVid === videoId && ctrl.activeVid === videoId) {
+        clearFallbackCaptions(doc, win);
+        return false;
+    }
+
+    const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
+    if (!video) return false;
+
+    ctrl.sameLangVideos.delete(videoId);
+    ctrl.manualForcePendingVid = null;
+    try { player.setOption?.('captions', 'track', {}); } catch {}
+    if (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn()) {
+        try { player.toggleSubtitles?.(); } catch {}
+    }
+
+    const ok = startWhisperLiveFallback({
+        player,
+        video,
+        videoId,
+        userLang: normalizeBaseLang(userLang) || 'es',
+        doc,
+        win,
+        manualForce: true,
+        initialMessage: 'Iniciando subtítulos IA...'
+    });
+    syncAiSubtitleButtonState(doc, win);
+    return ok;
+}
+
 const UNAVAILABLE_CC_TT_RE = /subt[ií]tulos no disponibles|captions unavailable|subtitles.*unavailable/i;
 
 function syncCcHoverTooltip(doc, label) {
@@ -2408,6 +2606,7 @@ function clearFallbackCaptions(doc = typeof document !== 'undefined' ? document 
         ctrl.stopWhisper = null;
     }
     ctrl.whisperVid = null;
+    ctrl.whisperManualForce = false;
     if (typeof ctrl.stopLoop === 'function') {
         try { ctrl.stopLoop(); } catch {}
         ctrl.stopLoop = null;
@@ -2416,6 +2615,7 @@ function clearFallbackCaptions(doc = typeof document !== 'undefined' ? document 
     if (existing) {
         try { existing.remove(); } catch {}
     }
+    syncAiSubtitleButtonState(doc, win);
 }
 
 function findActiveChunkText(chunks, timeSec) {
@@ -2500,10 +2700,17 @@ function dispatchWhisperCmd(win, detail) {
     return true;
 }
 
-function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, manualForce = false }) {
+function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, manualForce = false, initialMessage = '' }) {
     if (doc?.documentElement?.dataset?.supratubeWhisperBridge !== '1') return false;
     const ctrl = getFallbackCtrl(win);
-    if (ctrl.whisperVid === videoId) return true;
+    if (ctrl.whisperVid === videoId) {
+        if (manualForce && !ctrl.whisperManualForce) {
+            ctrl.whisperManualForce = true;
+            dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: userLang, manualForce: true });
+            syncAiSubtitleButtonState(doc, win);
+        }
+        return true;
+    }
     if (typeof ctrl.stopWhisper === 'function') {
         try { ctrl.stopWhisper(); } catch {}
         ctrl.stopWhisper = null;
@@ -2515,15 +2722,17 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
 
     ctrl.activeVid = videoId;
     ctrl.whisperVid = videoId;
+    ctrl.whisperManualForce = Boolean(manualForce);
     ctrl.forceOverlay = true;
     video?.setAttribute?.('data-supratube-whisper-target', videoId);
     setFallbackCcActive(player, doc, win, 'whisper');
+    syncAiSubtitleButtonState(doc, win);
 
     let fadeTimer = null;
     const showLine = (text, autoFadeMs = 0) => {
         if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
         const curVid = getActiveVideoIdSafe(player, win);
-        if ((curVid && curVid !== videoId) || hasVisibleNativeCaptions(player)) {
+        if ((curVid && curVid !== videoId) || (!ctrl.whisperManualForce && hasVisibleNativeCaptions(player))) {
             clearFallbackCaptions(doc, win);
             return;
         }
@@ -2543,6 +2752,10 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
         }
     };
 
+    if (initialMessage) {
+        showLine(initialMessage, 0);
+    }
+
     const onEvt = ev => {
         const d = ev?.detail;
         if (!d || typeof d !== 'object') return;
@@ -2552,7 +2765,7 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
         if (!ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
             setFallbackCcActive(player, doc, win, 'whisper');
         }
-        if (d.kind === 'same_language' && !manualForce) {
+        if (d.kind === 'same_language' && !ctrl.whisperManualForce) {
             ctrl.sameLangVideos.add(videoId);
             clearFallbackCaptions(doc, win);
             return;
@@ -5051,6 +5264,41 @@ function refreshProgressBar() {
     );
 }
 
+function syncIaButton() {
+    if (!S.videoId || !S.settings.autoSubtitles) {
+        removeAiSubtitleButtons(document);
+        return;
+    }
+    ensureAiSubtitleButton({
+        player: getPlayer(),
+        doc: document,
+        win: window,
+        enabled: true,
+        onToggle: () => {
+            const vid = getVideoId() || S.videoId;
+            const p = getPlayer();
+            if (!vid || !p) return;
+            const lang = S.userNativeLang || (typeof navigator !== 'undefined' ? String(navigator.language || '').split('-')[0].toLowerCase() : '') || 'es';
+            const started = startManualAiCaptions({
+                player: p,
+                videoId: vid,
+                userLang: lang,
+                doc: document,
+                win: window
+            });
+            if (started) {
+                S.subsAppliedForVideo = vid;
+                S.subsUserTouchedVideo = null;
+            } else {
+                S.subsUserTouchedVideo = vid;
+            }
+            if (!S.userNativeLang) {
+                resolveUserNativeLang().then(l => { S.userNativeLang = l; }).catch(() => {});
+            }
+        }
+    });
+}
+
 async function runSubtitlesForCurrentVideo() {
     const vid = S.videoId;
     if (!vid || !S.settings.autoSubtitles) return;
@@ -5247,16 +5495,19 @@ function onNavigate() {
         if (vid) {
             loadSponsorForVideo(vid);
             ensureSBLoop();
+            syncIaButton();
             [500, 1500, 3000].forEach(delay => {
                 const tid = setTimeout(() => {
                     if (S._tornDown || S.videoId !== vid) return;
                     apply1080pQuality(getPlayer(), S.qualityState, S.settings.auto1080p);
+                    syncIaButton();
                     runSubtitlesForCurrentVideo();
                 }, delay);
                 S._subTimers.push(tid);
             });
         } else {
             S.sbSegments = [];
+            removeAiSubtitleButtons(document);
             refreshProgressBar();
         }
         setupObservers();
@@ -5292,6 +5543,7 @@ function teardown() {
     try { S._aiCtrl?.destroy?.(); } catch {}
     try { S._tdCtrl?.destroy?.(); } catch {}
     clearFallbackCaptions(document, window);
+    removeAiSubtitleButtons(document);
     try { window.__supratubeEjecutado = false; } catch {}
 }
 
@@ -5371,6 +5623,7 @@ function boot() {
             }
         }
         S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: S.videoId });
+        syncIaButton();
     });
 
     const sig = S._abortCtrl?.signal;
@@ -5410,6 +5663,7 @@ function boot() {
         }
         S._aiCtrl.tick({ enabled: Boolean(S.settings.aiSummary), url: location.href, videoId: S.videoId });
         if (S.settings.transcriptDownload !== false) S._tdCtrl.scan();
+        syncIaButton();
     }, 800);
 
     S._navObs = new MutationObserver(() => {
