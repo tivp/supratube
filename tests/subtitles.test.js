@@ -1470,7 +1470,10 @@ test('main bundle preserves active CC fallback across same-video yt-page-data-up
         fakeWin.location.href = 'https://www.youtube.com/watch?v=otherVid002';
         fakeWin.location.search = '?v=otherVid002';
         for (const fn of (winListeners['yt-navigate-finish'] || [])) fn({});
-        await new Promise(r => setTimeout(r, 500));
+        const waitStart = Date.now();
+        while (!whisperCmds.some(c => c.action === 'stop' && c.videoId === 'sameVid0001') && Date.now() - waitStart < 1500) {
+            await new Promise(r => setTimeout(r, 30));
+        }
         assert.ok(whisperCmds.some(c => c.action === 'stop' && c.videoId === 'sameVid0001'));
     } finally {
         fakeWin.__supratubeTeardown?.();
