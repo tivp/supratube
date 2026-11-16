@@ -327,13 +327,17 @@ function clearSubTimers() {
 }
 
 function onNavigate() {
+    S.lastUrl = location.href;
     clearTimeout(S._navTimer);
     clearSubTimers();
     S._navTimer = setTimeout(() => {
         if (S._tornDown) return;
-        clearVideoCache();
-        clearFallbackCaptions(document, window);
         const vid = getVideoId();
+        const sameVideo = Boolean(vid && vid === S.videoId);
+        if (!sameVideo) {
+            clearVideoCache();
+            clearFallbackCaptions(document, window);
+        }
         S.videoId = vid;
 
         if (vid) {

@@ -2072,14 +2072,14 @@ function ensureFallbackBox(player, doc, win) {
     }
     const isShorts = Boolean(player.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
     const cw = Number(player.clientWidth) || (isShorts ? 380 : 900);
-    const fontPx = Math.round(Math.max(isShorts ? 14 : 16, Math.min(isShorts ? 22 : 30, cw * (isShorts ? 0.042 : 0.024))));
+    const fontPx = Math.round(Math.max(isShorts ? 21 : 16, Math.min(30, cw * (isShorts ? 0.064 : 0.024))));
     Object.assign(box.style, {
         position: 'absolute',
         left: '50%',
         transform: 'translateX(-50%)',
-        bottom: isShorts ? '23%' : '11%',
-        width: 'auto',
-        maxWidth: isShorts ? '86%' : '82%',
+        bottom: isShorts ? '19%' : '11%',
+        width: 'max-content',
+        maxWidth: isShorts ? '90%' : '84%',
         zIndex: '60',
         pointerEvents: 'none',
         textAlign: 'center'
@@ -2092,9 +2092,9 @@ function ensureFallbackBox(player, doc, win) {
             color: '#ffffff',
             fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
             fontSize: `${fontPx}px`,
-            fontWeight: '500',
-            lineHeight: '1.35',
-            padding: '4px 10px',
+            fontWeight: isShorts ? '600' : '500',
+            lineHeight: isShorts ? '1.3' : '1.35',
+            padding: isShorts ? '6px 12px' : '4px 10px',
             borderRadius: '4px',
             textShadow: '0 1px 2px rgba(0, 0, 0, 0.9)',
             whiteSpace: 'pre-wrap'
@@ -2104,22 +2104,81 @@ function ensureFallbackBox(player, doc, win) {
 }
 
 const CC_ACTIVE_STYLE_ID = 'supratube-cc-active-style';
+const SHORTS_CAPTION_STYLE_ID = 'supratube-shorts-caption-style';
 const FILLED_CC_SVG_PATH =
     'M21 3H3C2.46 3 1.96 3.21 1.58 3.58C1.21 3.96 1 4.46 1 5V19C1 19.53 1.21 20.03 1.58 20.41C1.96 20.78 2.46 21 3 21H21C21.53 21 22.03 20.78 22.41 20.41C22.78 20.03 23 19.53 23 19V5C23 4.46 22.78 3.96 22.41 3.58C22.03 3.21 21.53 3 21 3ZM6 11H8C8.26 11 8.51 11.10 8.70 11.29C8.89 11.48 9 11.73 9 12C9 12.26 8.89 12.51 8.70 12.70C8.51 12.89 8.26 13 8 13H6C5.73 13 5.48 12.89 5.29 12.70C5.10 12.51 5 12.26 5 12C5 11.73 5.10 11.48 5.29 11.29C5.48 11.10 5.73 11 6 11ZM12 11H18C18.26 11 18.51 11.10 18.70 11.29C18.89 11.48 19 11.73 19 12C19 12.26 18.89 12.51 18.70 12.70C18.51 12.89 18.26 13 18 13H12C11.73 13 11.48 12.89 11.29 12.70C11.10 12.51 11 12.26 11 12C11 11.73 11.10 11.48 11.29 11.29C11.48 11.10 11.73 11 12 11ZM16 15H18C18.26 15 18.51 15.10 18.70 15.29C18.89 15.48 19 15.73 19 16C19 16.26 18.89 16.51 18.70 16.70C18.51 16.89 18.26 17 18 17H16C15.73 17 15.48 16.89 15.29 16.70C15.10 16.51 15 16.26 15 16C15 15.73 15.10 15.48 15.29 15.29C15.48 15.10 15.73 15 16 15ZM6 15H12C12.26 15 12.51 15.10 12.70 15.29C12.89 15.48 13 15.73 13 16C13 16.26 12.89 16.51 12.70 16.70C12.51 16.89 12.26 17 12 17H6C5.73 17 5.48 16.89 5.29 16.70C5.10 16.51 5 16.26 5 16C5 15.73 5.10 15.48 5.29 15.29C5.48 15.10 5.73 15 6 15Z';
 const CC_TRACKED_ATTRS = ['aria-pressed', 'aria-disabled', 'aria-label', 'data-tooltip-title', 'data-title-no-tooltip'];
 
-function ensureCcActiveStyle(doc) {
-    if (!doc?.createElement) return;
-    if (doc.getElementById?.(CC_ACTIVE_STYLE_ID)) return;
+function ensureDocStyle(doc, id, css) {
+    if (!doc?.createElement || !id) return;
+    const existing = doc.getElementById?.(id);
+    if (existing) {
+        if (existing.textContent !== css) existing.textContent = css;
+        return;
+    }
     const target = doc.head || doc.documentElement;
     if (!target?.appendChild) return;
     const style = doc.createElement('style');
-    style.id = CC_ACTIVE_STYLE_ID;
-    style.textContent = [
-        '.ytp-subtitles-button[data-supratube-cc-active="1"] { opacity: 1 !important; pointer-events: auto !important; cursor: pointer !important; }',
-        '.ytp-subtitles-button[data-supratube-cc-active="1"] svg, .ytp-subtitles-button[data-supratube-cc-active="1"] path { opacity: 1 !important; }'
-    ].join('\n');
+    style.id = id;
+    style.textContent = css;
     target.appendChild(style);
+}
+
+function ensureCcActiveStyle(doc) {
+    ensureDocStyle(doc, CC_ACTIVE_STYLE_ID, [
+        '.ytp-subtitles-button[data-supratube-cc-active="1"] { opacity: 1 !important; pointer-events: auto !important; cursor: pointer !important; color: #fff !important; }',
+        '.ytp-subtitles-button[data-supratube-cc-active="1"] .ytp-subtitles-button-icon, .ytp-subtitles-button[data-supratube-cc-active="1"] svg, .ytp-subtitles-button[data-supratube-cc-active="1"] path { opacity: 1 !important; fill-opacity: 1 !important; }'
+    ].join('\n'));
+}
+
+function ensureShortsCaptionStyle(doc) {
+    ensureDocStyle(doc, SHORTS_CAPTION_STYLE_ID, [
+        '#shorts-player .ytp-caption-segment, ytd-reel-video-renderer .ytp-caption-segment, ytd-shorts .ytp-caption-segment {',
+        '    font-size: clamp(21px, 2vw, 28px) !important;',
+        '    line-height: 1.3 !important;',
+        '    padding: 4px 10px !important;',
+        '    font-weight: 600 !important;',
+        '}',
+        '#shorts-player .caption-window, ytd-reel-video-renderer .caption-window, ytd-shorts .caption-window {',
+        '    max-width: 92% !important;',
+        '}'
+    ].join('\n'));
+}
+
+const UNAVAILABLE_CC_TT_RE = /subt[ií]tulos no disponibles|captions unavailable|subtitles.*unavailable/i;
+
+function syncCcHoverTooltip(doc, label) {
+    if (!doc) return;
+    const nodes = [];
+    if (typeof doc.querySelectorAll === 'function') {
+        try {
+            const list = doc.querySelectorAll('.ytp-tooltip-text');
+            if (list) nodes.push(...list);
+        } catch {}
+    }
+    if (!nodes.length && typeof doc.querySelector === 'function') {
+        try {
+            const single = doc.querySelector('.ytp-tooltip-text');
+            if (single) nodes.push(single);
+        } catch {}
+    }
+    for (const tt of nodes) {
+        if (!tt || !UNAVAILABLE_CC_TT_RE.test(String(tt.textContent || ''))) continue;
+        const childNodes = tt.childNodes ? Array.from(tt.childNodes) : [];
+        const hasElementChild = childNodes.some((n) => n && n.nodeType === 1);
+        if (hasElementChild) {
+            let replaced = false;
+            for (const child of childNodes) {
+                if (child?.nodeType === 3 && UNAVAILABLE_CC_TT_RE.test(String(child.textContent || ''))) {
+                    child.textContent = `${label} `;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (replaced) continue;
+        }
+        tt.textContent = label;
+    }
 }
 
 function findFallbackCcButton(player, doc) {
@@ -2133,14 +2192,14 @@ function applyCcActiveAttrs(ui, doc) {
     try {
         const label = ui.mode === 'whisper' ? 'Subtítulos IA' : 'Subtítulos';
         const tooltip = `${label} (c)`;
-        const setIfDiff = (k, v) => {
-            if (ccBtn.getAttribute?.(k) !== v) ccBtn.setAttribute?.(k, v);
+        const setIfDiff = (el, k, v) => {
+            if (el?.getAttribute?.(k) !== v) el?.setAttribute?.(k, v);
         };
-        setIfDiff('data-supratube-cc-active', '1');
-        setIfDiff('aria-pressed', 'true');
-        setIfDiff('aria-label', tooltip);
-        setIfDiff('data-tooltip-title', tooltip);
-        setIfDiff('data-title-no-tooltip', label);
+        setIfDiff(ccBtn, 'data-supratube-cc-active', '1');
+        setIfDiff(ccBtn, 'aria-pressed', 'true');
+        setIfDiff(ccBtn, 'aria-label', tooltip);
+        setIfDiff(ccBtn, 'data-tooltip-title', tooltip);
+        setIfDiff(ccBtn, 'data-title-no-tooltip', label);
         if (ccBtn.hasAttribute?.('aria-disabled') || ccBtn.getAttribute?.('aria-disabled') !== null) {
             ccBtn.removeAttribute?.('aria-disabled');
         }
@@ -2148,23 +2207,55 @@ function applyCcActiveAttrs(ui, doc) {
         if (ccBtn.hasAttribute?.('disabled')) ccBtn.removeAttribute?.('disabled');
         if (ccBtn.style?.display === 'none') ccBtn.style.display = '';
 
+        const iconWrap = ccBtn.querySelector?.('.ytp-subtitles-button-icon');
+        if (iconWrap) {
+            if (ui.origIconFillOpacity === undefined) {
+                ui.origIconFillOpacity = iconWrap.getAttribute?.('fill-opacity') ?? null;
+            }
+            setIfDiff(iconWrap, 'fill-opacity', '1');
+        }
+
         const svg = ccBtn.querySelector?.('svg');
+        if (svg) {
+            if (ui.origSvgFillOpacity === undefined) {
+                ui.origSvgFillOpacity = svg.getAttribute?.('fill-opacity') ?? null;
+            }
+            if (svg.hasAttribute?.('fill-opacity') || svg.getAttribute?.('fill-opacity') !== null) {
+                svg.removeAttribute?.('fill-opacity');
+            }
+        }
+
         const path = ccBtn.querySelector?.('svg path');
-        if (svg?.getAttribute?.('viewBox') === '0 0 24 24' && path) {
-            if (ui.origPathD === null) ui.origPathD = path.getAttribute?.('d') ?? null;
-            if (path.getAttribute?.('d') !== FILLED_CC_SVG_PATH) {
-                path.setAttribute?.('d', FILLED_CC_SVG_PATH);
+        if (path) {
+            if (ui.origPathFillOpacity === undefined) {
+                ui.origPathFillOpacity = path.getAttribute?.('fill-opacity') ?? null;
+            }
+            if (path.hasAttribute?.('fill-opacity') || path.getAttribute?.('fill-opacity') !== null) {
+                path.removeAttribute?.('fill-opacity');
+            }
+            if (svg?.getAttribute?.('viewBox') === '0 0 24 24') {
+                if (ui.origPathD === null) ui.origPathD = path.getAttribute?.('d') ?? null;
+                if (path.getAttribute?.('d') !== FILLED_CC_SVG_PATH) {
+                    path.setAttribute?.('d', FILLED_CC_SVG_PATH);
+                }
             }
         }
-        if (ccBtn.matches?.(':hover')) {
-            const tt = doc?.querySelector?.('.ytp-tooltip-text');
-            if (tt && /subt[ií]tulos no disponibles|captions unavailable|subtitles.*unavailable/i.test(String(tt.textContent || ''))) {
-                tt.textContent = label;
-            }
-        }
+        syncCcHoverTooltip(doc, label);
     } finally {
         ui.suppressObs = false;
     }
+}
+
+function restoreCcAttr(el, attr, prev) {
+    if (!el) return;
+    if (prev === null || prev === undefined) el.removeAttribute?.(attr);
+    else el.setAttribute?.(attr, prev);
+}
+
+function clearUiTooltipTimers(ui) {
+    if (!ui?.tooltipTimers?.length) return;
+    for (const id of ui.tooltipTimers) clearTimeout(id);
+    ui.tooltipTimers.length = 0;
 }
 
 function restoreFallbackCcButton(win) {
@@ -2176,20 +2267,35 @@ function restoreFallbackCcButton(win) {
     ui.suppressObs = true;
     try {
         try { ui.observer?.disconnect?.(); } catch {}
+        clearUiTooltipTimers(ui);
         const { ccBtn } = ui;
         if (!ccBtn) return;
+        if (ui.onHover) {
+            for (const ev of ['pointerenter', 'mouseenter', 'focus']) {
+                ccBtn.removeEventListener?.(ev, ui.onHover, true);
+            }
+        }
         ccBtn.removeAttribute?.('data-supratube-cc-active');
         for (const attr of CC_TRACKED_ATTRS) {
-            const prev = ui.origAttrs[attr];
-            if (prev === null || prev === undefined) ccBtn.removeAttribute?.(attr);
-            else ccBtn.setAttribute?.(attr, prev);
+            restoreCcAttr(ccBtn, attr, ui.origAttrs[attr]);
         }
         ccBtn.disabled = Boolean(ui.origDisabled);
         if (ui.origDisabled) ccBtn.setAttribute?.('disabled', '');
         if (ccBtn.style) ccBtn.style.display = ui.origDisplay;
-        if (ui.origPathD !== null) {
-            const path = ccBtn.querySelector?.('svg path');
-            if (path) path.setAttribute?.('d', ui.origPathD);
+        if (ui.origIconFillOpacity !== undefined) {
+            restoreCcAttr(ccBtn.querySelector?.('.ytp-subtitles-button-icon'), 'fill-opacity', ui.origIconFillOpacity);
+        }
+        if (ui.origSvgFillOpacity !== undefined) {
+            restoreCcAttr(ccBtn.querySelector?.('svg'), 'fill-opacity', ui.origSvgFillOpacity);
+        }
+        const path = ccBtn.querySelector?.('svg path');
+        if (path) {
+            if (ui.origPathFillOpacity !== undefined) {
+                restoreCcAttr(path, 'fill-opacity', ui.origPathFillOpacity);
+            }
+            if (ui.origPathD !== null) {
+                path.setAttribute?.('d', ui.origPathD);
+            }
         }
     } finally {
         ui.suppressObs = false;
@@ -2227,11 +2333,30 @@ function setFallbackCcActive(player, doc, win, mode = 'layer1') {
             origDisabled: Boolean(ccBtn.disabled),
             origDisplay: ccBtn.style?.display ?? '',
             origPathD: (svg?.getAttribute?.('viewBox') === '0 0 24 24' && path) ? (path.getAttribute?.('d') ?? null) : null,
+            origIconFillOpacity: undefined,
+            origSvgFillOpacity: undefined,
+            origPathFillOpacity: undefined,
+            tooltipTimers: [],
+            onHover: null,
             observer: null,
             suppressObs: false,
             active: true,
             mode
         };
+        ui.onHover = () => {
+            if (!ui.active) return;
+            applyCcActiveAttrs(ui, doc);
+            clearUiTooltipTimers(ui);
+            const label = ui.mode === 'whisper' ? 'Subtítulos IA' : 'Subtítulos';
+            for (const delay of [0, 60, 160]) {
+                ui.tooltipTimers.push(setTimeout(() => {
+                    if (ui.active) syncCcHoverTooltip(doc, label);
+                }, delay));
+            }
+        };
+        for (const ev of ['pointerenter', 'mouseenter', 'focus']) {
+            ccBtn.addEventListener?.(ev, ui.onHover, true);
+        }
         if (typeof win?.MutationObserver === 'function') {
             try {
                 ui.observer = new win.MutationObserver(() => {
@@ -2239,7 +2364,7 @@ function setFallbackCcActive(player, doc, win, mode = 'layer1') {
                 });
                 ui.observer.observe(ccBtn, {
                     attributes: true,
-                    attributeFilter: [...CC_TRACKED_ATTRS, 'disabled', 'style'],
+                    attributeFilter: [...CC_TRACKED_ATTRS, 'disabled', 'style', 'fill-opacity', 'd'],
                     childList: true,
                     subtree: true
                 });
@@ -2260,6 +2385,7 @@ function clearFallbackCaptions(doc = typeof document !== 'undefined' ? document 
     ctrl.watchdogTimer = null;
     ctrl.activeVid = null;
     ctrl.inflightVid = null;
+    ctrl.manualForcePendingVid = null;
     ctrl.forceOverlay = false;
     restoreFallbackCcButton(win);
     if (typeof ctrl.stopWhisper === 'function') {
@@ -2465,7 +2591,11 @@ async function runFallbackSubtitles({
 }) {
     const ctrl = getFallbackCtrl(win);
     if (ctrl.sameLangVideos.has(videoId) && !manualForce) return;
-    if (ctrl.activeVid === videoId || ctrl.inflightVid === videoId) return;
+    if (ctrl.activeVid === videoId) return;
+    if (ctrl.inflightVid === videoId) {
+        if (manualForce) ctrl.manualForcePendingVid = videoId;
+        return;
+    }
     if (hasVisibleNativeCaptions(player)) return;
     const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
     if (!video) return;
@@ -2485,6 +2615,8 @@ async function runFallbackSubtitles({
         }
 
         const recovered = await obtainRawSegmentsForVideo(videoId, win, { userLang: targetBase, captionTracks, doc, requestFn });
+        const forced = Boolean(manualForce || ctrl.manualForcePendingVid === videoId);
+        if (ctrl.manualForcePendingVid === videoId) ctrl.manualForcePendingVid = null;
         const segments = recovered?.segments || [];
         if (getActiveVideoIdSafe(player, win) !== videoId || hasVisibleNativeCaptions(player)) return;
 
@@ -2493,7 +2625,7 @@ async function runFallbackSubtitles({
             sourceLang ||
             detectVideoAudioLang({ captionTracks: recovered?.captionTracks || [] })
         );
-        if (!manualForce && recoveredAudioLang && recoveredAudioLang === targetBase) {
+        if (!forced && recoveredAudioLang && recoveredAudioLang === targetBase) {
             ctrl.sameLangVideos.add(videoId);
             clearFallbackCaptions(doc, win);
             return;
@@ -2501,7 +2633,7 @@ async function runFallbackSubtitles({
 
         if (!segments.length) {
             if (allowWhisper) {
-                startWhisperLiveFallback({ player, video, videoId, userLang: targetBase, doc, win, manualForce });
+                startWhisperLiveFallback({ player, video, videoId, userLang: targetBase, doc, win, manualForce: forced });
             }
             return;
         }
@@ -2679,6 +2811,9 @@ async function applySmartSubtitles(player, deps = {}) {
         return false;
     }
     const targetVideoId = deps.expectedVideoId || playerVid || '';
+    if (player.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || '')) {
+        ensureShortsCaptionStyle(doc);
+    }
 
     try { player.loadModule?.('captions'); } catch {}
 
@@ -3238,49 +3373,25 @@ const __supratubeTdExports = (() => {
             clientTrackSets.push({ source: 'WEB', tracks: captionTracks });
         }
 
-        // Query ANDROID/IOS/MWEB/WEB_EMBEDDED_PLAYER when tracks are missing or need PO-token-free URLs.
+        // Query ANDROID first, then probe remaining Innertube clients in parallel if needed.
+        let checkedMobileClients = false;
         const needsMobileClient = !captionTracks.length;
         if (needsMobileClient) {
-            for (let i = 0; i < TD_INNERTUBE_CLIENTS.length; i++) {
-                const cli = TD_INNERTUBE_CLIENTS[i];
-                const res = await tdPostInnertubeJson({
-                    endpoint: 'player',
-                    payload: {
-                        context: {
-                            client: {
-                                ...cli.context,
-                                ...(cfg.visitorData ? { visitorData: cfg.visitorData } : {})
-                            },
-                            ...(cli.name === 'WEB_EMBEDDED_PLAYER' ? { thirdParty: { embedUrl: 'https://www.youtube.com/' } } : {})
-                        },
-                        videoId,
-                        contentCheckOk: true,
-                        racyCheckOk: true
-                    },
-                    headers: {
-                        'X-YouTube-Client-Name': cli.id,
-                        'X-YouTube-Client-Version': cli.context.clientVersion,
-                        ...(cfg.visitorData ? { 'X-Goog-Visitor-Id': cfg.visitorData } : {})
-                    },
-                    anonymous: true,
-                    win,
-                    requestFn
-                });
-                const sum = tdParsePlayerSummary(res.data, cli.name);
-                if (sum) {
-                    if (!title && sum.title) title = sum.title;
-                    if (publishDate === '0000-00-00' && sum.publishDate !== '0000-00-00') publishDate = sum.publishDate;
-                    if (!audioLang) {
-                        audioLang = detectVideoAudioLang({
-                            adaptiveFormats: sum.adaptiveFormats,
-                            captionTracks: sum.captionTracks
-                        });
-                    }
-                    if (sum.captionTracks.length) {
-                        clientTrackSets.push({ source: cli.name, tracks: sum.captionTracks });
-                        if (!captionTracks.length) captionTracks = sum.captionTracks;
-                        break;
-                    }
+            checkedMobileClients = true;
+            const results = await tdProbeInnertubeClients(videoId, cfg, win, requestFn);
+            for (const { cli, sum } of results) {
+                if (!sum) continue;
+                if (!title && sum.title) title = sum.title;
+                if (publishDate === '0000-00-00' && sum.publishDate !== '0000-00-00') publishDate = sum.publishDate;
+                if (!audioLang) {
+                    audioLang = detectVideoAudioLang({
+                        adaptiveFormats: sum.adaptiveFormats,
+                        captionTracks: sum.captionTracks
+                    });
+                }
+                if (sum.captionTracks.length) {
+                    clientTrackSets.push({ source: cli.name, tracks: sum.captionTracks });
+                    if (!captionTracks.length) captionTracks = sum.captionTracks;
                 }
             }
         }
@@ -3290,7 +3401,8 @@ const __supratubeTdExports = (() => {
             publishDate,
             captionTracks,
             clientTrackSets,
-            audioLang
+            audioLang,
+            checkedMobileClients
         };
     }
 
@@ -3337,33 +3449,49 @@ const __supratubeTdExports = (() => {
         return { rateLimited: false, cues: [] };
     }
 
-    async function tdFetchMobileCaptionTracks(videoId, cfg, win, requestFn) {
-        for (let i = 0; i < TD_INNERTUBE_CLIENTS.length; i++) {
-            const cli = TD_INNERTUBE_CLIENTS[i];
-            const res = await tdPostInnertubeJson({
-                endpoint: 'player',
-                payload: {
-                    context: {
-                        client: {
-                            ...cli.context,
-                            ...(cfg.visitorData ? { visitorData: cfg.visitorData } : {})
-                        },
-                        ...(cli.name === 'WEB_EMBEDDED_PLAYER' ? { thirdParty: { embedUrl: 'https://www.youtube.com/' } } : {})
+    async function tdFetchClientSummary(cli, videoId, cfg, win, requestFn) {
+        const res = await tdPostInnertubeJson({
+            endpoint: 'player',
+            payload: {
+                context: {
+                    client: {
+                        ...cli.context,
+                        ...(cfg.visitorData ? { visitorData: cfg.visitorData } : {})
                     },
-                    videoId,
-                    contentCheckOk: true,
-                    racyCheckOk: true
+                    ...(cli.name === 'WEB_EMBEDDED_PLAYER' ? { thirdParty: { embedUrl: 'https://www.youtube.com/' } } : {})
                 },
-                headers: {
-                    'X-YouTube-Client-Name': cli.id,
-                    'X-YouTube-Client-Version': cli.context.clientVersion,
-                    ...(cfg.visitorData ? { 'X-Goog-Visitor-Id': cfg.visitorData } : {})
-                },
-                anonymous: true,
-                win,
-                requestFn
-            });
-            const sum = tdParsePlayerSummary(res.data, cli.name);
+                videoId,
+                contentCheckOk: true,
+                racyCheckOk: true
+            },
+            headers: {
+                'X-YouTube-Client-Name': cli.id,
+                'X-YouTube-Client-Version': cli.context.clientVersion,
+                ...(cfg.visitorData ? { 'X-Goog-Visitor-Id': cfg.visitorData } : {})
+            },
+            anonymous: true,
+            win,
+            requestFn
+        });
+        return { cli, sum: tdParsePlayerSummary(res.data, cli.name) };
+    }
+
+    async function tdProbeInnertubeClients(videoId, cfg, win, requestFn) {
+        if (!TD_INNERTUBE_CLIENTS.length) return [];
+        const first = await tdFetchClientSummary(TD_INNERTUBE_CLIENTS[0], videoId, cfg, win, requestFn)
+            .catch(() => ({ cli: TD_INNERTUBE_CLIENTS[0], sum: null }));
+        if (first?.sum?.captionTracks?.length) return [first];
+        const rest = await Promise.all(
+            TD_INNERTUBE_CLIENTS.slice(1).map(cli =>
+                tdFetchClientSummary(cli, videoId, cfg, win, requestFn).catch(() => ({ cli, sum: null }))
+            )
+        );
+        return [first, ...rest];
+    }
+
+    async function tdFetchMobileCaptionTracks(videoId, cfg, win, requestFn) {
+        const results = await tdProbeInnertubeClients(videoId, cfg, win, requestFn);
+        for (const { sum } of results) {
             if (sum?.captionTracks?.length) return sum.captionTracks;
         }
         return [];
@@ -3392,6 +3520,7 @@ const __supratubeTdExports = (() => {
             });
             if (nextRes.data) tdCollectTranscriptParams(nextRes.data, 0, paramSet);
         }
+        const hadKnownParam = paramSet.size > 0;
         for (const p of buildGetTranscriptParamsCandidates(videoId, chosenTrack?.languageCode || 'es', chosenTrack?.kind ?? 'asr')) {
             paramSet.add(p);
         }
@@ -3411,19 +3540,32 @@ const __supratubeTdExports = (() => {
             'X-YouTube-Client-Version': String(cfg.clientVersion)
         };
 
-        for (let i = 0; i < candidates.length; i++) {
-            const res = await tdPostInnertubeJson({
-                endpoint: 'get_transcript',
-                payload: { context, params: candidates[i] },
-                headers,
-                anonymous: false,
-                win,
-                requestFn
-            });
-            if (res.status === 400 || res.status === 403 || res.status === 429) break;
-            if (res.data) {
-                const parsed = parseTranscriptPanelResponse(res.data);
+        const queryTranscript = params => tdPostInnertubeJson({
+            endpoint: 'get_transcript',
+            payload: { context, params },
+            headers,
+            anonymous: false,
+            win,
+            requestFn
+        });
+
+        let batch = candidates;
+        if (hadKnownParam && candidates.length) {
+            const firstRes = await queryTranscript(candidates[0]);
+            if (firstRes.data) {
+                const parsed = parseTranscriptPanelResponse(firstRes.data);
                 if (parsed.length) return parsed;
+            }
+            if (firstRes.status === 400 || firstRes.status === 403 || firstRes.status === 429) return [];
+            batch = candidates.slice(1);
+        }
+        if (batch.length) {
+            const rest = await Promise.all(batch.map(p => queryTranscript(p).catch(() => ({ status: 0, data: null }))));
+            for (const res of rest) {
+                if (res.data) {
+                    const parsed = parseTranscriptPanelResponse(res.data);
+                    if (parsed.length) return parsed;
+                }
             }
         }
         return [];
@@ -3574,7 +3716,7 @@ const __supratubeTdExports = (() => {
             }
         }
 
-        if (!cues.length) {
+        if (!cues.length && !meta.checkedMobileClients) {
             const cfg = tdGetYtCfg(win);
             const mobileTracks = await tdFetchMobileCaptionTracks(vid, cfg, win, requestFn);
             if (mobileTracks.length) {
@@ -3592,21 +3734,16 @@ const __supratubeTdExports = (() => {
             }
         }
 
-        // Layer 1d: Innertube /youtubei/v1/get_panel (PAmodern_transcript_view).
+        // Layer 1d + 1e: Innertube get_panel and /next + get_transcript in parallel.
         if (!cues.length) {
-            const panelCues = await fetchTranscriptViaGetPanel(vid, win).catch(() => []);
-            if (panelCues.length) {
-                cues = panelCues;
-                sourceLang = tdInferCueLang({ explicitLang: '', cues: panelCues, meta, baseUser });
-            }
-        }
-
-        // Layer 1e: Innertube /next + /youtubei/v1/get_transcript.
-        if (!cues.length) {
-            const trCues = await tdFetchViaGetTranscript(vid, chosen, doc, win, requestFn);
-            if (trCues.length) {
-                cues = trCues;
-                sourceLang = tdInferCueLang({ explicitLang: '', cues: trCues, meta, baseUser });
+            const [panelCues, trCues] = await Promise.all([
+                fetchTranscriptViaGetPanel(vid, win).catch(() => []),
+                tdFetchViaGetTranscript(vid, chosen, doc, win, requestFn).catch(() => [])
+            ]);
+            const bestCues = panelCues.length ? panelCues : trCues;
+            if (bestCues.length) {
+                cues = bestCues;
+                sourceLang = tdInferCueLang({ explicitLang: '', cues: bestCues, meta, baseUser });
             }
         }
 
@@ -5079,13 +5216,17 @@ function clearSubTimers() {
 }
 
 function onNavigate() {
+    S.lastUrl = location.href;
     clearTimeout(S._navTimer);
     clearSubTimers();
     S._navTimer = setTimeout(() => {
         if (S._tornDown) return;
-        clearVideoCache();
-        clearFallbackCaptions(document, window);
         const vid = getVideoId();
+        const sameVideo = Boolean(vid && vid === S.videoId);
+        if (!sameVideo) {
+            clearVideoCache();
+            clearFallbackCaptions(document, window);
+        }
         S.videoId = vid;
 
         if (vid) {
