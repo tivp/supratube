@@ -404,3 +404,54 @@ test('SupraTube branding, simple humane copy, and transparent credits stay consi
     assert.match(readme, /greasyfork\.org\/scripts\/508784/);
     assert.match(readme, /greasyfork\.org\/scripts\/537017/);
 });
+
+test('background.js retries transient offscreen startup connection errors and exposes swVersion', async () => {
+    const bg = fs.readFileSync(path.resolve('background.js'), 'utf8');
+    let msgListener = null;
+    let sendAttempts = 0;
+    const sandbox = {
+        chrome: {
+            runtime: {
+                id: 'ext_test',
+                getManifest: () => ({ version: '1.0.10' }),
+                onInstalled: { addListener() {} },
+                onStartup: { addListener() {} },
+                onMessage: { addListener: fn => { msgListener = fn; } },
+                getContexts: async () => [],
+                sendMessage: async payload => {
+                    if (payload?.target === 'offscreen' && payload?.type === 'INIT') {
+                        sendAttempts++;
+                        if (sendAttempts < 3) {
+                            throw new Error('Could not establish connection. Receiving end does not exist.');
+                        }
+                        return { ok: true };
+                    }
+                    return { ok: true };
+                }
+            },
+            offscreen: { createDocument: async () => {} },
+            tabs: { onRemoved: { addListener() {} }, query: async () => [], sendMessage: async () => {} },
+            storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } },
+            scripting: { executeScript: async () => [] },
+            userScripts: { register: async () => {}, unregister: async () => {}, getScripts: async () => [], execute: async () => {} }
+        },
+        fetch: async () => ({ ok: false, status: 500 }),
+        AbortController,
+        setTimeout,
+        clearTimeout,
+        URLSearchParams
+    };
+    vm.runInNewContext(bg, sandbox, { filename: 'background.js' });
+
+    const startRes = await new Promise(resolve => {
+        msgListener({ action: 'SUPRATUBE_WHISPER_START', videoId: 'fEt2anArPb4', targetLang: '-es', manualForce: true }, { tab: { id: 9 } }, resolve);
+    });
+    assert.equal(startRes?.ok, true);
+    assert.equal(sendAttempts, 3);
+
+    const statusRes = await new Promise(resolve => {
+        msgListener({ action: 'SUPRATUBE_GET_STATUS' }, {}, resolve);
+    });
+    assert.equal(statusRes?.ok, true);
+    assert.equal(statusRes?.swVersion, '1.0.10');
+});

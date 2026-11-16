@@ -2009,3 +2009,151 @@ test('manual [IA] survives in-flight auto fallback, keeps paused readiness banne
 
     clearFallbackCaptions(fakeDoc, fakeWin);
 });
+
+test('manual [IA] recovers automatically from offscreen unavailable via in-page PCM16 capture and maximus-bridge-stt', async () => {
+    const elements = new Map();
+    let capturedProc = null;
+    const videoEl = {
+        currentTime: 4,
+        paused: false,
+        ended: false,
+        muted: false,
+        volume: 1,
+        setAttribute() {},
+        removeAttribute() {},
+        addEventListener() {},
+        removeEventListener() {},
+        captureStream: () => ({ getAudioTracks: () => [{ kind: 'audio', readyState: 'live' }] })
+    };
+    const makeAttrs = (init = {}) => {
+        const map = { ...init };
+        return {
+            setAttribute(k, v) { map[k] = String(v); },
+            getAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null; },
+            hasAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k); },
+            removeAttribute(k) { delete map[k]; }
+        };
+    };
+    const createNode = tag => {
+        const listeners = {};
+        return {
+            tagName: String(tag).toUpperCase(),
+            id: '',
+            className: '',
+            style: {},
+            children: [],
+            parentElement: null,
+            ...makeAttrs(),
+            appendChild(c) { c.parentElement = this; this.children.push(c); if (c.id) elements.set(c.id, c); return c; },
+            insertBefore(c) { return this.appendChild(c); },
+            replaceChildren() { this.children = []; },
+            remove() { if (this.id) elements.delete(this.id); },
+            querySelector: () => null,
+            querySelectorAll: () => [],
+            addEventListener(ev, fn) { (listeners[ev] ||= []).push(fn); },
+            removeEventListener() {},
+            click() { for (const fn of (listeners.click || [])) fn({ preventDefault() {}, stopPropagation() {} }); }
+        };
+    };
+
+    const controlsRoot = createNode('div');
+    controlsRoot.className = 'ytp-right-controls';
+    const ccBtn = createNode('button');
+    ccBtn.className = 'ytp-subtitles-button ytp-button';
+    ccBtn.closest = () => controlsRoot;
+    controlsRoot.appendChild(ccBtn);
+
+    const fakeDoc = {
+        head: createNode('head'),
+        documentElement: { dataset: { supratubeWhisperBridge: '1', maximusBridge: '1' } },
+        createElement: tag => createNode(tag),
+        createElementNS: (_ns, tag) => createNode(tag),
+        getElementById: id => elements.get(id) || null,
+        querySelector: sel => (sel === '.ytp-subtitles-button' ? ccBtn : null),
+        querySelectorAll: () => []
+    };
+
+    const winListeners = {};
+    const sttBridgeReqs = [];
+    class FakeCustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } }
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/watch?v=fEt2anArPb4', pathname: '/watch', origin: 'https://www.youtube.com' },
+        CustomEvent: FakeCustomEvent,
+        MediaStream: class { constructor(t) { this.tracks = t; } },
+        AudioContext: class {
+            constructor() { this.sampleRate = 16000; this.state = 'running'; this.destination = {}; }
+            createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+            createScriptProcessor() {
+                capturedProc = { connect() {}, disconnect() {}, onaudioprocess: null };
+                return capturedProc;
+            }
+            createGain() { return { gain: { value: 0 }, connect() {} }; }
+        },
+        addEventListener(ev, fn) { (winListeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { winListeners[ev] = (winListeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) {
+            if (ev.type === 'maximus-bridge-stt' && ev.detail?.requestId) {
+                sttBridgeReqs.push(ev.detail);
+                fakeWin.dispatchEvent(new FakeCustomEvent(`maximus-bridge-stt-res-${ev.detail.requestId}`, {
+                    detail: { ok: true, text: 'Escucha la voz de tu alma.' }
+                }));
+            }
+            for (const fn of (winListeners[ev.type] || [])) fn(ev);
+        }
+    };
+    const fakePlayer = {
+        id: 'movie_player',
+        clientWidth: 960,
+        getVideoData: () => ({ video_id: 'fEt2anArPb4' }),
+        querySelector: sel => {
+            if (sel === 'video') return videoEl;
+            if (sel === '.ytp-subtitles-button') return ccBtn;
+            if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+            return null;
+        },
+        querySelectorAll: () => [],
+        appendChild: el => { if (el.id) elements.set(el.id, el); return el; }
+    };
+
+    const iaBtn = ensureAiSubtitleButton({
+        player: fakePlayer,
+        doc: fakeDoc,
+        win: fakeWin,
+        enabled: true,
+        onToggle: () => startManualAiCaptions({
+            player: fakePlayer,
+            videoId: 'fEt2anArPb4',
+            userLang: 'es',
+            doc: fakeDoc,
+            win: fakeWin
+        })
+    });
+
+    iaBtn.click();
+    // Simulate legacy v1.0.3 Service Worker failing SUPRATUBE_WHISPER_START:
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'error', videoId: 'fEt2anArPb4', error: 'offscreen unavailable' }
+    }));
+
+    const box = elements.get('supratube-fallback-captions');
+    assert.equal(iaBtn.getAttribute('data-active'), '1');
+    assert.notEqual(box?.children[0]?.textContent, 'Subtítulos IA: offscreen unavailable');
+    assert.equal(box?.children[0]?.textContent, 'Subtítulos IA escuchando...');
+    assert.ok(capturedProc && typeof capturedProc.onaudioprocess === 'function');
+
+    // Feed 2s of speech samples (8 x 4096) followed by 0.6s of silence (3 x 4096) to flush utterance:
+    const speechBuf = new Float32Array(4096);
+    for (let i = 0; i < speechBuf.length; i++) speechBuf[i] = 0.08 * Math.sin(i * 0.1);
+    const silenceBuf = new Float32Array(4096);
+    for (let i = 0; i < 8; i++) capturedProc.onaudioprocess({ inputBuffer: { getChannelData: () => speechBuf } });
+    for (let i = 0; i < 3; i++) capturedProc.onaudioprocess({ inputBuffer: { getChannelData: () => silenceBuf } });
+
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(sttBridgeReqs.length, 1);
+    assert.ok(sttBridgeReqs[0].pcm16B64.length > 100);
+    assert.equal(box?.children[0]?.textContent, 'Escucha la voz de tu alma.');
+
+    iaBtn.click();
+    assert.equal(iaBtn.getAttribute('data-active'), '0');
+    assert.equal(capturedProc.onaudioprocess, null);
+});

@@ -120,6 +120,15 @@ btnActualizar.addEventListener('click', () => {
                 'error'
             );
         }
+
+        if (!respuesta.swVersion) {
+            try {
+                if (localStorage.getItem('supratube_sw_upgraded') !== EXT_VERSION) {
+                    localStorage.setItem('supratube_sw_upgraded', EXT_VERSION);
+                    setTimeout(() => chrome.runtime.reload(), 500);
+                }
+            } catch {}
+        }
     });
 });
 

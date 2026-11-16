@@ -7,10 +7,19 @@
         return;
     }
 
-    if (window.__supratubeContentAlive) {
-        return;
+    if (typeof window.__supratubeContentTeardown === 'function') {
+        try {
+            window.__supratubeContentTeardown();
+        } catch {}
     }
-    window.__supratubeContentAlive = true;
+
+    const isRuntimeAlive = () => {
+        try {
+            return Boolean(typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id);
+        } catch {
+            return false;
+        }
+    };
 
     const SETTINGS_KEY = 'supratube_settings';
     const DEFAULT_SETTINGS = {
@@ -49,17 +58,22 @@
         // Usar valores por defecto si storage aún no está listo.
     }
 
+    const onStorageChanged = (cambios, area) => {
+        if (area === 'local' && cambios?.[SETTINGS_KEY]) {
+            syncSettingsToPage(cambios[SETTINGS_KEY].newValue, true);
+        }
+    };
     try {
-        chrome.storage.onChanged.addListener((cambios, area) => {
-            if (area === 'local' && cambios?.[SETTINGS_KEY]) {
-                syncSettingsToPage(cambios[SETTINGS_KEY].newValue, true);
-            }
-        });
+        chrome.storage.onChanged.addListener(onStorageChanged);
     } catch {
         // Ignorar si la extensión acaba de recargarse.
     }
 
-    window.addEventListener('supratube-bridge-http', e => {
+    const onBridgeHttp = e => {
+        if (!isRuntimeAlive()) {
+            teardown();
+            return;
+        }
         const detalle = e.detail;
         if (!detalle?.requestId || !detalle?.url) return;
 
@@ -91,9 +105,14 @@
                 })
             );
         }
-    });
+    };
+    window.addEventListener('supratube-bridge-http', onBridgeHttp);
 
-    window.addEventListener('supratube-bridge-abort', e => {
+    const onBridgeAbort = e => {
+        if (!isRuntimeAlive()) {
+            teardown();
+            return;
+        }
         const requestId = e.detail?.requestId;
         if (!requestId) return;
         try {
@@ -101,7 +120,8 @@
         } catch {
             // La pestaña pudo cerrarse antes de abortar.
         }
-    });
+    };
+    window.addEventListener('supratube-bridge-abort', onBridgeAbort);
 
     const captureByVideo = new WeakMap();
     let whisperSession = { active: false, videoId: '', pendingVideoId: '', video: null, connected: false };
@@ -237,10 +257,14 @@
         whisperSession.pendingVideoId = videoId;
 
         const startRes = await new Promise(resolve => {
-            chrome.runtime.sendMessage(
-                { action: 'SUPRATUBE_WHISPER_START', videoId, targetLang, manualForce: Boolean(manualForce) },
-                r => resolve(chrome.runtime.lastError ? { ok: false } : (r || { ok: false }))
-            );
+            try {
+                chrome.runtime.sendMessage(
+                    { action: 'SUPRATUBE_WHISPER_START', videoId, targetLang, manualForce: Boolean(manualForce) },
+                    r => resolve(chrome.runtime.lastError ? { ok: false, error: chrome.runtime.lastError.message || 'offscreen unavailable' } : (r || { ok: false }))
+                );
+            } catch (err) {
+                resolve({ ok: false, error: err?.message || 'offscreen unavailable' });
+            }
         });
         if (token !== whisperStartSeq) return;
         if (!startRes?.ok) {
@@ -250,6 +274,9 @@
             }));
             return;
         }
+        window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
+            detail: { kind: 'ack', videoId }
+        }));
 
         let entry = captureByVideo.get(vidEl);
         if (entry && (entry.ctx?.state === 'closed' || (!entry.usedMediaElement && entry.tracks?.some(t => t?.readyState === 'ended')))) {
@@ -386,7 +413,11 @@
         }
     }
 
-    window.addEventListener('supratube-whisper-cmd', e => {
+    const onWhisperCmd = e => {
+        if (!isRuntimeAlive()) {
+            teardown();
+            return;
+        }
         const d = e?.detail;
         if (!d || typeof d !== 'object') return;
         if (d.action === 'start') {
@@ -394,26 +425,44 @@
         } else if (d.action === 'stop') {
             stopWhisperCapture(d.videoId || '');
         } else if (d.action === 'reset' && d.videoId && whisperSession.videoId === d.videoId) {
-            chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_RESET', videoId: d.videoId }).catch(() => {});
+            try {
+                chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_RESET', videoId: d.videoId }).catch(() => {});
+            } catch {}
         }
-    });
+    };
+    window.addEventListener('supratube-whisper-cmd', onWhisperCmd);
+
+    const onRuntimeMessage = (msg, _sender, sendResponse) => {
+        if (msg?.action === 'SUPRATUBE_PING') {
+            sendResponse?.({ ok: true });
+            return false;
+        }
+        if (msg?.action === 'SUPRATUBE_WHISPER_EVENT' && msg.payload) {
+            if (msg.payload.kind === 'same_language' && !msg.payload.manualForce) {
+                stopWhisperCapture(msg.payload.videoId || '');
+            }
+            window.dispatchEvent(new CustomEvent('supratube-whisper-evt', { detail: msg.payload }));
+        }
+    };
 
     try {
-        chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-            if (msg?.action === 'SUPRATUBE_PING') {
-                sendResponse?.({ ok: true });
-                return false;
-            }
-            if (msg?.action === 'SUPRATUBE_WHISPER_EVENT' && msg.payload) {
-                if (msg.payload.kind === 'same_language' && !msg.payload.manualForce) {
-                    stopWhisperCapture(msg.payload.videoId || '');
-                }
-                window.dispatchEvent(new CustomEvent('supratube-whisper-evt', { detail: msg.payload }));
-            }
-        });
+        chrome.runtime.onMessage.addListener(onRuntimeMessage);
     } catch {
         // Ignorar si la extensión acaba de recargarse.
     }
+
+    function teardown() {
+        stopWhisperCapture();
+        window.removeEventListener?.('supratube-bridge-http', onBridgeHttp);
+        window.removeEventListener?.('supratube-bridge-abort', onBridgeAbort);
+        window.removeEventListener?.('supratube-whisper-cmd', onWhisperCmd);
+        try { chrome.storage.onChanged.removeListener?.(onStorageChanged); } catch {}
+        try { chrome.runtime.onMessage.removeListener?.(onRuntimeMessage); } catch {}
+        if (window.__supratubeContentTeardown === teardown) {
+            window.__supratubeContentTeardown = null;
+        }
+    }
+    window.__supratubeContentTeardown = teardown;
 
     try {
         chrome.runtime.sendMessage({ action: 'SUPRATUBE_INIT_TAB' }, () => {

@@ -27,7 +27,7 @@ Cada función importante de SupraTube está inspirada o basada en un proyecto pr
 
 ### Proyectos propios de base (`tivp`)
 - **Maximus Orden | Blackboard** (por `tivp`, proyecto padre bajo licencia GNU AGPL-3.0): Basado en este proyecto propio sacamos la estructura ordenada por módulos, la actualización directa desde GitHub y el puente seguro entre la página de YouTube y la extensión.
-- **Canal de YouTube a TXT (`Chan2TXT`)** (por `tivp`): Basado en esta herramienta propia sacamos la función para descargar transcripciones ordenadas en bloques de texto de 200 caracteres y la idea de rescatar el audio con Whisper dentro del navegador cuando un video no tiene subtítulos.
+- **Canal de YouTube a TXT (`Chan2TXT`)** (por `tivp`): Basado en esta herramienta propia sacamos la función para descargar transcripciones ordenadas en bloques de texto de 200 caracteres, el reintento paciente cuando el documento `offscreen` está cargando, la captura de audio dentro de la misma página (`PCM16` / `WAV`) con envío al puente local `maximus-bridge-stt` o a Whisper público en Hugging Face Space, y la idea de rescatar el audio con Whisper dentro del navegador cuando un video no tiene subtítulos.
 
 ### Scripts de la comunidad (Greasy Fork y GitHub)
 - **[EasyTube V5 — YouTube Ad Skip, SponsorBlock, Force 4K & HD Downloader](https://greasyfork.org/en/scripts/561432)** (script `#561432`, por **2pixel**, licencia MIT): Basado en este script (archivo base original del proyecto) sacamos la idea inicial de saltar anuncios y patrocinios, antes de quitarle los paneles flotantes y separarlo en módulos limpios.

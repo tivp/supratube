@@ -1395,12 +1395,14 @@ const MODULE_TT_HOLDER = {};
 
 /** Encode byte array to standard base64 across browser and Node runtimes. */
 function encodeBase64Bytes(bytes) {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    const chunk = 0x8000;
     let bin = '';
-    for (let i = 0; i < bytes.length; i++) {
-        bin += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < u8.length; i += chunk) {
+        bin += String.fromCharCode(...u8.subarray(i, i + chunk));
     }
     if (typeof btoa === 'function') return btoa(bin);
-    return Buffer.from(bytes).toString('base64');
+    return Buffer.from(u8).toString('base64');
 }
 
 /** Return or initialize per-window timedtext capture and block state. */
@@ -1435,6 +1437,7 @@ function getFallbackCtrl(win) {
             lastIaDomClickTs: 0,
             showWhisperLine: null,
             stopWhisper: null,
+            stopInPageStt: null,
             ccUi: null,
             sameLangVideos: new Set(),
             stopLoop: null,
@@ -2691,6 +2694,10 @@ function clearFallbackCaptions(doc = typeof document !== 'undefined' ? document 
         try { ctrl.stopWhisper(); } catch {}
         ctrl.stopWhisper = null;
     }
+    if (typeof ctrl.stopInPageStt === 'function') {
+        try { ctrl.stopInPageStt(); } catch {}
+        ctrl.stopInPageStt = null;
+    }
     ctrl.whisperVid = null;
     ctrl.whisperManualForce = false;
     if (typeof ctrl.stopLoop === 'function') {
@@ -2786,6 +2793,508 @@ function dispatchWhisperCmd(win, detail) {
     return true;
 }
 
+const INPAGE_HALLUC_RE = [
+    /^(?:thank you|thanks|thanks for watching|thank you for watching|gracias|obrigado|merci)[\s.!]*$/i,
+    /^(?:bye|goodbye|adios|adiós|see you|the end|subtitles by|transcribed by|subtítulos|music|música|applause|laughter|cheering)[\s.!]*$/i,
+    /^\[[^\]]*\]$/,
+    /^\([^)]*\)$/,
+    /^\*[^*]*\*$/,
+    /^♪.*♪$/,
+    /^♪+$/
+];
+const INPAGE_STOPWORD_RE = /^(?:the|an?|el|la|los|las|lo|le|les|un|una|uno|unas|unos|de|del|al|en|con|por|para|and|or|but|so|if|of|to|in|on|at|it|is|as|be|by|we|you|your|he|she|me|my|they|this|that|um+|uh+|ah+|eh+|oh+|hm+|mm+|mhm+|sh+|music|song)$/i;
+
+/** Filter non-speech Whisper artifacts from in-page fallback transcriptions. */
+function cleanInPageWhisperText(raw) {
+    const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
+    if (!t || !/[\p{L}\p{N}]/u.test(t)) return '';
+    for (let i = 0; i < INPAGE_HALLUC_RE.length; i++) {
+        if (INPAGE_HALLUC_RE[i].test(t)) return '';
+    }
+    const strippedPunct = t.replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, '');
+    if (strippedPunct.length <= 1 || INPAGE_STOPWORD_RE.test(strippedPunct)) return '';
+    const words = t.split(' ');
+    const norm = w => w.toLowerCase().replace(/[\p{P}\p{S}]/gu, '');
+    let out = [];
+    let i = 0;
+    while (i < words.length) {
+        const w = norm(words[i]);
+        let reps = 1;
+        while (i + reps < words.length && norm(words[i + reps]) === w) reps++;
+        if (w && reps >= 3) {
+            out.push(words[i]);
+            i += reps;
+        } else {
+            out.push(words[i++]);
+        }
+    }
+    const collapsed = out.join(' ').trim();
+    return collapsed.length >= t.length * 0.4 ? collapsed : '';
+}
+
+/** Convert peak-normalized Float32Array samples into signed 16-bit PCM. */
+function float32ToPcm16(f32) {
+    const src = f32 instanceof Float32Array ? f32 : new Float32Array(f32 || 0);
+    let maxAbs = 0;
+    for (let i = 0; i < src.length; i++) {
+        const a = Math.abs(src[i]);
+        if (a > maxAbs) maxAbs = a;
+    }
+    const gain = (maxAbs > 0.002 && maxAbs < 0.25) ? Math.min(8, 0.5 / maxAbs) : 1;
+    const pcm16 = new Int16Array(src.length);
+    for (let i = 0; i < src.length; i++) {
+        let s = src[i] * gain;
+        if (s < -1) s = -1;
+        else if (s > 1) s = 1;
+        pcm16[i] = s < 0 ? s * 32768 : s * 32767;
+    }
+    return pcm16;
+}
+
+/** Encode Int16Array PCM samples into base64 string. */
+function pcm16ToBase64(pcm16) {
+    const arr = pcm16 instanceof Int16Array ? pcm16 : new Int16Array(pcm16 || 0);
+    const u8 = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+    return encodeBase64Bytes(u8);
+}
+
+/** Wrap 16kHz mono PCM16 samples in a standard RIFF/WAVE header (harvested from Chan2TXT). */
+function encodeWavFromPcm16(pcm16, sampleRate = 16000) {
+    const arr = pcm16 instanceof Int16Array ? pcm16 : new Int16Array(pcm16 || 0);
+    const dataLen = arr.byteLength;
+    const wav = new Uint8Array(44 + dataLen);
+    const dv = new DataView(wav.buffer);
+    const writeAscii = (off, str) => {
+        for (let i = 0; i < str.length; i++) wav[off + i] = str.charCodeAt(i);
+    };
+    writeAscii(0, 'RIFF');
+    dv.setUint32(4, 36 + dataLen, true);
+    writeAscii(8, 'WAVE');
+    writeAscii(12, 'fmt ');
+    dv.setUint32(16, 16, true);
+    dv.setUint16(20, 1, true);
+    dv.setUint16(22, 1, true);
+    dv.setUint32(24, sampleRate, true);
+    dv.setUint32(28, sampleRate * 2, true);
+    dv.setUint16(32, 2, true);
+    dv.setUint16(34, 16, true);
+    writeAscii(36, 'data');
+    dv.setUint32(40, dataLen, true);
+    wav.set(new Uint8Array(arr.buffer, arr.byteOffset, dataLen), 44);
+    return wav;
+}
+
+/** Build multipart/form-data payload around WAV bytes for public Whisper Gradio endpoints. */
+function buildMultipartWav(wavBytes, fieldName = 'files', fileName = 'audio.wav') {
+    const boundary = `----SupraTubeWav${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+    const enc = new TextEncoder();
+    const head = enc.encode(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${fieldName}"; filename="${fileName}"\r\nContent-Type: audio/wav\r\n\r\n`
+    );
+    const tail = enc.encode(`\r\n--${boundary}--\r\n`);
+    const wav = wavBytes instanceof Uint8Array ? wavBytes : new Uint8Array(wavBytes || 0);
+    const body = new Uint8Array(head.byteLength + wav.byteLength + tail.byteLength);
+    body.set(head, 0);
+    body.set(wav, head.byteLength);
+    body.set(tail, head.byteLength + wav.byteLength);
+    return { body, contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+/** Transcribe a 16kHz PCM16 slice through companion Chan2TXT maximus-bridge-stt DOM bridge when present. */
+function transcribePcm16ViaMaximusBridge(win, pcm16, lang = 'es', timeoutMs = 45000) {
+    return new Promise(resolve => {
+        const Ev = typeof win?.CustomEvent === 'function' ? win.CustomEvent : (typeof CustomEvent === 'function' ? CustomEvent : null);
+        if (!win || typeof win.dispatchEvent !== 'function' || typeof win.addEventListener !== 'function' || !Ev) {
+            resolve({ ok: false, unavailable: true, error: 'bridge unavailable' });
+            return;
+        }
+        const requestId = `st_stt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const eventRes = `maximus-bridge-stt-res-${requestId}`;
+        let settled = false;
+        let timer = null;
+        const finish = payload => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            win.removeEventListener?.(eventRes, onRes);
+            resolve(payload || { ok: false, error: 'empty response' });
+        };
+        const onRes = ev => finish(ev?.detail);
+        win.addEventListener(eventRes, onRes);
+        timer = setTimeout(() => finish({ ok: false, timeout: true, error: 'bridge timeout' }), timeoutMs);
+        if (typeof timer?.unref === 'function') timer.unref();
+        win.dispatchEvent(new Ev('maximus-bridge-stt', {
+            detail: {
+                requestId,
+                op: 'transcribe',
+                pcm16B64: pcm16ToBase64(pcm16),
+                language: lang || 'es',
+                modelId: 'onnx-community/whisper-tiny'
+            }
+        }));
+    });
+}
+
+let inPageHfSpaceCooldownUntil = 0;
+
+/** Transcribe a 16kHz PCM16 slice via public Hugging Face Gradio Whisper Space as final serverless fallback. */
+async function transcribePcm16ViaHfSpace(pcm16, requestFn = gmRequest, win = typeof window !== 'undefined' ? window : null) {
+    if (Date.now() < inPageHfSpaceCooldownUntil) {
+        return { ok: false, error: 'hf_space cooldown' };
+    }
+    const base = 'https://hf-audio-whisper-large-v3.hf.space';
+    const mp = buildMultipartWav(encodeWavFromPcm16(pcm16, 16000), 'files', 'audio.wav');
+    const fetchFn = typeof win?.fetch === 'function' ? win.fetch.bind(win) : (typeof fetch === 'function' ? fetch : null);
+    if (!fetchFn) {
+        return { ok: false, error: 'fetch unavailable' };
+    }
+
+    try {
+        const upResp = await fetchFn(`${base}/gradio_api/upload`, {
+            method: 'POST',
+            headers: { 'Content-Type': mp.contentType },
+            body: mp.body,
+            credentials: 'omit'
+        });
+        if (!upResp?.ok) {
+            return { ok: false, error: `HF upload HTTP ${upResp?.status || 0}` };
+        }
+        const uploaded = typeof upResp.json === 'function' ? await upResp.json() : JSON.parse(await upResp.text());
+        const serverPath = Array.isArray(uploaded) ? uploaded[0] : '';
+        if (!serverPath) return { ok: false, error: 'HF upload empty' };
+
+        const callBody = JSON.stringify({ data: [{ path: serverPath, meta: { _type: 'gradio.FileData' } }, 'transcribe'] });
+        const callResp = await fetchFn(`${base}/gradio_api/call/transcribe`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: callBody,
+            credentials: 'omit'
+        });
+        if (!callResp?.ok) {
+            return { ok: false, error: `HF call HTTP ${callResp?.status || 0}` };
+        }
+        const callJson = typeof callResp.json === 'function' ? await callResp.json() : JSON.parse(await callResp.text());
+        const eventId = callJson?.event_id;
+        if (!eventId) return { ok: false, error: 'HF missing event_id' };
+
+        const sseUrl = `${base}/gradio_api/call/transcribe/${eventId}`;
+        let sseText = '';
+        let sseStatus = 0;
+        try {
+            const sseResp = await fetchFn(sseUrl, { method: 'GET', credentials: 'omit' });
+            sseStatus = sseResp?.status || 0;
+            if (sseResp?.ok) sseText = await sseResp.text();
+        } catch {}
+        if (!sseText && typeof requestFn === 'function') {
+            const res = await requestFn(sseUrl, { method: 'GET', anonymous: true, timeout: 45000 }).catch(() => null);
+            sseStatus = res?.status || 0;
+            sseText = res?.text || '';
+        }
+        if (sseStatus !== 200 || !sseText) {
+            return { ok: false, error: `HF stream HTTP ${sseStatus}` };
+        }
+        if (/event:\s*error/i.test(sseText)) {
+            inPageHfSpaceCooldownUntil = Date.now() + 15 * 60 * 1000;
+            return { ok: false, error: 'HF ZeroGPU quota exhausted' };
+        }
+        const match = sseText.match(/event:\s*complete[\s\S]*?data:\s*(\[[\s\S]*?\])(?:\n|$)/);
+        if (!match) return { ok: false, error: 'HF stream incomplete' };
+        const arr = JSON.parse(match[1]);
+        return { ok: true, text: String(arr?.[0] || '').trim() };
+    } catch (err) {
+        return { ok: false, error: String(err?.message || err || 'HF Space error') };
+    }
+}
+
+function downsampleFloat32To16k(input, srcRate) {
+    if (!srcRate || srcRate === 16000) return input;
+    const ratio = srcRate / 16000;
+    const outLen = Math.max(1, Math.round(input.length / ratio));
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+        const idx = i * ratio;
+        const lo = Math.floor(idx);
+        const hi = Math.min(lo + 1, input.length - 1);
+        const frac = idx - lo;
+        out[i] = input[lo] * (1 - frac) + input[hi] * frac;
+    }
+    return out;
+}
+
+function looksForeignForTarget(text, wantBase) {
+    if (wantBase !== 'es') return true;
+    if (/[áéíóúñü¿¡]/i.test(text)) return false;
+    const esHits = (text.match(/\b(?:que|de|la|el|en|y|un|una|los|las|para|por|con|como|pero|es|no|sí|este|esta|tu|su|alma|vida|tiempo)\b/gi) || []).length;
+    const enHits = (text.match(/\b(?:the|and|that|this|with|for|you|are|was|have|from|what|not|but|they|your|all|can|will)\b/gi) || []).length;
+    return enHits > esHits && enHits >= 1;
+}
+
+function startInPageSttFallback({
+    player,
+    video,
+    videoId,
+    wantBase,
+    doc,
+    win,
+    requestFn,
+    showLine,
+    onFatalError
+}) {
+    const ctrl = getFallbackCtrl(win);
+    let stopped = false;
+    let busy = false;
+    let attached = false;
+    let bridgeDead = false;
+    let proc = null;
+    let src = null;
+    let mute = null;
+    let connected = false;
+    let transSeq = 0;
+
+    const SR = 16000;
+    const MIN_SPEECH = Math.round(SR * 1.6);
+    const MAX_WINDOW = Math.round(SR * 4.5);
+    const PAUSE_END = Math.round(SR * 0.45);
+    const OVERLAP = Math.round(SR * 0.4);
+    const RMS_START = 0.0025;
+    const RMS_HOLD = 0.0015;
+
+    let buf = [];
+    let totalSamples = 0;
+    let speechEndSample = -1;
+    let winStartSample = null;
+    let zeroBatches = 0;
+
+    const readTracks = () => {
+        try {
+            const s = video.captureStream ? video.captureStream() : video.mozCaptureStream?.();
+            const tracks = (s?.getAudioTracks?.() || []).filter(t => t?.readyState !== 'ended');
+            if (tracks.length) return tracks;
+        } catch {}
+        try {
+            const MS = win?.MediaStream || (typeof MediaStream === 'function' ? MediaStream : null);
+            if (MS && video.srcObject instanceof MS) {
+                const tracks = (video.srcObject.getAudioTracks?.() || []).filter(t => t?.readyState !== 'ended');
+                if (tracks.length) return tracks;
+            }
+        } catch {}
+        return [];
+    };
+
+    const flushWindow = async (fromSample, toSample, isCut) => {
+        if (stopped || busy || ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
+        const winLen = toSample - fromSample;
+        if (winLen < MIN_SPEECH) return;
+
+        busy = true;
+        try {
+            const merged = new Float32Array(winLen);
+            for (let i = 0; i < buf.length; i++) {
+                const c = buf[i];
+                if (c.end <= fromSample || c.start >= toSample) continue;
+                const a = Math.max(fromSample, c.start);
+                const b = Math.min(toSample, c.end);
+                merged.set(c.pcm.subarray(a - c.start, b - c.start), a - fromSample);
+            }
+
+            const newStart = isCut ? Math.max(0, toSample - OVERLAP) : toSample;
+            buf = buf.filter(c => c.end > newStart);
+            winStartSample = isCut ? newStart : null;
+            if (!isCut) speechEndSample = -1;
+
+            const pcm16 = float32ToPcm16(merged);
+            const hasBridge = doc?.documentElement?.dataset?.maximusBridge === '1';
+            let res = null;
+            if (!bridgeDead) {
+                res = await transcribePcm16ViaMaximusBridge(win, pcm16, wantBase, hasBridge ? 45000 : 1200);
+                if (!res?.ok && (res?.timeout || res?.unavailable)) {
+                    bridgeDead = true;
+                }
+            }
+            if ((!res || !res.ok) && typeof win?.fetch === 'function') {
+                res = await transcribePcm16ViaHfSpace(pcm16, requestFn, win);
+            }
+            if (stopped || ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
+            const curVid = getActiveVideoIdSafe(player, win);
+            if (curVid && curVid !== videoId) return;
+
+            const cleaned = cleanInPageWhisperText(res?.text || '');
+            if (!cleaned) return;
+            ctrl.hasReceivedWhisperCaption = true;
+            syncAiSubtitleButtonState(doc, win);
+            showLine(cleaned, 5000);
+
+            if (looksForeignForTarget(cleaned, wantBase)) {
+                const mySeq = ++transSeq;
+                translateCueBatch({
+                    texts: [cleaned],
+                    sourceLang: 'auto',
+                    targetLang: wantBase,
+                    requestFn
+                }).then(out => {
+                    const translatedLine = String(out?.[0] || '').trim();
+                    if (
+                        !stopped &&
+                        translatedLine &&
+                        translatedLine !== cleaned &&
+                        mySeq === transSeq &&
+                        ctrl.whisperVid === videoId &&
+                        ctrl.activeVid === videoId
+                    ) {
+                        showLine(translatedLine, 5000);
+                    }
+                }).catch(() => {});
+            }
+        } finally {
+            busy = false;
+        }
+    };
+
+    const attachAudioGraph = () => {
+        if (stopped || attached || video.paused || video.ended) return false;
+        const Ctx = win?.AudioContext || win?.webkitAudioContext || (typeof AudioContext === 'function' ? AudioContext : null);
+        if (!Ctx) return false;
+
+        let ctx = video.__supratubeInPageAudioCtx || null;
+        if (ctx?.state === 'closed') ctx = null;
+        if (!ctx) {
+            try { ctx = new Ctx({ sampleRate: SR }); } catch { ctx = new Ctx(); }
+            video.__supratubeInPageAudioCtx = ctx;
+        }
+
+        const MS = win?.MediaStream || (typeof MediaStream === 'function' ? MediaStream : null);
+        const tracks = readTracks();
+        let usedElementSrc = false;
+        if (tracks.length && MS && typeof ctx.createMediaStreamSource === 'function') {
+            try {
+                src = ctx.createMediaStreamSource(new MS(tracks));
+            } catch {
+                src = null;
+            }
+        }
+        if (!src && typeof ctx.createMediaElementSource === 'function') {
+            try {
+                src = video.__supratubeMediaElemSrc || ctx.createMediaElementSource(video);
+                video.__supratubeMediaElemSrc = src;
+                src.connect(ctx.destination);
+                usedElementSrc = true;
+            } catch {
+                src = null;
+            }
+        }
+        if (!src || typeof ctx.createScriptProcessor !== 'function') {
+            onFatalError?.('sin pista de audio');
+            return false;
+        }
+
+        if (ctx.state === 'suspended') {
+            ctx.resume?.().catch?.(() => {});
+        }
+        proc = ctx.createScriptProcessor(4096, 1, 1);
+        mute = ctx.createGain();
+        mute.gain.value = 0;
+        mute.connect(ctx.destination);
+
+        const tryRefreshCaptureSrc = () => {
+            if (usedElementSrc || stopped) return;
+            const fresh = readTracks();
+            if (!fresh.length || !MS) return;
+            try {
+                if (connected) src.disconnect(proc);
+                src = ctx.createMediaStreamSource(new MS(fresh));
+                if (connected) src.connect(proc);
+            } catch {}
+        };
+
+        proc.onaudioprocess = ev => {
+            if (stopped || ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
+            if (video.paused || video.ended) {
+                buf = [];
+                winStartSample = null;
+                speechEndSample = -1;
+                return;
+            }
+            const raw = ev.inputBuffer.getChannelData(0);
+            const pcm = downsampleFloat32To16k(new Float32Array(raw), ctx.sampleRate || SR);
+            let sum = 0;
+            for (let j = 0; j < pcm.length; j++) sum += pcm[j] * pcm[j];
+            const rms = Math.sqrt(sum / Math.max(1, pcm.length));
+            if (rms < 0.00001 && !video.muted && (video.volume ?? 1) > 0) {
+                zeroBatches++;
+                if (zeroBatches >= 12) {
+                    zeroBatches = 0;
+                    tryRefreshCaptureSrc();
+                }
+            } else {
+                zeroBatches = 0;
+            }
+
+            const start = totalSamples;
+            const end = totalSamples + pcm.length;
+            buf.push({ start, end, pcm });
+            totalSamples = end;
+
+            const recent = speechEndSample > 0 && end - speechEndSample <= Math.round(SR * 0.3);
+            if (rms > RMS_START || (recent && rms > RMS_HOLD)) {
+                if (winStartSample === null) winStartSample = Math.max(0, start - Math.round(SR * 0.25));
+                speechEndSample = end;
+            }
+            const keepAfter = Math.min(winStartSample ?? start, Math.max(0, end - MAX_WINDOW - SR));
+            while (buf.length && buf[0].end < keepAfter) buf.shift();
+
+            if (!busy && winStartSample !== null && speechEndSample > winStartSample) {
+                const winLen = end - winStartSample;
+                const sinceSpeech = end - speechEndSample;
+                if (sinceSpeech >= PAUSE_END && winLen >= MIN_SPEECH) {
+                    void flushWindow(winStartSample, Math.min(end, speechEndSample + Math.round(SR * 0.2)), false);
+                } else if (winLen >= MAX_WINDOW) {
+                    void flushWindow(winStartSample, end, true);
+                }
+            }
+        };
+
+        src.connect(proc);
+        proc.connect(mute);
+        connected = true;
+        attached = true;
+        return true;
+    };
+
+    const onPlayAttach = () => {
+        if (stopped) return;
+        if (ctxResumeOnly()) return;
+        attachAudioGraph();
+    };
+    const ctxResumeOnly = () => {
+        const ctx = video.__supratubeInPageAudioCtx;
+        if (attached && ctx?.state === 'suspended') {
+            ctx.resume?.().catch?.(() => {});
+            return true;
+        }
+        return false;
+    };
+
+    video?.addEventListener?.('play', onPlayAttach, { passive: true });
+    if (!video?.paused && !video?.ended) {
+        attachAudioGraph();
+    }
+
+    return () => {
+        stopped = true;
+        transSeq++;
+        video?.removeEventListener?.('play', onPlayAttach);
+        if (proc) {
+            proc.onaudioprocess = null;
+            if (connected) {
+                try { src?.disconnect?.(proc); } catch {}
+                try { proc.disconnect(mute); } catch {}
+                connected = false;
+            }
+        }
+        buf = [];
+    };
+}
+
 function startWhisperLiveFallback({
     player,
     video,
@@ -2843,7 +3352,9 @@ function startWhisperLiveFallback({
     let fadeTimer = null;
     let bridgeWatchdog = null;
     let waitingPlayBanner = false;
+    let gotBridgeReply = false;
     let transSeq = 0;
+    ctrl.stopInPageStt = null;
 
     const showLine = (text, autoFadeMs = 0) => {
         if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
@@ -2869,6 +3380,73 @@ function startWhisperLiveFallback({
     };
     ctrl.showWhisperLine = showLine;
 
+    const showManualError = errMsg => {
+        const msg = String(errMsg || '').trim();
+        clearFallbackCaptions(doc, win);
+        if (msg && player && doc) {
+            const box = ensureFallbackBox(player, doc, win);
+            if (box) {
+                const segEl = box.children?.[0];
+                if (segEl) segEl.textContent = `Subtítulos IA: ${msg}`;
+                box.style.display = 'block';
+                const clearErrTimer = setTimeout(() => {
+                    if (!getFallbackCtrl(win).activeVid) {
+                        doc.getElementById?.(FALLBACK_BOX_ID)?.remove?.();
+                    }
+                }, 2500);
+                if (typeof clearErrTimer?.unref === 'function') clearErrTimer.unref();
+            }
+        }
+    };
+
+    const activateInPageFallback = () => {
+        if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return false;
+        if (ctrl.stopInPageStt) return true;
+        if (bridgeWatchdog) {
+            clearTimeout(bridgeWatchdog);
+            bridgeWatchdog = null;
+        }
+        if (!video) {
+            if (ctrl.whisperManualForce) showManualError('sin elemento de video');
+            else clearFallbackCaptions(doc, win);
+            return false;
+        }
+        const hasAudioHooks =
+            typeof video.captureStream === 'function' ||
+            typeof video.mozCaptureStream === 'function' ||
+            Boolean(video.srcObject) ||
+            typeof (win?.AudioContext || win?.webkitAudioContext) === 'function';
+        if (!hasAudioHooks && !ctrl.whisperManualForce) {
+            clearFallbackCaptions(doc, win);
+            return false;
+        }
+        ctrl.stopInPageStt = startInPageSttFallback({
+            player,
+            video,
+            videoId,
+            wantBase,
+            doc,
+            win,
+            requestFn,
+            showLine,
+            onFatalError: errMsg => {
+                if (ctrl.whisperManualForce) showManualError(errMsg);
+                else clearFallbackCaptions(doc, win);
+            }
+        });
+        syncAiSubtitleButtonState(doc, win);
+        if (ctrl.whisperManualForce && !ctrl.hasReceivedWhisperCaption) {
+            if (video.paused) {
+                waitingPlayBanner = true;
+                showLine('Subtítulos IA listos (reproduce el video)', 0);
+            } else {
+                waitingPlayBanner = false;
+                showLine('Subtítulos IA escuchando...', 2500);
+            }
+        }
+        return true;
+    };
+
     if (initialMessage) {
         waitingPlayBanner = Boolean(video?.paused);
         showLine(initialMessage, 0);
@@ -2888,13 +3466,19 @@ function startWhisperLiveFallback({
         if (!d || typeof d !== 'object') return;
         if (d.videoId && d.videoId !== videoId) return;
         if (ctrl.whisperVid !== videoId) return;
-        if (bridgeWatchdog) {
-            clearTimeout(bridgeWatchdog);
-            bridgeWatchdog = null;
+        if (d.kind !== 'error') {
+            gotBridgeReply = true;
+            if (bridgeWatchdog) {
+                clearTimeout(bridgeWatchdog);
+                bridgeWatchdog = null;
+            }
         }
 
         if (!ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
             setFallbackCcActive(player, doc, win, 'whisper');
+        }
+        if (d.kind === 'ack') {
+            return;
         }
         if (d.kind === 'same_language' && !ctrl.whisperManualForce) {
             ctrl.sameLangVideos.add(videoId);
@@ -2976,21 +3560,11 @@ function startWhisperLiveFallback({
             return;
         }
         if (d.kind === 'error') {
-            const manualErr = ctrl.whisperManualForce ? String(d.error || '').trim() : '';
-            clearFallbackCaptions(doc, win);
-            if (manualErr && player && doc) {
-                const box = ensureFallbackBox(player, doc, win);
-                if (box) {
-                    const segEl = box.children?.[0];
-                    if (segEl) segEl.textContent = `Subtítulos IA: ${manualErr}`;
-                    box.style.display = 'block';
-                    setTimeout(() => {
-                        if (!getFallbackCtrl(win).activeVid) {
-                            doc.getElementById?.(FALLBACK_BOX_ID)?.remove?.();
-                        }
-                    }, 2500);
-                }
+            const hasCompanionStt = doc?.documentElement?.dataset?.maximusBridge === '1';
+            if (ctrl.whisperManualForce || hasCompanionStt) {
+                if (activateInPageFallback()) return;
             }
+            showManualError(ctrl.whisperManualForce ? d.error : '');
         }
     };
 
@@ -3001,6 +3575,10 @@ function startWhisperLiveFallback({
             clearTimeout(bridgeWatchdog);
             bridgeWatchdog = null;
         }
+        if (typeof ctrl.stopInPageStt === 'function') {
+            try { ctrl.stopInPageStt(); } catch {}
+            ctrl.stopInPageStt = null;
+        }
         transSeq++;
         video?.removeEventListener?.('play', onVideoPlay);
         win?.removeEventListener?.('supratube-whisper-evt', onEvt);
@@ -3008,13 +3586,13 @@ function startWhisperLiveFallback({
         dispatchWhisperCmd(win, { action: 'stop', videoId });
     };
 
-    if (!hasBridge && manualForce) {
+    if (manualForce) {
         bridgeWatchdog = setTimeout(() => {
             bridgeWatchdog = null;
-            if (ctrl.whisperVid === videoId && ctrl.activeVid === videoId && !ctrl.hasReceivedWhisperCaption) {
-                showLine('Subtítulos IA: recarga la extensión en brave://extensions', 3500);
+            if (!gotBridgeReply && ctrl.whisperVid === videoId && ctrl.activeVid === videoId && !ctrl.hasReceivedWhisperCaption) {
+                activateInPageFallback();
             }
-        }, 2500);
+        }, hasBridge ? 2000 : 600);
         if (typeof bridgeWatchdog?.unref === 'function') bridgeWatchdog.unref();
     }
 

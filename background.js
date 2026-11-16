@@ -370,6 +370,7 @@ async function actualizarScriptsDesdeGithub({ recargarLegado = false } = {}) {
         });
         return {
             ok: true,
+            swVersion: EXT_VERSION,
             localVigente: true,
             cache: {
                 sha,
@@ -423,6 +424,7 @@ async function actualizarScriptsDesdeGithub({ recargarLegado = false } = {}) {
 
     return {
         ok: true,
+        swVersion: EXT_VERSION,
         cache: {
             sha: cache.sha,
             shaCorto: cache.shaCorto,
@@ -545,6 +547,28 @@ async function ensureWhisperOffscreen() {
     await whisperOffscreenPromise;
 }
 
+// Reintenta hasta 25 veces mientras offscreen.html termina de cargar su módulo (patrón Chan2TXT).
+async function sendMessageToOffscreenWithRetry(payload) {
+    await ensureWhisperOffscreen();
+    let lastErr = null;
+    for (let i = 0; i < 25; i++) {
+        try {
+            return await chrome.runtime.sendMessage({
+                target: 'offscreen',
+                ...payload
+            });
+        } catch (err) {
+            lastErr = err;
+            const msg = String(err?.message || err || '');
+            if (!/Receiving end does not exist|message port closed/i.test(msg)) {
+                throw err;
+            }
+            await new Promise(r => setTimeout(r, 120));
+        }
+    }
+    throw lastErr || new Error('Offscreen no respondió tras inicializar');
+}
+
 if (chrome.tabs?.onRemoved?.addListener) {
     chrome.tabs.onRemoved.addListener(tabId => {
         if (tabId === activeWhisperTabId) {
@@ -574,16 +598,12 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
                 .sendMessage(prevTabId, { action: 'SUPRATUBE_WHISPER_EVENT', payload: { kind: 'preempted', videoId: prevVid } })
                 .catch(() => {});
         }
-        ensureWhisperOffscreen()
-            .then(() =>
-                chrome.runtime.sendMessage({
-                    target: 'offscreen',
-                    type: 'INIT',
-                    videoId: activeWhisperVideoId,
-                    targetLang: mensaje.targetLang || 'es',
-                    manualForce: Boolean(mensaje.manualForce)
-                })
-            )
+        sendMessageToOffscreenWithRetry({
+            type: 'INIT',
+            videoId: activeWhisperVideoId,
+            targetLang: mensaje.targetLang || 'es',
+            manualForce: Boolean(mensaje.manualForce)
+        })
             .then(() => enviarRespuesta({ ok: true }))
             .catch(err => enviarRespuesta({ ok: false, error: err?.message || 'Error iniciando Whisper' }));
         return true;
@@ -700,6 +720,7 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
                 const c = datos[CACHE_KEY];
                 enviarRespuesta({
                     ok: true,
+                    swVersion: EXT_VERSION,
                     cache: c
                         ? {
                               sha: c.sha,
