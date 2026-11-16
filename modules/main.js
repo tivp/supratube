@@ -188,7 +188,7 @@ function syncIaButton() {
 async function runSubtitlesForCurrentVideo() {
     const vid = S.videoId;
     if (!vid || !S.settings.autoSubtitles) return;
-    if (S.subsUserTouchedVideo === vid || S._subInFlight === vid) return;
+    if (S.subsUserTouchedVideo === vid || S._subInFlight === vid || isFallbackCaptionsActive(window, vid)) return;
     const player = getPlayer();
     if (!player) return;
     S._subInFlight = vid;
@@ -571,6 +571,12 @@ function boot() {
     }, passiveOpts);
     window.addEventListener('yt-navigate-finish', () => onNavigate(), passiveOpts);
     window.addEventListener('yt-page-data-updated', () => onNavigate(), passiveOpts);
+    document.addEventListener('visibilitychange', () => {
+        if (!S._tornDown && !document.hidden) {
+            syncIaButton();
+            runSubtitlesForCurrentVideo();
+        }
+    }, passiveOpts);
 
     onNavigate();
 }

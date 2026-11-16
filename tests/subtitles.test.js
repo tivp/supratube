@@ -1742,6 +1742,35 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
     assert.equal(iaBtn.querySelector('svg')?.getAttribute('data-ia-mode'), '0');
     assert.ok(cmds.some(c => c.action === 'stop' && c.videoId === 'fEt2anArPb4'));
 
+    // Auto-started non-forced session gets upgraded to manualForce: true on [IA] click (NOT killed!)
+    cmds.length = 0;
+    fakePlayer.isSubtitlesOn = () => false;
+    fakePlayer.getOption = () => [];
+    fakePlayer.getPlayerResponse = () => ({ videoDetails: { videoId: 'fEt2anArPb4' } });
+    fakeWin.ytcfg = { get: () => '' };
+    fakeWin.fetch = async () => ({ ok: true, status: 200, text: async () => '{}' });
+    await applySmartSubtitles(fakePlayer, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: 'fEt2anArPb4',
+        doc: fakeDoc,
+        win: fakeWin
+    });
+    await new Promise(r => setTimeout(r, 35));
+    assert.equal(cmds.filter(c => c.action === 'start' && c.manualForce === false).length, 1);
+    assert.equal(iaBtn.getAttribute('data-active'), '1');
+
+    iaBtn.click();
+    assert.equal(iaBtn.getAttribute('data-active'), '1');
+    assert.ok(cmds.some(c => c.action === 'start' && c.manualForce === true));
+    assert.equal(cmds.some(c => c.action === 'stop'), false);
+
+    // Displaced background tab preempted event turns off [IA] button cleanly
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'preempted', videoId: 'fEt2anArPb4' }
+    }));
+    assert.equal(iaBtn.getAttribute('data-active'), '0');
+
     removeAiSubtitleButtons(fakeDoc);
     assert.equal(leftGroup.children.length, 1);
 

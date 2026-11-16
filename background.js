@@ -565,8 +565,15 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
             enviarRespuesta({ ok: false, error: 'Falta tabId o videoId' });
             return false;
         }
+        const prevTabId = activeWhisperTabId;
+        const prevVid = activeWhisperVideoId;
         activeWhisperTabId = sender.tab.id;
         activeWhisperVideoId = String(mensaje.videoId);
+        if (prevTabId !== null && prevTabId !== activeWhisperTabId && chrome.tabs?.sendMessage) {
+            chrome.tabs
+                .sendMessage(prevTabId, { action: 'SUPRATUBE_WHISPER_EVENT', payload: { kind: 'preempted', videoId: prevVid } })
+                .catch(() => {});
+        }
         ensureWhisperOffscreen()
             .then(() =>
                 chrome.runtime.sendMessage({

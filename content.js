@@ -204,6 +204,12 @@
         const token = ++whisperStartSeq;
 
         let entry = captureByVideo.get(vidEl);
+        if (entry && (entry.ctx?.state === 'closed' || entry.tracks?.some(t => t.readyState === 'ended'))) {
+            disconnectProc(entry);
+            try { entry.ctx?.close?.(); } catch {}
+            captureByVideo.delete(vidEl);
+            entry = null;
+        }
         if (!entry) {
             const aTracks = await waitAudioTracks(vidEl, token, videoId);
             if (token !== whisperStartSeq) return;
@@ -216,13 +222,18 @@
 
             const Ctx = window.AudioContext || window.webkitAudioContext;
             if (!Ctx) return;
-            const ctx = new Ctx({ sampleRate: 16000 });
+            let ctx;
+            try {
+                ctx = new Ctx({ sampleRate: 16000 });
+            } catch {
+                ctx = new Ctx();
+            }
             const src = ctx.createMediaStreamSource(new MediaStream(aTracks));
             const proc = ctx.createScriptProcessor(4096, 1, 1);
             const mute = ctx.createGain();
             mute.gain.value = 0;
             mute.connect(ctx.destination);
-            entry = { ctx, src, proc, mute, connected: false, boundSeek: false, boundPlay: false };
+            entry = { ctx, tracks: aTracks, src, proc, mute, connected: false, boundSeek: false, boundPlay: false };
             captureByVideo.set(vidEl, entry);
         }
 

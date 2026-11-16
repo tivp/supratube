@@ -1237,8 +1237,10 @@ export function startManualAiCaptions({
     if (!player || !videoId || !doc || !win) return false;
     const ctrl = getFallbackCtrl(win);
     if (ctrl.whisperVid === videoId && ctrl.activeVid === videoId) {
-        clearFallbackCaptions(doc, win);
-        return false;
+        if (ctrl.whisperManualForce) {
+            clearFallbackCaptions(doc, win);
+            return false;
+        }
     }
 
     const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
@@ -1686,7 +1688,7 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
             return;
         }
         if (d.kind === 'ready') {
-            showLine('', 0);
+            showLine(ctrl.whisperManualForce ? 'Subtítulos IA escuchando...' : '', ctrl.whisperManualForce ? 2200 : 0);
             return;
         }
         if (d.kind === 'caption') {
@@ -1694,8 +1696,26 @@ function startWhisperLiveFallback({ player, video, videoId, userLang, doc, win, 
             if (txt) showLine(txt, 4500);
             return;
         }
-        if (d.kind === 'error') {
+        if (d.kind === 'preempted') {
             clearFallbackCaptions(doc, win);
+            return;
+        }
+        if (d.kind === 'error') {
+            const manualErr = ctrl.whisperManualForce ? String(d.error || '').trim() : '';
+            clearFallbackCaptions(doc, win);
+            if (manualErr && player && doc) {
+                const box = ensureFallbackBox(player, doc, win);
+                if (box) {
+                    const segEl = box.children?.[0];
+                    if (segEl) segEl.textContent = `Subtítulos IA: ${manualErr}`;
+                    box.style.display = 'block';
+                    setTimeout(() => {
+                        if (!getFallbackCtrl(win).activeVid) {
+                            doc.getElementById?.(FALLBACK_BOX_ID)?.remove?.();
+                        }
+                    }, 2500);
+                }
+            }
         }
     };
 
@@ -1767,7 +1787,7 @@ async function runFallbackSubtitles({
         }
 
         if (!segments.length) {
-            if (allowWhisper) {
+            if (allowWhisper && (forced || doc?.visibilityState !== 'hidden')) {
                 startWhisperLiveFallback({ player, video, videoId, userLang: targetBase, doc, win, manualForce: forced });
             }
             return;

@@ -378,6 +378,10 @@ self.onmessage = async e => {
         while (chunks.length && chunks[0].end < keepFrom) {
             chunks.shift();
         }
-        void maybeInfer(m.videoTime, m.videoId);
+        maybeInfer(m.videoTime, m.videoId).catch(err => {
+            if (!stopped && m.videoId === activeVideoId) {
+                self.postMessage({ kind: 'error', videoId: m.videoId, error: String(err?.message || err) });
+            }
+        });
     }
 };
