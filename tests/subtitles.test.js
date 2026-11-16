@@ -2307,6 +2307,7 @@ test('in-page STT detects English audio, translates AI captions to IP language b
     await new Promise(r => setTimeout(r, 40));
     assert.equal(sttBridgeReqs.length, 1);
     assert.equal(sttBridgeReqs[0].language, 'en');
+    assert.equal(sttBridgeReqs[0].modelId, 'onnx-community/whisper-small');
     assert.ok(gtxReqs.some(r => String(r.url).includes('sl=auto') && String(r.url).includes('tl=es')));
     assert.equal(shownHistory.includes('Oh, that is skinny.'), false, 'never flashes untranslated English before Spanish translation');
     assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Oh, eso es muy flaco.');

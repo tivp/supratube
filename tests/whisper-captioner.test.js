@@ -15,6 +15,12 @@ test('filterWhisperText suppresses instrumental single stopwords, hallucinations
     assert.equal(filterWhisperText('♪'), '');
     assert.equal(filterWhisperText('Thank you for watching.'), '');
     assert.equal(filterWhisperText('Thanks.'), '');
+    // Empirically observed music mix hallucinations & inline sound tags:
+    assert.equal(filterWhisperText('*music*'), '');
+    assert.equal(filterWhisperText('(dramatic music)'), '');
+    assert.equal(filterWhisperText("I'm gonna go back to the car."), '');
+    assert.equal(filterWhisperText('(dramatic music) Enjoy yourself tonight'), 'Enjoy yourself tonight');
+    assert.equal(filterWhisperText('You.'), '');
     // Empirically observed Whisper bleed on instrumental aqz-KE-bpKQ:
     assert.equal(filterWhisperText('I'), '');
     assert.equal(filterWhisperText('The'), '');

@@ -64,7 +64,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.10' }),
+                getManifest: () => ({ version: '1.0.11' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -107,7 +107,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
     const storeData = {
         supratube_last_sync_check: Date.now() - (20 * 60 * 1000),
         supratube_github_cache: {
-            extVersion: '1.0.10',
+            extVersion: '1.0.11',
             sha: 'sha_old',
             modulos: modMap,
             codigoCompilado: compileBundle(modMap)
@@ -117,7 +117,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.10' }),
+                getManifest: () => ({ version: '1.0.11' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -192,7 +192,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.10' }),
+                getManifest: () => ({ version: '1.0.11' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -369,7 +369,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
                 return { ok: true, json: async () => ({ sha: 'sha_old_109', commit: { message: 'v1.0.9' } }) };
             }
             if (url.includes('/modules/config.js')) {
-                return { ok: true, text: async () => modMap['config.js'].replace("version: '1.0.10'", "version: '1.0.9'") };
+                return { ok: true, text: async () => modMap['config.js'].replace("version: '1.0.11'", "version: '1.0.9'") };
             }
             return { ok: false, status: 500 };
         }
@@ -413,7 +413,7 @@ test('background.js retries transient offscreen startup connection errors and ex
         chrome: {
             runtime: {
                 id: 'ext_test',
-                getManifest: () => ({ version: '1.0.10' }),
+                getManifest: () => ({ version: '1.0.11' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener: fn => { msgListener = fn; } },
@@ -453,5 +453,5 @@ test('background.js retries transient offscreen startup connection errors and ex
         msgListener({ action: 'SUPRATUBE_GET_STATUS' }, {}, resolve);
     });
     assert.equal(statusRes?.ok, true);
-    assert.equal(statusRes?.swVersion, '1.0.10');
+    assert.equal(statusRes?.swVersion, '1.0.11');
 });

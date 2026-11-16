@@ -5,10 +5,10 @@ const REPO_RAW_BASE = 'https://raw.githubusercontent.com/tivp/supratube/main';
 const CACHE_KEY = 'supratube_github_cache';
 const SETTINGS_KEY = 'supratube_settings';
 const SYNC_CHECK_KEY = 'supratube_last_sync_check';
-const AUTO_SYNC_INTERVAL_MS = 15 * 60 * 1000;
+const AUTO_SYNC_INTERVAL_MS = 60 * 1000;
 const USER_SCRIPT_ID = 'supratube-github-bundle';
 const MATCHES_YOUTUBE = ['https://www.youtube.com/*', 'https://m.youtube.com/*'];
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.10';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.11';
 
 const ORDEN_MODULOS = [
     'config.js',

@@ -15,9 +15,9 @@ env.backends.onnx.wasm.wasmPaths = ASYNCIFY;
 
 const SR = 16000;
 const S = sec => Math.round(sec * SR);
-const MIN_FIRST_WINDOW = S(1.0);
-const MAX_WINDOW = S(9);
-const OVERLAP = S(1.0);
+const MIN_FIRST_WINDOW = S(2.2);
+const MAX_WINDOW = S(6.5);
+const OVERLAP = S(0.8);
 const PAUSE_FINAL = S(0.45);
 const PRE_ROLL = S(0.3);
 const SPEECH_RMS = 0.0025;
@@ -30,7 +30,12 @@ class LangDetectProcessor extends LogitsProcessor {
         this.langToId = Object.fromEntries(this.langs);
         this.transcribeId = genCfg.task_to_id.transcribe;
         this.noTsId = genCfg.no_timestamps_token_id;
+        this.noSpeechId = genCfg.no_speech_token_id ?? 50362;
+        this.eosId = genCfg.eos_token_id ?? 50257;
         this.forced = forced && this.langToId[forced] != null ? forced : null;
+        this.noSpeechProb = 0;
+        this.sumLogProb = 0;
+        this.tokenCount = 0;
         this.result = null;
     }
 
@@ -38,8 +43,25 @@ class LangDetectProcessor extends LogitsProcessor {
         const step = inputIds[0].length;
         const data = logits.data;
         if (step === 1) {
+            let maxAll = -Infinity;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > maxAll) maxAll = data[i];
+            }
+            let sumExp = 0;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > -Infinity) sumExp += Math.exp(data[i] - maxAll);
+            }
+            this.noSpeechProb = (sumExp > 0 && this.noSpeechId >= 0 && this.noSpeechId < data.length)
+                ? Math.exp(data[this.noSpeechId] - maxAll) / sumExp
+                : 0;
             const info = computeLangSoftmax(data, this.langs, this.forced);
-            this.result = { lang: info.chosen, detected: info.detected, conf: info.conf, lockedConf: info.lockedConf };
+            this.result = {
+                lang: info.chosen,
+                detected: info.detected,
+                conf: info.conf,
+                lockedConf: info.lockedConf,
+                noSpeechProb: this.noSpeechProb
+            };
             data.fill(-Infinity);
             data[this.langToId[info.chosen]] = 0;
         } else if (step === 2) {
@@ -48,6 +70,25 @@ class LangDetectProcessor extends LogitsProcessor {
         } else if (step === 3) {
             data.fill(-Infinity);
             data[this.noTsId] = 0;
+        } else {
+            let maxV = -Infinity;
+            let maxIdx = -1;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > maxV) {
+                    maxV = data[i];
+                    maxIdx = i;
+                }
+            }
+            if (maxIdx >= 0 && maxIdx !== this.eosId && maxV > -Infinity) {
+                let sumExp = 0;
+                for (let i = 0; i < data.length; i++) {
+                    if (data[i] > -Infinity) sumExp += Math.exp(data[i] - maxV);
+                }
+                if (sumExp > 0) {
+                    this.sumLogProb += -Math.log(sumExp);
+                    this.tokenCount++;
+                }
+            }
         }
         return logits;
     }
@@ -106,7 +147,7 @@ async function initModel() {
         gpu = Boolean(navigator.gpu && (await navigator.gpu.requestAdapter()));
     } catch {}
 
-    const desiredKey = gpu ? 'webgpu:base' : 'wasm:tiny';
+    const desiredKey = gpu ? 'webgpu:small' : 'wasm:tiny';
     if (model && loadedKey === desiredKey) {
         self.postMessage({ kind: 'ready', videoId: activeVideoId, model: loadedKey });
         return;
@@ -117,8 +158,8 @@ async function initModel() {
         const t0 = performance.now();
         const attempts = gpu
             ? [
+                ['onnx-community/whisper-small', 'webgpu', { encoder_model: 'q4', decoder_model_merged: 'q4' }, {}],
                 ['onnx-community/whisper-base', 'webgpu', { encoder_model: 'q4', decoder_model_merged: 'q4' }, {}],
-                ['onnx-community/whisper-base', 'webgpu', { encoder_model: 'fp32', decoder_model_merged: 'q4' }, {}],
                 ['onnx-community/whisper-tiny', 'wasm', 'q8', { graphOptimizationLevel: 'basic' }]
             ]
             : [
@@ -200,10 +241,18 @@ async function inferSamples(samples, forced) {
         inputs: feats.input_features,
         decoder_input_ids: [model.generation_config.decoder_start_token_id],
         logits_processor: list,
+        no_repeat_ngram_size: 4,
+        repetition_penalty: 1.15,
         max_new_tokens: 96
     });
     const text = (tokenizer.batch_decode(out, { skip_special_tokens: true })[0] || '').trim();
-    return { text, ...(lp.result || { lang: 'en', detected: 'en', conf: 0 }) };
+    const avgLogProb = lp.tokenCount > 0 ? lp.sumLogProb / lp.tokenCount : -10;
+    return {
+        text,
+        avgLogProb,
+        noSpeechProb: lp.noSpeechProb,
+        ...(lp.result || { lang: 'en', detected: 'en', conf: 0 })
+    };
 }
 
 function extractWindow(from, to) {
@@ -213,6 +262,18 @@ function extractWindow(from, to) {
         const a = Math.max(from, c.start);
         const b = Math.min(to, c.end);
         out.set(c.pcm.subarray(a - c.start, b - c.start), a - from);
+    }
+    // High-pass ~120Hz filter at 16kHz to reduce sub-bass/kick-drum saturation on music mixes.
+    if (out.length > 0) {
+        let prevIn = out[0];
+        let prevOut = 0;
+        for (let i = 0; i < out.length; i++) {
+            const x = out[i];
+            const y = x - prevIn + 0.955 * prevOut;
+            prevIn = x;
+            prevOut = y;
+            out[i] = y;
+        }
     }
     let maxAbs = 0;
     for (let i = 0; i < out.length; i++) {
@@ -299,7 +360,7 @@ async function maybeInfer(videoTime, runVid) {
         end = Math.min(now, lastSpeechEnd + S(0.3));
     } else if (winLen >= MAX_WINDOW) {
         mode = 'cut';
-    } else if (sinceSpeech < PAUSE_FINAL && winLen >= MIN_FIRST_WINDOW && now - lastInferEnd >= S(1.2)) {
+    } else if (sinceSpeech < PAUSE_FINAL && winLen >= MIN_FIRST_WINDOW && now - lastInferEnd >= S(1.8)) {
         mode = 'interim';
     }
     if (!mode) return;
@@ -312,6 +373,19 @@ async function maybeInfer(videoTime, runVid) {
 
         const inferMs = Math.round(performance.now() - t0);
         lastInferEnd = end;
+        if (res.noSpeechProb > 0.6 || res.avgLogProb < (mode === 'final' ? -0.68 : -0.58)) {
+            if (mode === 'final') {
+                lastFinalEnd = lastSpeechEnd;
+                prevUtteranceEnd = lastSpeechEnd;
+                committed = end;
+                utteranceStart = null;
+            } else if (mode === 'cut') {
+                committed = Math.max(committed, now - OVERLAP);
+                utteranceStart = committed;
+            }
+            return;
+        }
+
         const silMs = ((utteranceStart - prevUtteranceEnd) / SR) * 1000;
         voter.observe({ lang: res.detected, conf: res.conf, lockedConf: res.lockedConf, ts: Date.now(), silenceMs: silMs });
 
@@ -336,6 +410,8 @@ async function maybeInfer(videoTime, runVid) {
                 lang: res.lang,
                 locked: voter.locked,
                 translated,
+                avgLogProb: +res.avgLogProb.toFixed(2),
+                noSpeechProb: +res.noSpeechProb.toFixed(2),
                 inferMs,
                 videoTime
             });
