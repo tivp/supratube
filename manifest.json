@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "SupraTube",
-    "version": "1.0.11",
+    "version": "1.0.12",
     "description": "Equilibra YouTube conservando lo vanilla: moddea solo lo injusto (anuncios, calidad baja y subtítulos que no se activan).",
     "author": "tivp",
     "icons": {

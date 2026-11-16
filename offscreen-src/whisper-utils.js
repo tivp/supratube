@@ -1,10 +1,7 @@
 // Pure helpers for on-device Whisper ASR filtering, language voting, and overlap cleanup.
 
-const INLINE_MUSIC_TAG_RE = /\[[^\]]*?(?:music|m[uú]sica|applause|laughter|singing|instrumental|intro|outro|beat|audio|sound)[^\]]*\]|\([^)]*?(?:music|m[uú]sica|applause|laughter|singing|instrumental|intro|outro|beat|audio|sound)[^)]*\)|\*[^*]*\*/gi;
-
 const HALLUC_RE = [
-    /^(?:you|thank you|thanks|thanks for watching|thank you for watching|gracias|obrigado|merci)[\s.!]*$/i,
-    /^(?:i'?m gonna go back to the car)[\s.!]*$/i,
+    /^(?:thank you|thanks|thanks for watching|thank you for watching|gracias|obrigado|merci)[\s.!]*$/i,
     /^(?:bye|goodbye|adios|adiós|see you|the end|subtitles by|transcribed by|subtítulos|music|música|applause|laughter|cheering)[\s.!]*$/i,
     /^\[[^\]]*\]$/,
     /^\([^)]*\)$/,
@@ -26,7 +23,7 @@ function normWord(word) {
 
 /** Filter Whisper non-speech hallucinations, instrumental stopword artifacts, and repeated n-gram loops. */
 export function filterWhisperText(raw) {
-    const t = String(raw ?? '').replace(INLINE_MUSIC_TAG_RE, ' ').replace(/\s+/g, ' ').trim();
+    const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
     if (!t || !/[\p{L}\p{N}]/u.test(t)) return '';
     for (const re of HALLUC_RE) {
         if (re.test(t)) return '';

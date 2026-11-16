@@ -9,7 +9,7 @@ window.__supratubeEjecutado = true;
 
 // --- config.js ---
 const CFG = Object.freeze({
-    version: '1.0.11',
+    version: '1.0.12',
     sbApi: 'https://sponsor.ajay.app/api/skipSegments',
     sbCacheTTL: 5 * 60 * 1000,
     geoRefreshMs: 24 * 60 * 60 * 1000,
@@ -2788,10 +2788,8 @@ function dispatchWhisperCmd(win, detail) {
     return true;
 }
 
-const INPAGE_INLINE_MUSIC_TAG_RE = /\[[^\]]*?(?:music|m[uú]sica|applause|laughter|singing|instrumental|intro|outro|beat|audio|sound)[^\]]*\]|\([^)]*?(?:music|m[uú]sica|applause|laughter|singing|instrumental|intro|outro|beat|audio|sound)[^)]*\)|\*[^*]*\*/gi;
 const INPAGE_HALLUC_RE = [
-    /^(?:you|thank you|thanks|thanks for watching|thank you for watching|gracias|obrigado|merci)[\s.!]*$/i,
-    /^(?:i'?m gonna go back to the car)[\s.!]*$/i,
+    /^(?:thank you|thanks|thanks for watching|thank you for watching|gracias|obrigado|merci)[\s.!]*$/i,
     /^(?:bye|goodbye|adios|adiós|see you|the end|subtitles by|transcribed by|subtítulos|music|música|applause|laughter|cheering)[\s.!]*$/i,
     /^\[[^\]]*\]$/,
     /^\([^)]*\)$/,
@@ -2803,13 +2801,11 @@ const INPAGE_STOPWORD_RE = /^(?:the|an?|el|la|los|las|lo|le|les|un|una|uno|unas|
 
 /** Filter non-speech Whisper artifacts from in-page fallback transcriptions. */
 function cleanInPageWhisperText(raw) {
-    const t = String(raw ?? '').replace(INPAGE_INLINE_MUSIC_TAG_RE, ' ').replace(/\s+/g, ' ').trim();
+    const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
     if (!t || !/[\p{L}\p{N}]/u.test(t)) return '';
     for (let i = 0; i < INPAGE_HALLUC_RE.length; i++) {
         if (INPAGE_HALLUC_RE[i].test(t)) return '';
     }
-    const core = t.replace(/[\p{P}\p{S}\s]/gu, '');
-    if (core.length <= 1) return '';
     const strippedPunct = t.replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, '');
     if (strippedPunct.length <= 1 || INPAGE_STOPWORD_RE.test(strippedPunct)) return '';
     const words = t.split(' ');
@@ -2831,21 +2827,9 @@ function cleanInPageWhisperText(raw) {
     return collapsed.length >= t.length * 0.4 ? collapsed : '';
 }
 
-/** Convert high-pass filtered, peak-normalized Float32Array samples into signed 16-bit PCM. */
+/** Convert peak-normalized Float32Array samples into signed 16-bit PCM. */
 function float32ToPcm16(f32) {
-    const raw = f32 instanceof Float32Array ? f32 : new Float32Array(f32 || 0);
-    const src = new Float32Array(raw.length);
-    if (raw.length > 0) {
-        let prevIn = raw[0];
-        let prevOut = 0;
-        for (let i = 0; i < raw.length; i++) {
-            const x = raw[i];
-            const y = x - prevIn + 0.955 * prevOut;
-            prevIn = x;
-            prevOut = y;
-            src[i] = y;
-        }
-    }
+    const src = f32 instanceof Float32Array ? f32 : new Float32Array(f32 || 0);
     let maxAbs = 0;
     for (let i = 0; i < src.length; i++) {
         const a = Math.abs(src[i]);
@@ -2940,7 +2924,7 @@ function transcribePcm16ViaMaximusBridge(win, pcm16, lang = 'es', timeoutMs = 45
                 op: 'transcribe',
                 pcm16B64: pcm16ToBase64(pcm16),
                 language: lang || 'es',
-                modelId: 'onnx-community/whisper-small'
+                modelId: 'onnx-community/whisper-tiny'
             }
         }));
     });
