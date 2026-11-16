@@ -333,6 +333,7 @@ function getFallbackCtrl(win) {
     if (!host.__supratubeFallbackCtrl) {
         host.__supratubeFallbackCtrl = {
             activeVid: null,
+            activePlayer: null,
             inflightVid: null,
             forceOverlay: false,
             whisperVid: null,
@@ -802,15 +803,18 @@ async function requestTranslateHttp(url, opts, requestFn) {
     try {
         const res = await requestFn(url, opts);
         if (res?.status === 200 && res.text) return res;
+        if (res?.status >= 400) return res;
     } catch {}
     if (typeof fetch === 'function') {
-        const resp = await fetch(url, {
-            method: opts.method || 'GET',
-            headers: opts.headers,
-            body: opts.body,
-            credentials: 'omit'
-        });
-        return { status: resp.status, text: await resp.text() };
+        try {
+            const resp = await fetch(url, {
+                method: opts.method || 'GET',
+                headers: opts.headers,
+                body: opts.body,
+                credentials: 'omit'
+            });
+            return { status: resp.status, text: await resp.text() };
+        } catch {}
     }
     return { status: 0, text: '' };
 }
@@ -831,35 +835,54 @@ async function translateSingleViaClients5(text, sl, tl, requestFn) {
     return null;
 }
 
-/** Translate an array of subtitle strings in batch via translate.googleapis.com (with clients5 fallback). */
+async function translateSingleViaMyMemory(text, sl, tl, requestFn) {
+    const src = (!sl || sl === 'auto') ? 'autodetect' : sl;
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(`${src}|${tl}`)}`;
+    const res = await requestTranslateHttp(url, { method: 'GET', anonymous: true, timeout: 8000 }, requestFn);
+    if (res?.status !== 200 || !res.text) return null;
+    try {
+        const parsed = JSON.parse(res.text);
+        const translated = String(parsed?.responseData?.translatedText || '').trim();
+        if (translated && !/MYMEMORY WARNING/i.test(translated)) return translated;
+    } catch {}
+    return null;
+}
+
+/** Translate an array of subtitle strings in batch via translate.googleapis.com (it/at/gtx, clients5 & MyMemory fallbacks). */
 export async function translateCueBatch({ texts, sourceLang = 'auto', targetLang = 'es', requestFn = gmRequest }) {
     if (!Array.isArray(texts) || !texts.length) return [];
     const normalized = texts.map(t => String(t || '').replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim());
-    const sl = normalizeBaseLang(sourceLang) || 'auto';
+    const rawSl = String(sourceLang || '').trim().toLowerCase();
+    const sl = (!rawSl || rawSl === 'auto') ? 'auto' : (normalizeBaseLang(rawSl) || 'auto');
     const tl = normalizeBaseLang(targetLang) || 'es';
     if (sl !== 'auto' && sl === tl) return normalized;
 
-    const batchUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${encodeURIComponent(sl)}&tl=${encodeURIComponent(tl)}&dt=t&dj=1`;
-    try {
-        const res = await requestTranslateHttp(
-            batchUrl,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-                body: `q=${encodeURIComponent(normalized.join('\n'))}`,
-                anonymous: true,
-                timeout: 10000
-            },
-            requestFn
-        );
-        if (res?.status === 200 && res.text) {
-            const joined = parseGtxResponse(res.text);
-            const split = joined.split(/\r?\n/);
-            if (split.length === normalized.length) {
-                return split.map((line, i) => line.trim() || normalized[i]);
+    for (const client of ['it', 'at', 'gtx']) {
+        const batchUrl = `https://translate.googleapis.com/translate_a/single?client=${client}&sl=${encodeURIComponent(sl)}&tl=${encodeURIComponent(tl)}&dt=t&dj=1`;
+        try {
+            const res = await requestTranslateHttp(
+                batchUrl,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                    body: `q=${encodeURIComponent(normalized.join('\n'))}`,
+                    anonymous: true,
+                    timeout: 10000
+                },
+                requestFn
+            );
+            if (res?.status === 200 && res.text) {
+                const joined = parseGtxResponse(res.text);
+                if (normalized.length === 1 && joined.trim()) {
+                    return [joined.replace(/\s+/g, ' ').trim()];
+                }
+                const split = joined.split(/\r?\n/);
+                if (split.length === normalized.length) {
+                    return split.map((line, i) => line.trim() || normalized[i]);
+                }
             }
-        }
-    } catch {}
+        } catch {}
+    }
 
     const out = [];
     for (let i = 0; i < normalized.length; i++) {
@@ -868,7 +891,9 @@ export async function translateCueBatch({ texts, sourceLang = 'auto', targetLang
             out.push('');
             continue;
         }
-        const single = await translateSingleViaClients5(line, sl, tl, requestFn).catch(() => null);
+        const single =
+            (await translateSingleViaClients5(line, sl, tl, requestFn).catch(() => null)) ||
+            (await translateSingleViaMyMemory(line, sl, tl, requestFn).catch(() => null));
         out.push(single || line);
     }
     return out;
@@ -965,6 +990,7 @@ function getActiveVideoIdSafe(player, win) {
 
 function hasVisibleNativeCaptions(player) {
     if (!player?.querySelectorAll) return false;
+    if (player.getAttribute?.('data-supratube-ai-subs-active') === '1') return false;
     const nodes = player.querySelectorAll('.ytp-caption-segment');
     for (let i = 0; i < nodes.length; i++) {
         const el = nodes[i];
@@ -1088,7 +1114,10 @@ function ensureIaButtonStyle(doc) {
     ensureDocStyle(doc, IA_CC_STYLE_ID, [
         '.supratube-ia-cc-btn { display: inline-flex !important; align-items: center !important; justify-content: center !important; opacity: 0.92 !important; color: #fff !important; cursor: pointer !important; vertical-align: middle !important; }',
         '.supratube-ia-cc-btn:hover, .supratube-ia-cc-btn[data-active="1"] { opacity: 1 !important; }',
-        '.supratube-ia-cc-btn .ytp-subtitles-button-icon { display: inline-flex; align-items: center; justify-content: center; }'
+        '.supratube-ia-cc-btn .ytp-subtitles-button-icon { display: inline-flex; align-items: center; justify-content: center; }',
+        '[data-supratube-ai-subs-active="1"] .ytp-caption-window-container,',
+        'html[data-supratube-ai-subs-active="1"] #shorts-player .ytp-caption-window-container,',
+        'html[data-supratube-ai-subs-active="1"] #movie_player .ytp-caption-window-container { display: none !important; visibility: hidden !important; opacity: 0 !important; }'
     ].join('\n'));
 }
 
@@ -1273,7 +1302,13 @@ export function startManualAiCaptions({
     const baseUser = normalizeBaseLang(userLang) || 'es';
     ctrl.sameLangVideos.delete(videoId);
     ctrl.manualForcePendingVid = videoId;
+    ctrl.activePlayer = player;
+    ensureIaButtonStyle(doc);
+    ensureShortsCaptionStyle(doc);
+    player.setAttribute?.('data-supratube-ai-subs-active', '1');
+    doc.documentElement?.setAttribute?.('data-supratube-ai-subs-active', '1');
     try { player.setOption?.('captions', 'track', {}); } catch {}
+    try { player.unloadModule?.('captions'); } catch {}
     if (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn()) {
         try { player.toggleSubtitles?.(); } catch {}
     }
@@ -1290,63 +1325,12 @@ export function startManualAiCaptions({
         manualForce: true,
         initialMessage: initialMsg
     });
-    syncAiSubtitleButtonState(doc, win);
-
-    if (ok && (typeof win?.fetch === 'function' || typeof player?.getPlayerResponse === 'function')) {
-        void (async () => {
-            try {
-                const cachedChunks = ctrl.cache.get(`${videoId}:${baseUser}`);
-                if (cachedChunks?.length && !ctrl.hasReceivedWhisperCaption) {
-                    if (typeof ctrl.stopWhisper === 'function') {
-                        try { ctrl.stopWhisper(); } catch {}
-                        ctrl.stopWhisper = null;
-                    }
-                    ctrl.whisperVid = null;
-                    ctrl.whisperManualForce = false;
-                    ctrl.manualOverlayActive = true;
-                    ctrl.forceOverlay = true;
-                    startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks: () => cachedChunks });
-                    syncAiSubtitleButtonState(doc, win);
-                    return;
-                }
-                const pr = player.getPlayerResponse?.() || {};
-                const trackHint =
-                    pr.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
-                    player.getAudioTrack?.()?.captionTracks ||
-                    [];
-                const recovered = await obtainRawSegmentsForVideo(videoId, win, {
-                    userLang: baseUser,
-                    captionTracks: trackHint,
-                    doc,
-                    requestFn
-                });
-                if (
-                    !(recovered?.segments?.length) ||
-                    ctrl.activeVid !== videoId ||
-                    ctrl.whisperVid !== videoId ||
-                    !ctrl.whisperManualForce ||
-                    ctrl.hasReceivedWhisperCaption ||
-                    getActiveVideoIdSafe(player, win) !== videoId ||
-                    hasVisibleNativeCaptions(player)
-                ) {
-                    return;
-                }
-                await renderRecoveredOverlaySegments({
-                    player,
-                    video,
-                    videoId,
-                    recovered,
-                    targetBase: baseUser,
-                    forceOverlay: true,
-                    manualOverlay: true,
-                    doc,
-                    win,
-                    requestFn
-                });
-            } catch {}
-        })();
+    if (!ok) {
+        player.removeAttribute?.('data-supratube-ai-subs-active');
+        doc.documentElement?.removeAttribute?.('data-supratube-ai-subs-active');
+        ctrl.activePlayer = null;
     }
-
+    syncAiSubtitleButtonState(doc, win);
     return ok;
 }
 
@@ -1611,6 +1595,17 @@ export function clearFallbackCaptions(doc = typeof document !== 'undefined' ? do
         try { ctrl.stopLoop(); } catch {}
         ctrl.stopLoop = null;
     }
+    try { ctrl.activePlayer?.removeAttribute?.('data-supratube-ai-subs-active'); } catch {}
+    ctrl.activePlayer = null;
+    doc?.documentElement?.removeAttribute?.('data-supratube-ai-subs-active');
+    doc?.getElementById?.('movie_player')?.removeAttribute?.('data-supratube-ai-subs-active');
+    doc?.getElementById?.('shorts-player')?.removeAttribute?.('data-supratube-ai-subs-active');
+    try {
+        const flagged = doc?.querySelectorAll?.('[data-supratube-ai-subs-active]') || [];
+        for (let i = 0; i < flagged.length; i++) {
+            flagged[i]?.removeAttribute?.('data-supratube-ai-subs-active');
+        }
+    } catch {}
     const existing = doc?.getElementById?.(FALLBACK_BOX_ID);
     if (existing) {
         try { existing.remove(); } catch {}
@@ -1928,12 +1923,87 @@ function downsampleFloat32To16k(input, srcRate) {
     return out;
 }
 
-function looksForeignForTarget(text, wantBase) {
-    if (wantBase !== 'es') return true;
-    if (/[áéíóúñü¿¡]/i.test(text)) return false;
-    const esHits = (text.match(/\b(?:que|de|la|el|en|y|un|una|los|las|para|por|con|como|pero|es|no|sí|este|esta|tu|su|alma|vida|tiempo)\b/gi) || []).length;
-    const enHits = (text.match(/\b(?:the|and|that|this|with|for|you|are|was|have|from|what|not|but|they|your|all|can|will)\b/gi) || []).length;
-    return enHits > esHits && enHits >= 1;
+const aiLineTransCache = new Map();
+
+function inferVideoSpokenLang(player, doc, win, fallbackLang = 'es') {
+    try {
+        const pr = player?.getPlayerResponse?.();
+        const initPr = win?.ytInitialPlayerResponse;
+        const activeVid = getActiveVideoIdSafe(player, win);
+        const usableInit = initPr && (!activeVid || !initPr?.videoDetails?.videoId || initPr.videoDetails.videoId === activeVid)
+            ? initPr
+            : null;
+        const resp = pr || usableInit || null;
+        const captionTracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
+            player?.getAudioTrack?.()?.captionTracks ||
+            [];
+        const detected = detectVideoAudioLang({
+            activeAudioTrack: player?.getAudioTrack?.(),
+            availableAudioTracks: player?.getAvailableAudioTracks?.(),
+            playerResponse: resp,
+            captionTracks
+        });
+        if (detected) return detected;
+
+        const title = String(resp?.videoDetails?.title || player?.getVideoData?.()?.title || doc?.title || '').trim();
+        if (title) {
+            if (/[áéíóúñ¿¡]|\b(?:el|la|los|las|de|del|en|con|para|por|una|un|como|este|esta|tu|su|voz|alma|vida|escucha)\b/i.test(title)) {
+                return 'es';
+            }
+            if (/\b(?:the|and|with|for|from|scene|movie|clip|official|trailer|how|what|why|when|who|vs|ranking|moments|best|top|full|review|doctor|armor|suit|man|speech)\b/i.test(title)) {
+                return 'en';
+            }
+        }
+    } catch {}
+    return normalizeBaseLang(fallbackLang) || 'es';
+}
+
+function isConfirmedTargetLanguage(text, wantBase) {
+    const t = String(text || '').trim();
+    if (!t || !wantBase) return false;
+    if (wantBase === 'es') {
+        const enHits = (t.match(/\b(?:the|and|that|this|with|for|you|are|was|were|have|has|from|what|not|but|they|your|all|can|will|is|it|be|do|don't|he|she|we|i'm|it's|skinny|doctor)\b/gi) || []).length;
+        if (enHits > 0) return false;
+        if (/[áéíóúñ¿¡]/i.test(t)) return true;
+        const esHits = (t.match(/\b(?:que|de|la|el|en|los|las|para|por|con|como|pero|más|este|esta|una|unos|unas|tu|su|alma|vida|voz|muy|flaco|hola|gracias|todo|todos|están|soy|eres)\b/gi) || []).length;
+        return esHits >= 2;
+    }
+    return false;
+}
+
+async function translateAiTextImmediate(text, wantBase, requestFn = gmRequest, sourceLang = 'auto') {
+    const clean = String(text || '').replace(/\s+/g, ' ').trim();
+    const tl = normalizeBaseLang(wantBase) || 'es';
+    if (!clean) return '';
+
+    const spokenBase = normalizeBaseLang(sourceLang);
+    if (spokenBase === tl && isConfirmedTargetLanguage(clean, tl)) {
+        return clean;
+    }
+    if (isConfirmedTargetLanguage(clean, tl)) {
+        return clean;
+    }
+
+    const cacheKey = `${tl}:${clean}`;
+    if (aiLineTransCache.has(cacheKey)) {
+        return aiLineTransCache.get(cacheKey);
+    }
+
+    try {
+        const out = await translateCueBatch({
+            texts: [clean],
+            sourceLang: 'auto',
+            targetLang: tl,
+            requestFn
+        });
+        const translatedLine = String(out?.[0] || '').trim() || clean;
+        if (translatedLine) {
+            setBoundedCache(aiLineTransCache, cacheKey, translatedLine, 200);
+        }
+        return translatedLine;
+    } catch {
+        return clean;
+    }
 }
 
 function startInPageSttFallback({
@@ -2011,9 +2081,10 @@ function startInPageSttFallback({
 
             const pcm16 = float32ToPcm16(merged);
             const hasBridge = doc?.documentElement?.dataset?.maximusBridge === '1';
+            const spokenLang = inferVideoSpokenLang(player, doc, win, wantBase);
             let res = null;
             if (!bridgeDead) {
-                res = await transcribePcm16ViaMaximusBridge(win, pcm16, wantBase, hasBridge ? 45000 : 1200);
+                res = await transcribePcm16ViaMaximusBridge(win, pcm16, spokenLang, hasBridge ? 45000 : 1200);
                 if (!res?.ok && (res?.timeout || res?.unavailable)) {
                     bridgeDead = true;
                 }
@@ -2027,31 +2098,23 @@ function startInPageSttFallback({
 
             const cleaned = cleanInPageWhisperText(res?.text || '');
             if (!cleaned) return;
+
+            const mySeq = ++transSeq;
+            const finalLine = await translateAiTextImmediate(cleaned, wantBase, requestFn, spokenLang);
+            if (
+                stopped ||
+                mySeq !== transSeq ||
+                ctrl.whisperVid !== videoId ||
+                ctrl.activeVid !== videoId
+            ) {
+                return;
+            }
+            const postVid = getActiveVideoIdSafe(player, win);
+            if (postVid && postVid !== videoId) return;
+
             ctrl.hasReceivedWhisperCaption = true;
             syncAiSubtitleButtonState(doc, win);
-            showLine(cleaned, 5000);
-
-            if (looksForeignForTarget(cleaned, wantBase)) {
-                const mySeq = ++transSeq;
-                translateCueBatch({
-                    texts: [cleaned],
-                    sourceLang: 'auto',
-                    targetLang: wantBase,
-                    requestFn
-                }).then(out => {
-                    const translatedLine = String(out?.[0] || '').trim();
-                    if (
-                        !stopped &&
-                        translatedLine &&
-                        translatedLine !== cleaned &&
-                        mySeq === transSeq &&
-                        ctrl.whisperVid === videoId &&
-                        ctrl.activeVid === videoId
-                    ) {
-                        showLine(translatedLine, 5000);
-                    }
-                }).catch(() => {});
-            }
+            showLine(finalLine || cleaned, 5000);
         } finally {
             busy = false;
         }
@@ -2426,40 +2489,46 @@ function startWhisperLiveFallback({
             const rawTxt = String(d.raw || '').trim();
             const transTxt = String(d.translated || '').trim();
             const spokenBase = normalizeBaseLang(d.lang || d.locked);
-            const showTxt = (spokenBase && spokenBase === wantBase && rawTxt) ? rawTxt : (transTxt || rawTxt);
-            if (!showTxt) return;
-            ctrl.hasReceivedWhisperCaption = true;
-            waitingPlayBanner = false;
-            syncAiSubtitleButtonState(doc, win);
+            if (!rawTxt && !transTxt) return;
 
-            const needsOnFlyTranslate = Boolean(
-                ctrl.whisperManualForce &&
-                rawTxt &&
-                spokenBase &&
-                spokenBase !== wantBase &&
-                (!transTxt || transTxt === rawTxt)
+            const alreadyTranslated = Boolean(transTxt && (!rawTxt || transTxt !== rawTxt));
+            const alreadyInTarget = Boolean(
+                rawTxt && spokenBase && spokenBase === wantBase && isConfirmedTargetLanguage(rawTxt, wantBase)
             );
-            showLine(showTxt, 4500);
-            if (needsOnFlyTranslate) {
-                const mySeq = ++transSeq;
-                translateCueBatch({
-                    texts: [rawTxt],
-                    sourceLang: spokenBase,
-                    targetLang: wantBase,
-                    requestFn
-                }).then(out => {
-                    const translatedLine = String(out?.[0] || '').trim();
-                    if (
-                        translatedLine &&
-                        translatedLine !== rawTxt &&
-                        mySeq === transSeq &&
-                        ctrl.whisperVid === videoId &&
-                        ctrl.activeVid === videoId
-                    ) {
-                        showLine(translatedLine, 4500);
-                    }
-                }).catch(() => {});
+            if (alreadyTranslated || alreadyInTarget) {
+                ctrl.hasReceivedWhisperCaption = true;
+                waitingPlayBanner = false;
+                syncAiSubtitleButtonState(doc, win);
+                showLine(alreadyTranslated ? transTxt : rawTxt, 4500);
+                return;
             }
+
+            const srcLine = rawTxt || transTxt;
+            const mySeq = ++transSeq;
+            translateAiTextImmediate(srcLine, wantBase, requestFn, spokenBase).then(finalLine => {
+                if (
+                    mySeq !== transSeq ||
+                    ctrl.whisperVid !== videoId ||
+                    ctrl.activeVid !== videoId
+                ) {
+                    return;
+                }
+                ctrl.hasReceivedWhisperCaption = true;
+                waitingPlayBanner = false;
+                syncAiSubtitleButtonState(doc, win);
+                showLine(finalLine || srcLine, 4500);
+            }).catch(() => {
+                if (
+                    mySeq === transSeq &&
+                    ctrl.whisperVid === videoId &&
+                    ctrl.activeVid === videoId
+                ) {
+                    ctrl.hasReceivedWhisperCaption = true;
+                    waitingPlayBanner = false;
+                    syncAiSubtitleButtonState(doc, win);
+                    showLine(srcLine, 4500);
+                }
+            });
             return;
         }
         if (d.kind === 'preempted') {
@@ -2934,6 +3003,7 @@ export const __supratubeTdExports = (() => {
 
     const TD_STYLE_ID = 'supratube-td-style';
     const TD_ITEM_ATTR = 'data-supratube-td-item';
+    const TD_IA_ITEM_ATTR = 'data-supratube-ia-menu-item';
     const TD_TOAST_ID = 'supratube-td-toast';
     const TD_BLOCK_SIZE = 200;
     const TD_HEROICON_SVG_URL = 'https://api.iconify.design/heroicons/arrow-down-tray.svg';
@@ -3890,7 +3960,7 @@ export const __supratubeTdExports = (() => {
         const style = doc.createElement('style');
         style.id = TD_STYLE_ID;
         style.textContent = `
-            [${TD_ITEM_ATTR}="1"] {
+            .supratube-td-menuitem {
                 display: flex;
                 align-items: center;
                 gap: 16px;
@@ -3912,29 +3982,29 @@ export const __supratubeTdExports = (() => {
                 user-select: none;
                 transition: background-color 0.12s ease;
             }
-            [${TD_ITEM_ATTR}="1"].supratube-td-shorts {
+            .supratube-td-menuitem.supratube-td-shorts {
                 gap: 12px;
                 padding: 0 16px;
                 min-height: 40px;
             }
-            [${TD_ITEM_ATTR}="1"].supratube-td-watch {
+            .supratube-td-menuitem.supratube-td-watch {
                 gap: 16px;
                 padding: 0 12px 0 16px;
                 min-height: 36px;
             }
-            [${TD_ITEM_ATTR}="1"].supratube-td-dark {
+            .supratube-td-menuitem.supratube-td-dark {
                 color: var(--yt-spec-text-primary, #f1f1f1);
             }
-            [${TD_ITEM_ATTR}="1"]:hover,
-            [${TD_ITEM_ATTR}="1"]:focus-visible {
+            .supratube-td-menuitem:hover,
+            .supratube-td-menuitem:focus-visible {
                 background-color: var(--yt-spec-10-percent-layer, rgba(128, 128, 128, 0.14));
                 outline: none;
             }
-            [${TD_ITEM_ATTR}="1"][data-busy="1"] {
+            .supratube-td-menuitem[data-busy="1"] {
                 opacity: 0.72;
                 cursor: wait;
             }
-            [${TD_ITEM_ATTR}="1"] .supratube-td-icon {
+            .supratube-td-menuitem .supratube-td-icon {
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
@@ -3943,7 +4013,13 @@ export const __supratubeTdExports = (() => {
                 flex-shrink: 0;
                 color: inherit;
             }
-            [${TD_ITEM_ATTR}="1"] .supratube-td-icon-img {
+            .supratube-td-menuitem .supratube-td-icon svg {
+                display: block;
+                width: 22px;
+                height: 22px;
+                pointer-events: none;
+            }
+            .supratube-td-menuitem .supratube-td-icon-img {
                 display: block;
                 width: 22px;
                 height: 22px;
@@ -3951,15 +4027,22 @@ export const __supratubeTdExports = (() => {
                 pointer-events: none;
                 filter: brightness(0) invert(0.06);
             }
-            html[dark] [${TD_ITEM_ATTR}="1"] .supratube-td-icon-img,
-            [${TD_ITEM_ATTR}="1"].supratube-td-dark .supratube-td-icon-img {
+            html[dark] .supratube-td-menuitem .supratube-td-icon-img,
+            .supratube-td-menuitem.supratube-td-dark .supratube-td-icon-img {
                 filter: brightness(0) invert(0.945);
             }
-            [${TD_ITEM_ATTR}="1"] .supratube-td-label {
+            .supratube-td-menuitem .supratube-td-label {
                 flex: 1 1 auto;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
+            }
+            .supratube-td-menuitem .supratube-td-sublabel {
+                margin-left: auto;
+                padding-left: 12px;
+                font-size: 12px;
+                opacity: 0.72;
+                flex-shrink: 0;
             }
             #${TD_TOAST_ID} {
                 position: fixed;
@@ -4060,7 +4143,7 @@ export const __supratubeTdExports = (() => {
         }
         const items = listEl?.querySelectorAll?.('yt-list-item-view-model') || [];
         for (let i = 0; i < items.length; i++) {
-            if (items[i].getAttribute?.(TD_ITEM_ATTR) === '1') continue;
+            if (items[i].getAttribute?.(TD_ITEM_ATTR) === '1' || items[i].getAttribute?.(TD_IA_ITEM_ATTR) === '1') continue;
             const role = items[i].getAttribute?.('role');
             if (role === 'menuitemradio' || items[i].getAttribute?.('aria-checked') === 'true') return true;
             const txt = String(items[i].textContent || '').trim();
@@ -4131,7 +4214,7 @@ export const __supratubeTdExports = (() => {
         }
         const curMaxH = parseFloat(popup.style.maxHeight);
         if (Number.isFinite(curMaxH) && curMaxH > 0) {
-            const nextH = `${Math.min(maxAvailH, curMaxH + 56)}px`;
+            const nextH = `${Math.min(maxAvailH, curMaxH + 96)}px`;
             if (popup.dataset) {
                 if (!Object.prototype.hasOwnProperty.call(popup.dataset, 'supratubeOrigMaxH')) {
                     popup.dataset.supratubeOrigMaxH = popup.style.maxHeight;
@@ -4185,19 +4268,64 @@ export const __supratubeTdExports = (() => {
         return null;
     }
 
-    function tdCreateMenuItem(doc, kind, siblingHeight, siblingColor, isDark, onActivate) {
+    function tdBuildMenuBtnBase(doc, kind, attrName, siblingHeight, siblingColor, isDark) {
         const btn = doc.createElement('button');
         btn.type = 'button';
         btn.className = `supratube-td-menuitem supratube-td-${kind === 'watch' ? 'watch' : 'shorts'}${isDark ? ' supratube-td-dark' : ''}`;
         btn.setAttribute('role', 'menuitem');
-        btn.setAttribute(TD_ITEM_ATTR, '1');
+        btn.setAttribute(attrName, '1');
         if (siblingHeight >= 34 && siblingHeight <= 56) {
             btn.style.minHeight = `${siblingHeight}px`;
         }
         if (siblingColor && !/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/i.test(siblingColor)) {
             btn.style.color = siblingColor;
         }
+        return btn;
+    }
 
+    function tdRenderIaMenuSvg(iconWrap, doc, active) {
+        if (!iconWrap || !doc) return;
+        iconWrap.replaceChildren?.();
+        const svg = createSvgNode(doc, 'svg', {
+            fill: 'none',
+            viewBox: '0 0 24 24',
+            width: 22,
+            height: 22,
+            'aria-hidden': 'true'
+        });
+        if (active) {
+            svg.appendChild?.(createSvgNode(doc, 'path', {
+                d: IA_FILLED_CUTOUT_PATH,
+                fill: 'currentColor',
+                'fill-rule': 'evenodd',
+                'clip-rule': 'evenodd'
+            }));
+        } else {
+            svg.appendChild?.(createSvgNode(doc, 'path', {
+                d: IA_OUTLINE_BOX_PATH,
+                fill: 'none',
+                stroke: 'currentColor',
+                'stroke-width': '1.8'
+            }));
+            svg.appendChild?.(createSvgNode(doc, 'path', {
+                d: IA_GLYPHS_PATH,
+                fill: 'currentColor',
+                'fill-rule': 'evenodd',
+                'clip-rule': 'evenodd'
+            }));
+        }
+        iconWrap.appendChild?.(svg);
+    }
+
+    function tdUpdateIaMenuItemState(doc, btn, iconWrap, sublabelEl, active) {
+        btn?.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+        btn?.setAttribute?.('data-active', active ? '1' : '0');
+        if (sublabelEl) sublabelEl.textContent = active ? 'Activado' : '';
+        tdRenderIaMenuSvg(iconWrap, doc, Boolean(active));
+    }
+
+    function tdCreateMenuItem(doc, kind, siblingHeight, siblingColor, isDark, onActivate) {
+        const btn = tdBuildMenuBtnBase(doc, kind, TD_ITEM_ATTR, siblingHeight, siblingColor, isDark);
         const icon = tdBuildDownloadIcon(doc);
         const label = doc.createElement('span');
         label.className = 'supratube-td-label';
@@ -4213,7 +4341,30 @@ export const __supratubeTdExports = (() => {
         return btn;
     }
 
-    /** Create lifecycle controller that injects Descargar transcripción into Shorts and /watch 3-dots menus. */
+    function tdCreateIaMenuItem(doc, kind, siblingHeight, siblingColor, isDark, active, onActivate) {
+        const btn = tdBuildMenuBtnBase(doc, kind, TD_IA_ITEM_ATTR, siblingHeight, siblingColor, isDark);
+        const iconWrap = doc.createElement('span');
+        iconWrap.className = 'supratube-td-icon';
+        iconWrap.setAttribute('aria-hidden', 'true');
+        const label = doc.createElement('span');
+        label.className = 'supratube-td-label';
+        label.textContent = 'Subtítulos IA';
+        const sublabel = doc.createElement('span');
+        sublabel.className = 'supratube-td-sublabel';
+
+        tdUpdateIaMenuItemState(doc, btn, iconWrap, sublabel, active);
+        btn.appendChild(iconWrap);
+        btn.appendChild(label);
+        btn.appendChild(sublabel);
+        btn.addEventListener('click', ev => {
+            ev.preventDefault?.();
+            ev.stopPropagation?.();
+            onActivate(btn, iconWrap, sublabel);
+        });
+        return btn;
+    }
+
+    /** Create lifecycle controller that injects Descargar transcripción and Subtítulos IA into Shorts and /watch 3-dots menus. */
     function createTranscriptDownloadController({
         doc = typeof document !== 'undefined' ? document : null,
         win = typeof window !== 'undefined' ? window : null,
@@ -4221,12 +4372,43 @@ export const __supratubeTdExports = (() => {
         requestFn = gmRequest,
         downloadFile = (content, filename) => tdTriggerBlobDownload(doc, content, filename),
         copyText = txt => tdCopyTextToClipboard(win, doc, txt),
-        extractorFn = extractVideoTranscript
+        extractorFn = extractVideoTranscript,
+        isAiSubtitlesActive = null,
+        onToggleAiSubtitles = null
     } = {}) {
         let enabled = false;
         let lastTrigger = { kind: '', ts: 0 };
         let observer = null;
         let scanScheduled = false;
+
+        const checkAiActive = vid => {
+            if (typeof isAiSubtitlesActive === 'function') {
+                return Boolean(isAiSubtitlesActive(vid));
+            }
+            const ctrl = getFallbackCtrl(win);
+            return Boolean(
+                vid && (
+                    (ctrl.whisperVid === vid && ctrl.activeVid === vid && ctrl.whisperManualForce) ||
+                    (ctrl.manualOverlayActive && ctrl.activeVid === vid)
+                )
+            );
+        };
+
+        const toggleAiSubs = async ({ videoId, userLang }) => {
+            if (typeof onToggleAiSubtitles === 'function') {
+                return onToggleAiSubtitles({ videoId, userLang, doc, win, requestFn });
+            }
+            const player = selectActivePlayer(doc, win?.location?.pathname || '', videoId);
+            if (!player) return false;
+            return startManualAiCaptions({
+                player,
+                videoId,
+                userLang,
+                doc,
+                win,
+                requestFn
+            });
+        };
 
         const onDocClickCapture = ev => {
             const target = ev?.target;
@@ -4297,8 +4479,32 @@ export const __supratubeTdExports = (() => {
             }
         };
 
+        const handleIaActivate = async (btn, iconWrap, sublabelEl, dropdown) => {
+            const vid = getVideoId(win?.location?.href || '');
+            if (!vid) {
+                tdShowToast(doc, 'No se detectó un video activo', 'error');
+                return;
+            }
+            const userLang = typeof getUserLang === 'function' ? getUserLang() : 'es';
+            try {
+                const res = await Promise.resolve(toggleAiSubs({ videoId: vid, userLang }));
+                const nowActive = typeof res === 'boolean' ? res : checkAiActive(vid);
+                tdUpdateIaMenuItemState(doc, btn, iconWrap, sublabelEl, nowActive);
+                tdShowToast(
+                    doc,
+                    nowActive ? '✓ Subtítulos IA activados (traducidos a tu idioma)' : 'Subtítulos IA desactivados',
+                    'ok'
+                );
+            } catch (err) {
+                tdShowToast(doc, err?.message || 'No se pudieron iniciar los subtítulos IA', 'error', 3600);
+            }
+            setTimeout(() => {
+                try { dropdown?.close?.(); } catch {}
+            }, 250);
+        };
+
         const cleanupDropdown = dd => {
-            const stale = dd?.querySelectorAll?.(`[${TD_ITEM_ATTR}="1"]`) || [];
+            const stale = dd?.querySelectorAll?.(`[${TD_ITEM_ATTR}="1"], [${TD_IA_ITEM_ATTR}="1"]`) || [];
             for (let j = 0; j < stale.length; j++) {
                 try { stale[j].remove(); } catch {}
             }
@@ -4313,7 +4519,7 @@ export const __supratubeTdExports = (() => {
             for (let i = 0; i < dropdowns.length; i++) {
                 cleanupDropdown(dropdowns[i]);
             }
-            const items = doc?.querySelectorAll?.(`[${TD_ITEM_ATTR}="1"]`) || [];
+            const items = doc?.querySelectorAll?.(`[${TD_ITEM_ATTR}="1"], [${TD_IA_ITEM_ATTR}="1"]`) || [];
             for (let i = 0; i < items.length; i++) {
                 try { items[i].remove(); } catch {}
             }
@@ -4360,7 +4566,16 @@ export const __supratubeTdExports = (() => {
                     cleanupDropdown(dd);
                     continue;
                 }
-                if (match.listEl.querySelector?.(`[${TD_ITEM_ATTR}="1"]`)) continue;
+                const existingTd = match.listEl.querySelector?.(`[${TD_ITEM_ATTR}="1"]`);
+                const existingIa = match.listEl.querySelector?.(`[${TD_IA_ITEM_ATTR}="1"]`);
+                const curVid = getVideoId(win?.location?.href || '');
+                const iaActive = checkAiActive(curVid);
+                if (existingTd && existingIa) {
+                    const iconWrap = existingIa.querySelector?.('.supratube-td-icon');
+                    const sublabel = existingIa.querySelector?.('.supratube-td-sublabel');
+                    tdUpdateIaMenuItemState(doc, existingIa, iconWrap, sublabel, iaActive);
+                    continue;
+                }
 
                 tdEnsureStyles(doc);
                 tdExpandPopupBounds(match.popup, win);
@@ -4372,14 +4587,35 @@ export const __supratubeTdExports = (() => {
                     ? (win.getComputedStyle(sampleTextHost)?.color || '')
                     : '';
                 const isDark = tdIsDarkTheme(doc, sibColor);
-                const itemEl = tdCreateMenuItem(doc, match.kind, Math.round(sibH), sibColor, isDark, (btn, labelEl) => {
-                    handleActivate(btn, labelEl, dd);
-                });
                 const refNode = tdFindInsertionRef(match.listEl, match.kind);
-                if (refNode && typeof match.listEl.insertBefore === 'function') {
-                    match.listEl.insertBefore(itemEl, refNode);
-                } else {
-                    match.listEl.appendChild(itemEl);
+
+                if (!existingTd) {
+                    const itemEl = tdCreateMenuItem(doc, match.kind, Math.round(sibH), sibColor, isDark, (btn, labelEl) => {
+                        handleActivate(btn, labelEl, dd);
+                    });
+                    if (refNode && typeof match.listEl.insertBefore === 'function') {
+                        match.listEl.insertBefore(itemEl, refNode);
+                    } else {
+                        match.listEl.appendChild(itemEl);
+                    }
+                }
+                if (!existingIa) {
+                    const iaItemEl = tdCreateIaMenuItem(
+                        doc,
+                        match.kind,
+                        Math.round(sibH),
+                        sibColor,
+                        isDark,
+                        iaActive,
+                        (btn, iconWrap, sublabelEl) => {
+                            handleIaActivate(btn, iconWrap, sublabelEl, dd);
+                        }
+                    );
+                    if (refNode && typeof match.listEl.insertBefore === 'function') {
+                        match.listEl.insertBefore(iaItemEl, refNode);
+                    } else {
+                        match.listEl.appendChild(iaItemEl);
+                    }
                 }
             }
         };
@@ -4432,6 +4668,7 @@ export const __supratubeTdExports = (() => {
     return {
         TD_STYLE_ID,
         TD_ITEM_ATTR,
+        TD_IA_ITEM_ATTR,
         TD_TOAST_ID,
         TD_BLOCK_SIZE,
         TD_HEROICON_SVG_URL,

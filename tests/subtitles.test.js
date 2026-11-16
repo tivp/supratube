@@ -1999,10 +1999,11 @@ test('manual [IA] survives in-flight auto fallback, keeps paused readiness banne
     for (const fn of (vidListeners.play || [])) fn();
     assert.equal(box?.children[0]?.textContent, 'Subtítulos IA escuchando...');
 
-    // Legacy v1.0.9 worker failing to translate foreign speech ('en' -> same raw text) gets translated on the fly:
+    // Legacy v1.0.9 worker failing to translate foreign speech ('en' -> same raw text) translates immediately BEFORE rendering:
     fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
         detail: { kind: 'caption', videoId: 'fEt2anArPb4', mode: 'final', lang: 'en', raw: 'I am Iron Man.', translated: 'I am Iron Man.' }
     }));
+    assert.notEqual(box?.children[0]?.textContent, 'I am Iron Man.');
     await new Promise(r => setTimeout(r, 30));
     assert.ok(translateRequests.some(u => u.includes('translate.googleapis.com')));
     assert.equal(box?.children[0]?.textContent, 'Soy Iron Man.');
@@ -2156,4 +2157,190 @@ test('manual [IA] recovers automatically from offscreen unavailable via in-page 
     iaBtn.click();
     assert.equal(iaBtn.getAttribute('data-active'), '0');
     assert.equal(capturedProc.onaudioprocess, null);
+});
+
+test('in-page STT detects English audio, translates AI captions to IP language before rendering, and hides traditional native subtitles', async () => {
+    const elements = new Map();
+    let capturedProc = null;
+    const shownHistory = [];
+    const unloadedModules = [];
+    let toggleCalls = 0;
+
+    const videoEl = {
+        currentTime: 5,
+        paused: false,
+        ended: false,
+        muted: false,
+        volume: 1,
+        setAttribute() {},
+        removeAttribute() {},
+        addEventListener() {},
+        removeEventListener() {},
+        captureStream: () => ({ getAudioTracks: () => [{ kind: 'audio', readyState: 'live' }] })
+    };
+    const makeAttrs = (init = {}) => {
+        const map = { ...init };
+        return {
+            setAttribute(k, v) { map[k] = String(v); },
+            getAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null; },
+            hasAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k); },
+            removeAttribute(k) { delete map[k]; }
+        };
+    };
+    const createNode = tag => ({
+        tagName: String(tag).toUpperCase(),
+        id: '',
+        className: '',
+        style: {},
+        children: [],
+        parentElement: null,
+        ...makeAttrs(),
+        set textContent(v) {
+            this._txt = String(v ?? '');
+            if (this.getAttribute('data-supratube-seg') === '1') shownHistory.push(this._txt);
+        },
+        get textContent() { return this._txt || ''; },
+        appendChild(c) { c.parentElement = this; this.children.push(c); if (c.id) elements.set(c.id, c); return c; },
+        insertBefore(c) { return this.appendChild(c); },
+        replaceChildren() { this.children = []; },
+        remove() { if (this.id) elements.delete(this.id); },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        addEventListener() {},
+        removeEventListener() {}
+    });
+
+    const fakeDoc = {
+        head: createNode('head'),
+        documentElement: { ...makeAttrs(), dataset: { supratubeWhisperBridge: '1', maximusBridge: '1' } },
+        createElement: tag => createNode(tag),
+        createElementNS: (_ns, tag) => createNode(tag),
+        getElementById: id => elements.get(id) || null,
+        querySelector: () => null,
+        querySelectorAll: () => []
+    };
+
+    const winListeners = {};
+    const sttBridgeReqs = [];
+    const gtxReqs = [];
+    class FakeCustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } }
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/shorts/KBIKtrmM80Y', pathname: '/shorts/KBIKtrmM80Y', origin: 'https://www.youtube.com' },
+        CustomEvent: FakeCustomEvent,
+        MediaStream: class { constructor(t) { this.tracks = t; } },
+        AudioContext: class {
+            constructor() { this.sampleRate = 16000; this.state = 'running'; this.destination = {}; }
+            createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+            createScriptProcessor() {
+                capturedProc = { connect() {}, disconnect() {}, onaudioprocess: null };
+                return capturedProc;
+            }
+            createGain() { return { gain: { value: 0 }, connect() {} }; }
+        },
+        addEventListener(ev, fn) { (winListeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { winListeners[ev] = (winListeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) {
+            if (ev.type === 'maximus-bridge-stt' && ev.detail?.requestId) {
+                sttBridgeReqs.push(ev.detail);
+                fakeWin.dispatchEvent(new FakeCustomEvent(`maximus-bridge-stt-res-${ev.detail.requestId}`, {
+                    detail: { ok: true, text: 'Oh, that is skinny.' }
+                }));
+            }
+            for (const fn of (winListeners[ev.type] || [])) fn(ev);
+        }
+    };
+    const fakePlayer = {
+        id: 'shorts-player',
+        clientWidth: 342,
+        ...makeAttrs(),
+        isSubtitlesOn: () => true,
+        toggleSubtitles: () => { toggleCalls++; },
+        setOption() {},
+        unloadModule: mod => { unloadedModules.push(mod); },
+        getPlayerResponse: () => ({
+            videoDetails: { videoId: 'KBIKtrmM80Y', defaultAudioLanguage: 'en', title: 'Doctor Who Tenth Meets Eleventh' }
+        }),
+        getVideoData: () => ({ video_id: 'KBIKtrmM80Y', title: 'Doctor Who Tenth Meets Eleventh' }),
+        querySelector: sel => {
+            if (sel === 'video') return videoEl;
+            if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+            return null;
+        },
+        querySelectorAll: () => [],
+        appendChild: el => { if (el.id) elements.set(el.id, el); return el; }
+    };
+
+    const requestFn = async (url, opts) => {
+        gtxReqs.push({ url, body: opts?.body || '' });
+        return {
+            status: 200,
+            text: JSON.stringify({ sentences: [{ trans: 'Oh, eso es muy flaco.' }] })
+        };
+    };
+
+    const started = startManualAiCaptions({
+        player: fakePlayer,
+        videoId: 'KBIKtrmM80Y',
+        userLang: 'es',
+        doc: fakeDoc,
+        win: fakeWin,
+        requestFn
+    });
+    assert.equal(started, true);
+    assert.equal(fakePlayer.getAttribute('data-supratube-ai-subs-active'), '1');
+    assert.equal(fakeDoc.documentElement.getAttribute('data-supratube-ai-subs-active'), '1');
+    assert.ok(unloadedModules.includes('captions'));
+    assert.equal(toggleCalls, 1);
+    const iaStyle = elements.get('supratube-ia-cc-style');
+    assert.match(iaStyle?.textContent || '', /\[data-supratube-ai-subs-active="1"\] \.ytp-caption-window-container/);
+
+    // Simulate offscreen unavailable -> in-page STT captures PCM16
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'error', videoId: 'KBIKtrmM80Y', error: 'offscreen unavailable' }
+    }));
+    const speechBuf = new Float32Array(4096);
+    for (let i = 0; i < speechBuf.length; i++) speechBuf[i] = 0.08 * Math.sin(i * 0.1);
+    const silenceBuf = new Float32Array(4096);
+    for (let i = 0; i < 8; i++) capturedProc.onaudioprocess({ inputBuffer: { getChannelData: () => speechBuf } });
+    for (let i = 0; i < 3; i++) capturedProc.onaudioprocess({ inputBuffer: { getChannelData: () => silenceBuf } });
+
+    await new Promise(r => setTimeout(r, 40));
+    assert.equal(sttBridgeReqs.length, 1);
+    assert.equal(sttBridgeReqs[0].language, 'en');
+    assert.ok(gtxReqs.some(r => String(r.url).includes('sl=auto') && String(r.url).includes('tl=es')));
+    assert.equal(shownHistory.includes('Oh, that is skinny.'), false, 'never flashes untranslated English before Spanish translation');
+    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Oh, eso es muy flaco.');
+
+    clearFallbackCaptions(fakeDoc, fakeWin);
+    assert.equal(fakePlayer.getAttribute('data-supratube-ai-subs-active'), null);
+    assert.equal(fakeDoc.documentElement.getAttribute('data-supratube-ai-subs-active'), null);
+});
+
+test('translateCueBatch falls back cleanly through client=it/at/gtx, clients5, and MyMemory when Google rate-limits with 429', async () => {
+    const seenUrls = [];
+    const out = await translateCueBatch({
+        texts: ['As you can see these men are heavily armed.'],
+        sourceLang: 'auto',
+        targetLang: 'es',
+        requestFn: async url => {
+            const u = String(url);
+            seenUrls.push(u);
+            if (u.includes('client=it') || u.includes('client=at') || u.includes('client=gtx') || u.includes('clients5.google.com')) {
+                return { status: 429, text: '<html>Too Many Requests</html>' };
+            }
+            if (u.includes('api.mymemory.translated.net')) {
+                return {
+                    status: 200,
+                    text: JSON.stringify({ responseData: { translatedText: 'Como pueden ver estos hombres están fuertemente armados.' } })
+                };
+            }
+            return { status: 404, text: '' };
+        }
+    });
+    assert.ok(seenUrls.some(u => u.includes('client=it')));
+    assert.ok(seenUrls.some(u => u.includes('client=at')));
+    assert.ok(seenUrls.some(u => u.includes('client=gtx')));
+    assert.ok(seenUrls.some(u => u.includes('clients5.google.com')));
+    assert.ok(seenUrls.some(u => u.includes('api.mymemory.translated.net') && u.includes('autodetect%7Ces')));
+    assert.deepEqual(out, ['Como pueden ver estos hombres están fuertemente armados.']);
 });

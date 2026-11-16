@@ -233,26 +233,30 @@ async function translateCached(text, from, to) {
     if (!clean) return '';
     const baseFrom = String(from || '').replace(/^[-_]+/, '').split('-')[0].toLowerCase();
     const baseTo = String(to || 'es').replace(/^[-_]+/, '').split('-')[0].toLowerCase();
-    if (!baseTo || baseTo === 'und' || baseTo === 'auto' || (baseFrom && baseFrom === baseTo)) return clean;
+    if (!baseTo || baseTo === 'und' || baseTo === 'auto' || (!manualForce && baseFrom && baseFrom === baseTo)) {
+        return clean;
+    }
 
-    const key = `${baseFrom || 'auto'}:${baseTo}:${clean}`;
+    const key = `auto:${baseTo}:${clean}`;
     if (transCache.has(key)) return transCache.get(key);
 
-    try {
-        const gtxUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${encodeURIComponent(baseFrom || 'auto')}&tl=${encodeURIComponent(baseTo)}&dt=t&q=${encodeURIComponent(clean)}`;
-        const r = await fetch(gtxUrl);
-        if (r.ok) {
-            const j = await r.json();
-            const joined = Array.isArray(j?.[0]) ? j[0].map(s => s?.[0] || '').join('').trim() : '';
-            if (joined) {
-                setBoundedTrans(key, joined);
-                return joined;
+    for (const client of ['it', 'at', 'gtx']) {
+        try {
+            const gtxUrl = `https://translate.googleapis.com/translate_a/single?client=${client}&sl=auto&tl=${encodeURIComponent(baseTo)}&dt=t&q=${encodeURIComponent(clean)}`;
+            const r = await fetch(gtxUrl);
+            if (r.ok) {
+                const j = await r.json();
+                const joined = Array.isArray(j?.[0]) ? j[0].map(s => s?.[0] || '').join('').trim() : '';
+                if (joined) {
+                    setBoundedTrans(key, joined);
+                    return joined;
+                }
             }
-        }
-    } catch {}
+        } catch {}
+    }
 
     try {
-        const c5Url = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${encodeURIComponent(baseFrom || 'auto')}&tl=${encodeURIComponent(baseTo)}&q=${encodeURIComponent(clean)}`;
+        const c5Url = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=${encodeURIComponent(baseTo)}&q=${encodeURIComponent(clean)}`;
         const r2 = await fetch(c5Url);
         if (r2.ok) {
             const j2 = await r2.json();
@@ -260,6 +264,20 @@ async function translateCached(text, from, to) {
             if (out) {
                 setBoundedTrans(key, out);
                 return out;
+            }
+        }
+    } catch {}
+
+    try {
+        const mmPair = `${baseFrom && baseFrom !== 'auto' ? baseFrom : 'autodetect'}|${baseTo}`;
+        const mmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(clean)}&langpair=${encodeURIComponent(mmPair)}`;
+        const r3 = await fetch(mmUrl);
+        if (r3.ok) {
+            const j3 = await r3.json();
+            const out3 = String(j3?.responseData?.translatedText || '').trim();
+            if (out3 && !/MYMEMORY WARNING/i.test(out3)) {
+                setBoundedTrans(key, out3);
+                return out3;
             }
         }
     } catch {}

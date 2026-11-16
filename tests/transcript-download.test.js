@@ -10,6 +10,7 @@ import {
     buildGetTranscriptParamsCandidates,
     extractVideoTranscript,
     createTranscriptDownloadController,
+    TD_IA_ITEM_ATTR,
     TD_HEROICON_SVG_URL,
     TD_HEROICON_FALLBACK_URL
 } from '../modules/transcript-download.js';
@@ -511,21 +512,34 @@ test('controller injects Descargar transcripción in Shorts root dropdown (not s
 
     let downloads = [];
     let copied = '';
+    const aiToggles = [];
+    let aiState = false;
     const ctrl = createTranscriptDownloadController({
         doc,
         win,
         getUserLang: () => 'es',
         downloadFile: (bytes, filename) => downloads.push({ bytes, filename }),
-        copyText: async txt => { copied = txt; }
+        copyText: async txt => { copied = txt; },
+        isAiSubtitlesActive: () => aiState,
+        onToggleAiSubtitles: async ({ videoId, userLang }) => {
+            aiToggles.push({ videoId, userLang });
+            aiState = !aiState;
+            return aiState;
+        }
     });
     ctrl.setEnabled(true);
     ctrl.scan();
 
     const injectedShorts = shortsDd.querySelectorAll('[data-supratube-td-item="1"]');
+    const injectedShortsIa = shortsDd.querySelectorAll(`[${TD_IA_ITEM_ATTR}="1"]`);
     assert.equal(injectedShorts.length, 1);
+    assert.equal(injectedShortsIa.length, 1);
     assert.ok(injectedShorts[0].classList.contains('supratube-td-shorts'));
     assert.ok(injectedShorts[0].classList.contains('supratube-td-dark'));
     assert.equal(injectedShorts[0].querySelector('svg'), null);
+    assert.ok(injectedShortsIa[0].querySelector('svg'));
+    assert.match(injectedShortsIa[0].textContent, /Subtítulos IA/);
+    assert.equal(injectedShortsIa[0].getAttribute('data-active'), '0');
     const imgIcon = injectedShorts[0].querySelector('img.supratube-td-icon-img');
     assert.ok(imgIcon);
     assert.match(TD_HEROICON_SVG_URL, /^https:\/\/.*heroicons.*\.svg/i);
@@ -533,20 +547,36 @@ test('controller injects Descargar transcripción in Shorts root dropdown (not s
     imgIcon.dispatchEvent({ type: 'error' });
     assert.equal(imgIcon.src, TD_HEROICON_FALLBACK_URL);
     assert.equal(subDd.querySelectorAll('[data-supratube-td-item="1"]').length, 0);
-    // Inserted immediately after Subtítulos (Descripción[0], Modo ambiente[1], Subtítulos[2], injected[3]).
+    assert.equal(subDd.querySelectorAll(`[${TD_IA_ITEM_ATTR}="1"]`).length, 0);
+    // Inserted immediately after Subtítulos (Descripción[0], Modo ambiente[1], Subtítulos[2], Descargar[3], Subtítulos IA[4]).
     assert.equal(list.children[3].getAttribute('data-supratube-td-item'), '1');
+    assert.equal(list.children[4].getAttribute(TD_IA_ITEM_ATTR), '1');
     // Expanded tight inline sizing so item is not clipped or wrapped narrowly.
     assert.ok(parseFloat(sheet.style.maxHeight) > 455.762);
     assert.ok(parseFloat(sheet.style.maxWidth) >= 240);
 
-    // Repeated scans must remain idempotent.
+    // Clicking Subtítulos IA activates AI subtitles for current Short in IP language and closes dropdown.
+    injectedShortsIa[0].click();
+    await new Promise(r => setTimeout(r, 30));
+    assert.deepEqual(aiToggles, [{ videoId: 'KBIKtrmM80Y', userLang: 'es' }]);
+    assert.equal(injectedShortsIa[0].getAttribute('data-active'), '1');
+    await new Promise(r => setTimeout(r, 270));
+    assert.equal(shortsDd.closed, 1);
+
+    // Reopen Shorts dropdown -> repeated scans remain idempotent and show Activado state.
+    shortsDd.style.display = 'block';
+    shortsDd.offsetWidth = 280;
+    shortsDd.offsetHeight = 200;
     ctrl.scan();
     assert.equal(shortsDd.querySelectorAll('[data-supratube-td-item="1"]').length, 1);
+    assert.equal(shortsDd.querySelectorAll(`[${TD_IA_ITEM_ATTR}="1"]`).length, 1);
+    assert.equal(shortsDd.querySelector(`[${TD_IA_ITEM_ATTR}="1"]`).getAttribute('data-active'), '1');
 
-    // Closing the dropdown removes the injected item so reusing the dropdown never leaks elsewhere.
+    // Closing the dropdown removes the injected items so reusing the dropdown never leaks elsewhere.
     shortsDd.style.display = 'none';
     ctrl.scan();
     assert.equal(shortsDd.querySelectorAll('[data-supratube-td-item="1"]').length, 0);
+    assert.equal(shortsDd.querySelectorAll(`[${TD_IA_ITEM_ATTR}="1"]`).length, 0);
 
     // Watch context: only inject for ytd-watch-metadata positionTarget, not sidebar compact video card!
     const { doc: wDoc, win: wWin } = createMenuFakeDom({ pathname: '/watch', search: '?v=4Pg9rUF1RQ0', videoTitle: 'Watch Pro' });
@@ -599,8 +629,11 @@ test('controller injects Descargar transcripción in Shorts root dropdown (not s
     watchDd.positionTarget = watchMenuBtn;
     wCtrl.scan();
     const watchInjected = watchDd.querySelector('[data-supratube-td-item="1"]');
+    const watchInjectedIa = watchDd.querySelector(`[${TD_IA_ITEM_ATTR}="1"]`);
     assert.ok(watchInjected);
+    assert.ok(watchInjectedIa);
     assert.equal(listbox.children[0], watchInjected);
+    assert.equal(listbox.children[1], watchInjectedIa);
     assert.ok(parseFloat(watchPopup.style.maxWidth) >= 240);
     assert.ok(parseFloat(watchPopup.style.maxHeight) > 52);
 
@@ -614,4 +647,5 @@ test('controller injects Descargar transcripción in Shorts root dropdown (not s
 
     wCtrl.destroy();
     assert.equal(wDoc.querySelectorAll('[data-supratube-td-item="1"]').length, 0);
+    assert.equal(wDoc.querySelectorAll(`[${TD_IA_ITEM_ATTR}="1"]`).length, 0);
 });

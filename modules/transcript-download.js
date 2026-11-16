@@ -4,6 +4,7 @@ import { __supratubeTdExports } from './subtitles.js';
 export const {
     TD_STYLE_ID,
     TD_ITEM_ATTR,
+    TD_IA_ITEM_ATTR,
     TD_TOAST_ID,
     TD_BLOCK_SIZE,
     TD_HEROICON_SVG_URL,

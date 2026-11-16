@@ -3,7 +3,7 @@ import { getVideoId, selectActivePlayer, readBridgeSettings, subscribeSettings, 
 import { installLayer0AdPrune, injectAdStyles, trySkipAd, dismissEnforcement } from './adblock.js';
 import { fetchSponsorSegments, renderGreenProgressBar, tickSponsorBlock } from './sponsorblock.js';
 import { apply1080pQuality } from './quality.js';
-import { resolveUserNativeLang } from './geo-lang.js';
+import { resolveUserNativeLang, parseGeoCookie } from './geo-lang.js';
 import {
     bindManualCaptionListeners,
     applySmartSubtitles,
@@ -49,7 +49,8 @@ const S = {
             ? tdFactory({
                 doc: document,
                 win: window,
-                getUserLang: () => S.userNativeLang || 'es',
+                getUserLang: () => getEffectiveUserLang(),
+                onToggleAiSubtitles: ({ videoId }) => toggleAiSubtitlesForVideo(videoId),
                 requestFn: gmRequest
             })
             : { setEnabled() {}, scan() {}, destroy() {} };
@@ -150,6 +151,38 @@ function refreshProgressBar() {
     );
 }
 
+function getEffectiveUserLang() {
+    const geoLang = parseGeoCookie(typeof document !== 'undefined' ? document.cookie : '')?.lang || '';
+    const navLang = typeof navigator !== 'undefined' ? String(navigator.language || '').split('-')[0].toLowerCase() : '';
+    return S.userNativeLang || geoLang || navLang || 'es';
+}
+
+function toggleAiSubtitlesForVideo(vid = getVideoId() || S.videoId) {
+    const targetVid = vid || getVideoId() || S.videoId;
+    const p = getPlayer();
+    if (!targetVid || !p) return false;
+    const lang = getEffectiveUserLang();
+    const started = startManualAiCaptions({
+        player: p,
+        videoId: targetVid,
+        userLang: lang,
+        doc: document,
+        win: window,
+        requestFn: gmRequest
+    });
+    if (started) {
+        S.subsAppliedForVideo = targetVid;
+        S.subsUserTouchedVideo = null;
+    } else {
+        S.subsUserTouchedVideo = targetVid;
+    }
+    if (!S.userNativeLang) {
+        resolveUserNativeLang().then(l => { S.userNativeLang = l; }).catch(() => {});
+    }
+    syncIaButton();
+    return started;
+}
+
 function syncIaButton() {
     if (!S.videoId || !S.settings.autoSubtitles) {
         removeAiSubtitleButtons(document);
@@ -160,28 +193,7 @@ function syncIaButton() {
         doc: document,
         win: window,
         enabled: true,
-        onToggle: () => {
-            const vid = getVideoId() || S.videoId;
-            const p = getPlayer();
-            if (!vid || !p) return;
-            const lang = S.userNativeLang || (typeof navigator !== 'undefined' ? String(navigator.language || '').split('-')[0].toLowerCase() : '') || 'es';
-            const started = startManualAiCaptions({
-                player: p,
-                videoId: vid,
-                userLang: lang,
-                doc: document,
-                win: window
-            });
-            if (started) {
-                S.subsAppliedForVideo = vid;
-                S.subsUserTouchedVideo = null;
-            } else {
-                S.subsUserTouchedVideo = vid;
-            }
-            if (!S.userNativeLang) {
-                resolveUserNativeLang().then(l => { S.userNativeLang = l; }).catch(() => {});
-            }
-        }
+        onToggle: () => toggleAiSubtitlesForVideo()
     });
 }
 
