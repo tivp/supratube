@@ -15,13 +15,13 @@ env.backends.onnx.wasm.wasmPaths = ASYNCIFY;
 
 const SR = 16000;
 const S = sec => Math.round(sec * SR);
-const MIN_FIRST_WINDOW = S(1.4);
+const MIN_FIRST_WINDOW = S(1.0);
 const MAX_WINDOW = S(9);
 const OVERLAP = S(1.0);
 const PAUSE_FINAL = S(0.45);
 const PRE_ROLL = S(0.3);
-const SPEECH_RMS = 0.008;
-const SPEECH_RMS_HOLD = 0.004;
+const SPEECH_RMS = 0.0025;
+const SPEECH_RMS_HOLD = 0.0015;
 
 class LangDetectProcessor extends LogitsProcessor {
     constructor(genCfg, forced) {
@@ -73,6 +73,7 @@ let lastFinalEnd = 0;
 let lastInferEnd = 0;
 let prevUtteranceEnd = 0;
 let prevCommittedRaw = '';
+let lastVideoTime = 0;
 let busy = false;
 
 const voter = new LanguageVoter();
@@ -87,6 +88,7 @@ function resetAudioState(clearOverlap = true) {
     lastFinalEnd = 0;
     lastInferEnd = 0;
     prevUtteranceEnd = 0;
+    lastVideoTime = 0;
     if (clearOverlap) prevCommittedRaw = '';
 }
 
@@ -123,38 +125,38 @@ async function initModel() {
                 ['onnx-community/whisper-tiny', 'wasm', 'q8', { graphOptimizationLevel: 'basic' }]
             ];
 
-        let lastPct = -1;
-        const files = new Map();
-        const progress_callback = p => {
-            if (!p?.file) return;
-            if (p.status === 'progress') files.set(p.file, [p.loaded, p.total]);
-            else if (p.status === 'done') {
-                const f = files.get(p.file);
-                if (f) files.set(p.file, [f[1], f[1]]);
-            }
-            let loaded = 0;
-            let tot = 0;
-            for (const [l, t] of files.values()) {
-                if (t > 0) {
-                    loaded += Math.min(l, t);
-                    tot += t;
-                }
-            }
-            const pct = tot ? Math.round((loaded / tot) * 100) : 0;
-            if (pct >= lastPct + 10 || p.status === 'done') {
-                lastPct = pct;
-                self.postMessage({
-                    kind: 'progress',
-                    videoId: activeVideoId,
-                    pct,
-                    mbLoaded: +(loaded / 1048576).toFixed(1),
-                    mbTotal: +(tot / 1048576).toFixed(1)
-                });
-            }
-        };
-
         let lastErr = null;
         for (const [id, device, dtype, session_options] of attempts) {
+            let lastPct = -1;
+            const files = new Map();
+            const progress_callback = p => {
+                if (!p?.file) return;
+                if (p.status === 'progress') files.set(p.file, [p.loaded, p.total]);
+                else if (p.status === 'done') {
+                    const f = files.get(p.file);
+                    if (f) files.set(p.file, [f[1], f[1]]);
+                }
+                let loaded = 0;
+                let tot = 0;
+                for (const [l, t] of files.values()) {
+                    if (t > 0) {
+                        loaded += Math.min(l, t);
+                        tot += t;
+                    }
+                }
+                if (tot < 1048576) return;
+                const pct = Math.min(99, Math.max(1, Math.round((loaded / tot) * 100)));
+                if (pct >= lastPct + 5) {
+                    lastPct = pct;
+                    self.postMessage({
+                        kind: 'progress',
+                        videoId: activeVideoId,
+                        pct,
+                        mbLoaded: +(loaded / 1048576).toFixed(1),
+                        mbTotal: +(tot / 1048576).toFixed(1)
+                    });
+                }
+            };
             try {
                 env.backends.onnx.wasm.wasmPaths = ASYNCIFY;
                 env.backends.onnx.wasm.numThreads = 1;
@@ -212,15 +214,26 @@ function extractWindow(from, to) {
         const b = Math.min(to, c.end);
         out.set(c.pcm.subarray(a - c.start, b - c.start), a - from);
     }
+    let maxAbs = 0;
+    for (let i = 0; i < out.length; i++) {
+        const abs = Math.abs(out[i]);
+        if (abs > maxAbs) maxAbs = abs;
+    }
+    if (maxAbs > 0.002 && maxAbs < 0.25) {
+        const gain = Math.min(8, 0.5 / maxAbs);
+        for (let i = 0; i < out.length; i++) {
+            out[i] *= gain;
+        }
+    }
     return out;
 }
 
 async function translateCached(text, from, to) {
     const clean = String(text || '').trim();
     if (!clean) return '';
-    const baseFrom = String(from || '').split('-')[0].toLowerCase();
-    const baseTo = String(to || 'es').split('-')[0].toLowerCase();
-    if (baseFrom && baseFrom === baseTo) return clean;
+    const baseFrom = String(from || '').replace(/^[-_]+/, '').split('-')[0].toLowerCase();
+    const baseTo = String(to || 'es').replace(/^[-_]+/, '').split('-')[0].toLowerCase();
+    if (!baseTo || baseTo === 'und' || baseTo === 'auto' || (baseFrom && baseFrom === baseTo)) return clean;
 
     const key = `${baseFrom || 'auto'}:${baseTo}:${clean}`;
     if (transCache.has(key)) return transCache.get(key);
@@ -287,7 +300,7 @@ async function maybeInfer(videoTime, runVid) {
         if (voter.shouldAbortForSameLanguage(targetLang, manualForce)) {
             stopped = true;
             resetAudioState(true);
-            self.postMessage({ kind: 'same_language', videoId: runVid, lang: voter.locked });
+            self.postMessage({ kind: 'same_language', videoId: runVid, lang: voter.locked, manualForce });
             return;
         }
 
@@ -331,13 +344,24 @@ self.onmessage = async e => {
     if (!m || !m.kind) return;
 
     if (m.kind === 'INIT') {
-        activeVideoId = String(m.videoId || '');
+        const nextVid = String(m.videoId || '');
+        const sameActiveVid = !stopped && Boolean(nextVid) && activeVideoId === nextVid && chunks.length > 0;
+        activeVideoId = nextVid;
         targetLang = String(m.targetLang || 'es');
         manualForce = Boolean(m.manualForce);
         stopped = false;
-        voter.reset();
-        resetAudioState(true);
+        if (!sameActiveVid) {
+            voter.reset();
+            resetAudioState(true);
+        }
         await initModel();
+        if (sameActiveVid && model) {
+            maybeInfer(lastVideoTime, activeVideoId).catch(err => {
+                if (!stopped && activeVideoId === nextVid) {
+                    self.postMessage({ kind: 'error', videoId: nextVid, error: String(err?.message || err) });
+                }
+            });
+        }
         return;
     }
 
@@ -362,6 +386,7 @@ self.onmessage = async e => {
         if (stopped || !model || !m.videoId || m.videoId !== activeVideoId) return;
         const pcm = m.pcm instanceof Float32Array ? m.pcm : new Float32Array(m.pcm || []);
         if (!pcm.length) return;
+        lastVideoTime = Number(m.videoTime) || 0;
 
         const start = total;
         const end = total + pcm.length;

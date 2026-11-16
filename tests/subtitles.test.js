@@ -1720,13 +1720,13 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
     assert.equal(iaBtn2, iaBtn);
     assert.equal(leftGroup.children.length, 2);
 
-    // Click IA button -> immediately starts forced Whisper session & lights up icon
+    // Click IA button -> immediately starts forced Whisper session with backward-compatible '-es' & lights up icon
     iaBtn.click();
     assert.equal(iaBtn.getAttribute('data-active'), '1');
     assert.equal(iaBtn.getAttribute('aria-pressed'), 'true');
     assert.equal(iaBtn.querySelector('svg')?.getAttribute('data-ia-mode'), '1');
     assert.equal(ccBtn.getAttribute('aria-pressed'), 'true');
-    assert.ok(cmds.some(c => c.action === 'start' && c.videoId === 'fEt2anArPb4' && c.manualForce === true));
+    assert.ok(cmds.some(c => c.action === 'start' && c.videoId === 'fEt2anArPb4' && c.targetLang === '-es' && c.manualForce === true));
     assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Iniciando subtítulos IA...');
 
     // same_language event MUST NOT kill manual forced Whisper session
@@ -1742,7 +1742,7 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
     assert.equal(iaBtn.querySelector('svg')?.getAttribute('data-ia-mode'), '0');
     assert.ok(cmds.some(c => c.action === 'stop' && c.videoId === 'fEt2anArPb4'));
 
-    // Auto-started non-forced session gets upgraded to manualForce: true on [IA] click (NOT killed!)
+    // Auto-started non-forced session gets upgraded to manualForce: true with immediate banner on [IA] click (NOT killed!)
     cmds.length = 0;
     fakePlayer.isSubtitlesOn = () => false;
     fakePlayer.getOption = () => [];
@@ -1762,8 +1762,9 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
 
     iaBtn.click();
     assert.equal(iaBtn.getAttribute('data-active'), '1');
-    assert.ok(cmds.some(c => c.action === 'start' && c.manualForce === true));
+    assert.ok(cmds.some(c => c.action === 'start' && c.targetLang === '-es' && c.manualForce === true));
     assert.equal(cmds.some(c => c.action === 'stop'), false);
+    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Iniciando subtítulos IA...');
 
     // Displaced background tab preempted event turns off [IA] button cleanly
     fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
@@ -1821,8 +1822,190 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
         clearInterval
     });
     for (const fn of (cListeners['supratube-whisper-cmd'] || [])) {
-        fn({ detail: { action: 'start', videoId: 'fEt2anArPb4', targetLang: 'es', manualForce: true } });
+        fn({ detail: { action: 'start', videoId: 'fEt2anArPb4', targetLang: '-es', manualForce: true } });
     }
     await new Promise(r => setTimeout(r, 30));
-    assert.ok(sent.some(m => m.action === 'SUPRATUBE_WHISPER_START' && m.videoId === 'fEt2anArPb4' && m.manualForce === true));
+    assert.ok(sent.some(m => m.action === 'SUPRATUBE_WHISPER_START' && m.videoId === 'fEt2anArPb4' && m.targetLang === '-es' && m.manualForce === true));
+});
+
+test('manual [IA] survives in-flight auto fallback, keeps paused readiness banner, and translates foreign legacy captions on the fly', async () => {
+    const { LanguageVoter } = await import('../offscreen-src/whisper-utils.js');
+    const elements = new Map();
+    const vidListeners = {};
+    const videoEl = {
+        currentTime: 3,
+        paused: true,
+        setAttribute() {},
+        removeAttribute() {},
+        addEventListener(ev, fn) { (vidListeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { vidListeners[ev] = (vidListeners[ev] || []).filter(f => f !== fn); }
+    };
+    const makeAttrs = (init = {}) => {
+        const map = { ...init };
+        return {
+            setAttribute(k, v) { map[k] = String(v); },
+            getAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null; },
+            hasAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k); },
+            removeAttribute(k) { delete map[k]; }
+        };
+    };
+    const createNode = tag => {
+        const listeners = {};
+        return {
+            tagName: String(tag).toUpperCase(),
+            id: '',
+            className: '',
+            style: {},
+            children: [],
+            parentElement: null,
+            ...makeAttrs(),
+            appendChild(c) { c.parentElement = this; this.children.push(c); if (c.id) elements.set(c.id, c); return c; },
+            insertBefore(c) { return this.appendChild(c); },
+            replaceChildren() { this.children = []; },
+            remove() { if (this.id) elements.delete(this.id); },
+            querySelector: () => null,
+            querySelectorAll: () => [],
+            addEventListener(ev, fn) { (listeners[ev] ||= []).push(fn); },
+            removeEventListener() {},
+            click() { for (const fn of (listeners.click || [])) fn({ preventDefault() {}, stopPropagation() {} }); }
+        };
+    };
+
+    const controlsRoot = createNode('div');
+    controlsRoot.className = 'ytp-right-controls';
+    const ccBtn = createNode('button');
+    ccBtn.className = 'ytp-subtitles-button ytp-button';
+    ccBtn.closest = () => controlsRoot;
+    controlsRoot.appendChild(ccBtn);
+
+    const fakeDoc = {
+        head: createNode('head'),
+        documentElement: { dataset: { supratubeWhisperBridge: '1' } },
+        createElement: tag => createNode(tag),
+        createElementNS: (_ns, tag) => createNode(tag),
+        getElementById: id => elements.get(id) || null,
+        querySelector: sel => (sel === '.ytp-subtitles-button' ? ccBtn : null),
+        querySelectorAll: () => []
+    };
+
+    let releaseInnertube = null;
+    const winListeners = {};
+    const cmds = [];
+    class FakeCustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } }
+    const fakeWin = {
+        location: { href: 'https://www.youtube.com/watch?v=fEt2anArPb4', pathname: '/watch', origin: 'https://www.youtube.com' },
+        CustomEvent: FakeCustomEvent,
+        ytcfg: { get: () => '' },
+        fetch: async url => {
+            if (String(url).includes('/youtubei/v1/player')) {
+                await new Promise(r => { releaseInnertube = r; });
+                return {
+                    ok: true,
+                    status: 200,
+                    text: async () => JSON.stringify({
+                        videoDetails: { videoId: 'fEt2anArPb4', defaultAudioLanguage: 'es' },
+                        streamingData: { adaptiveFormats: [{ audioTrack: { id: 'es.4', audioIsDefault: true } }] }
+                    })
+                };
+            }
+            return { ok: true, status: 200, text: async () => '{}' };
+        },
+        addEventListener(ev, fn) { (winListeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { winListeners[ev] = (winListeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) {
+            if (ev.type === 'supratube-whisper-cmd') cmds.push(ev.detail);
+            for (const fn of (winListeners[ev.type] || [])) fn(ev);
+        }
+    };
+    const fakePlayer = {
+        id: 'movie_player',
+        clientWidth: 960,
+        isSubtitlesOn: () => false,
+        getOption: () => [],
+        getPlayerResponse: () => ({ videoDetails: { videoId: 'fEt2anArPb4' } }),
+        getVideoData: () => ({ video_id: 'fEt2anArPb4' }),
+        querySelector: sel => {
+            if (sel === 'video') return videoEl;
+            if (sel === '.ytp-subtitles-button') return ccBtn;
+            if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+            return null;
+        },
+        querySelectorAll: () => [],
+        appendChild: el => { if (el.id) elements.set(el.id, el); return el; }
+    };
+
+    const translateRequests = [];
+    const mockRequestFn = async url => {
+        translateRequests.push(url);
+        return {
+            status: 200,
+            text: JSON.stringify({ sentences: [{ trans: 'Soy Iron Man.' }] })
+        };
+    };
+
+    const iaBtn = ensureAiSubtitleButton({
+        player: fakePlayer,
+        doc: fakeDoc,
+        win: fakeWin,
+        enabled: true,
+        onToggle: () => startManualAiCaptions({
+            player: fakePlayer,
+            videoId: 'fEt2anArPb4',
+            userLang: 'es',
+            doc: fakeDoc,
+            win: fakeWin,
+            requestFn: mockRequestFn
+        })
+    });
+
+    // Start auto applySmartSubtitles (leaves obtainRawSegmentsForVideo in flight)
+    await applySmartSubtitles(fakePlayer, {
+        enabled: true,
+        userLang: 'es',
+        expectedVideoId: 'fEt2anArPb4',
+        doc: fakeDoc,
+        win: fakeWin
+    });
+
+    // User clicks [IA] while paused and while auto obtainRawSegmentsForVideo is still in flight
+    iaBtn.click();
+    const box = elements.get('supratube-fallback-captions');
+    assert.equal(box?.children[0]?.textContent, 'Subtítulos IA listos (reproduce el video)');
+    assert.equal(box?.style.display, 'block');
+
+    // waiting_play keeps banner visible in manual mode
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'waiting_play', videoId: 'fEt2anArPb4' }
+    }));
+    assert.equal(box?.children[0]?.textContent, 'Subtítulos IA listos (reproduce el video)');
+    assert.equal(box?.style.display, 'block');
+
+    // Resolve delayed Innertube call returning audioLanguage='es' & no captions -> MUST NOT kill manual [IA]!
+    releaseInnertube?.();
+    await new Promise(r => setTimeout(r, 40));
+    assert.equal(iaBtn.getAttribute('data-active'), '1');
+    assert.equal(cmds.some(c => c.action === 'stop'), false);
+
+    // Simulate legacy v1.0.9 worker checking LanguageVoter without manualForce on Spanish video:
+    const startCmd = cmds.find(c => c.action === 'start');
+    assert.equal(startCmd?.targetLang, '-es');
+    const legacyVoter = new LanguageVoter();
+    legacyVoter.observe({ lang: 'es', conf: 0.9, ts: 1 });
+    legacyVoter.observe({ lang: 'es', conf: 0.9, ts: 2 });
+    assert.equal(legacyVoter.shouldAbortForSameLanguage(startCmd.targetLang), false);
+
+    // Pressing play transitions readiness banner to listening
+    videoEl.paused = false;
+    for (const fn of (vidListeners.play || [])) fn();
+    assert.equal(box?.children[0]?.textContent, 'Subtítulos IA escuchando...');
+
+    // Legacy v1.0.9 worker failing to translate foreign speech ('en' -> same raw text) gets translated on the fly:
+    fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'caption', videoId: 'fEt2anArPb4', mode: 'final', lang: 'en', raw: 'I am Iron Man.', translated: 'I am Iron Man.' }
+    }));
+    await new Promise(r => setTimeout(r, 30));
+    assert.ok(translateRequests.some(u => u.includes('translate.googleapis.com')));
+    assert.equal(box?.children[0]?.textContent, 'Soy Iron Man.');
+
+    clearFallbackCaptions(fakeDoc, fakeWin);
 });

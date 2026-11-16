@@ -98,3 +98,15 @@ test('computeLangSoftmax normalizes logits and honors forced language above 0.2 
     assert.equal(kept.chosen, 'es');
     assert.ok(kept.lockedConf > 0.2);
 });
+
+test('leading dash targetLang (-es) bypasses legacy v1.0.9 shouldAbortForSameLanguage even with manualForce=false', () => {
+    const voter = new LanguageVoter();
+    voter.observe({ lang: 'es', conf: 0.9, ts: 1000 });
+    voter.observe({ lang: 'es', conf: 0.92, ts: 2000 });
+    assert.equal(voter.locked, 'es');
+    // Standard auto-mode aborts on same-language Spanish video:
+    assert.equal(voter.shouldAbortForSameLanguage('es', false), true);
+    // Legacy v1.0.9 caller without manualForce arg (defaults to false) MUST NOT abort when targetLang is '-es':
+    assert.equal(voter.shouldAbortForSameLanguage('-es'), false);
+    assert.equal(voter.shouldAbortForSameLanguage('-es', false), false);
+});

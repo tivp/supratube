@@ -104,7 +104,7 @@
     });
 
     const captureByVideo = new WeakMap();
-    let whisperSession = { active: false, videoId: '', video: null, connected: false };
+    let whisperSession = { active: false, videoId: '', pendingVideoId: '', video: null, connected: false };
     let whisperStartSeq = 0;
 
     function disconnectProc(entry) {
@@ -121,11 +121,12 @@
 
     function stopWhisperCapture(videoId = '') {
         whisperStartSeq++;
-        if (!whisperSession.active) return;
-        if (videoId && whisperSession.videoId && videoId !== whisperSession.videoId) return;
-        const vid = whisperSession.videoId;
+        const curVid = whisperSession.videoId || whisperSession.pendingVideoId;
+        if (!whisperSession.active && !whisperSession.pendingVideoId) return;
+        if (videoId && curVid && videoId !== curVid) return;
+        const vid = curVid;
         const vidEl = whisperSession.video;
-        whisperSession = { active: false, videoId: '', video: null, connected: false };
+        whisperSession = { active: false, videoId: '', pendingVideoId: '', video: null, connected: false };
         if (vidEl) {
             disconnectProc(captureByVideo.get(vidEl));
         }
@@ -137,9 +138,39 @@
     function readStreamAudioTracks(vidEl) {
         try {
             const stream = vidEl.captureStream ? vidEl.captureStream() : vidEl.mozCaptureStream?.();
-            return stream?.getAudioTracks?.() || [];
+            const tracks = (stream?.getAudioTracks?.() || []).filter(t => t?.readyState !== 'ended');
+            if (tracks.length) return tracks;
+        } catch {}
+        try {
+            if (typeof MediaStream === 'function' && vidEl.srcObject instanceof MediaStream) {
+                const tracks = (vidEl.srcObject.getAudioTracks?.() || []).filter(t => t?.readyState !== 'ended');
+                if (tracks.length) return tracks;
+            }
+        } catch {}
+        return [];
+    }
+
+    function refreshEntryAudioSource(vidEl, entry, force = false) {
+        if (!vidEl || !entry || entry.usedMediaElement) return false;
+        const freshTracks = readStreamAudioTracks(vidEl);
+        if (!freshTracks.length) return false;
+        const prevIds = (entry.tracks || []).map(t => t?.id || '').join(',');
+        const nextIds = freshTracks.map(t => t?.id || '').join(',');
+        if (!force && prevIds && prevIds === nextIds && freshTracks.every(t => t?.readyState !== 'ended')) {
+            return false;
+        }
+        try {
+            if (entry.connected) {
+                try { entry.src.disconnect(entry.proc); } catch {}
+            }
+            entry.src = entry.ctx.createMediaStreamSource(new MediaStream(freshTracks));
+            entry.tracks = freshTracks;
+            if (entry.connected) {
+                entry.src.connect(entry.proc);
+            }
+            return true;
         } catch {
-            return [];
+            return false;
         }
     }
 
@@ -180,7 +211,7 @@
             if (!ready || token !== whisperStartSeq) return [];
         }
 
-        for (let attempt = 0; attempt < 15; attempt++) {
+        for (let attempt = 0; attempt < 8; attempt++) {
             if (token !== whisperStartSeq) return [];
             const tracks = readStreamAudioTracks(vidEl);
             if (tracks.length) return tracks;
@@ -198,42 +229,78 @@
             document.querySelector('video');
         if (!vidEl) return;
 
-        if (whisperSession.active && whisperSession.videoId !== videoId) {
-            stopWhisperCapture(whisperSession.videoId);
+        const prevVid = whisperSession.videoId || whisperSession.pendingVideoId;
+        if ((whisperSession.active || whisperSession.pendingVideoId) && prevVid !== videoId) {
+            stopWhisperCapture(prevVid);
         }
         const token = ++whisperStartSeq;
+        whisperSession.pendingVideoId = videoId;
+
+        const startRes = await new Promise(resolve => {
+            chrome.runtime.sendMessage(
+                { action: 'SUPRATUBE_WHISPER_START', videoId, targetLang, manualForce: Boolean(manualForce) },
+                r => resolve(chrome.runtime.lastError ? { ok: false } : (r || { ok: false }))
+            );
+        });
+        if (token !== whisperStartSeq) return;
+        if (!startRes?.ok) {
+            whisperSession.pendingVideoId = '';
+            window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
+                detail: { kind: 'error', videoId, error: startRes?.error || 'offscreen unavailable' }
+            }));
+            return;
+        }
 
         let entry = captureByVideo.get(vidEl);
-        if (entry && (entry.ctx?.state === 'closed' || entry.tracks?.some(t => t.readyState === 'ended'))) {
+        if (entry && (entry.ctx?.state === 'closed' || (!entry.usedMediaElement && entry.tracks?.some(t => t?.readyState === 'ended')))) {
             disconnectProc(entry);
-            try { entry.ctx?.close?.(); } catch {}
+            try { if (!entry.usedMediaElement) entry.ctx?.close?.(); } catch {}
             captureByVideo.delete(vidEl);
             entry = null;
         }
         if (!entry) {
             const aTracks = await waitAudioTracks(vidEl, token, videoId);
             if (token !== whisperStartSeq) return;
-            if (!aTracks.length) {
+
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) return;
+            let ctx = vidEl.__supratubeAudioCtx || null;
+            if (ctx?.state === 'closed') ctx = null;
+            if (!ctx) {
+                try {
+                    ctx = new Ctx({ sampleRate: 16000 });
+                } catch {
+                    ctx = new Ctx();
+                }
+                vidEl.__supratubeAudioCtx = ctx;
+            }
+
+            let src = null;
+            let usedMediaElement = false;
+            if (aTracks.length) {
+                src = ctx.createMediaStreamSource(new MediaStream(aTracks));
+            } else if (typeof ctx.createMediaElementSource === 'function') {
+                try {
+                    src = vidEl.__supratubeMediaElemSrc || ctx.createMediaElementSource(vidEl);
+                    vidEl.__supratubeMediaElemSrc = src;
+                    src.connect(ctx.destination);
+                    usedMediaElement = true;
+                } catch {
+                    src = null;
+                }
+            }
+            if (!src) {
+                whisperSession.pendingVideoId = '';
                 window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
                     detail: { kind: 'error', videoId, error: 'no audio track' }
                 }));
                 return;
             }
-
-            const Ctx = window.AudioContext || window.webkitAudioContext;
-            if (!Ctx) return;
-            let ctx;
-            try {
-                ctx = new Ctx({ sampleRate: 16000 });
-            } catch {
-                ctx = new Ctx();
-            }
-            const src = ctx.createMediaStreamSource(new MediaStream(aTracks));
             const proc = ctx.createScriptProcessor(4096, 1, 1);
             const mute = ctx.createGain();
             mute.gain.value = 0;
             mute.connect(ctx.destination);
-            entry = { ctx, tracks: aTracks, src, proc, mute, connected: false, boundSeek: false, boundPlay: false };
+            entry = { ctx, tracks: aTracks, src, proc, mute, connected: false, boundSeek: false, boundPlay: false, usedMediaElement, zeroBatches: 0 };
             captureByVideo.set(vidEl, entry);
         }
 
@@ -265,21 +332,8 @@
         }
         if (token !== whisperStartSeq) return;
 
-        const startRes = await new Promise(resolve => {
-            chrome.runtime.sendMessage(
-                { action: 'SUPRATUBE_WHISPER_START', videoId, targetLang, manualForce: Boolean(manualForce) },
-                r => resolve(chrome.runtime.lastError ? { ok: false } : (r || { ok: false }))
-            );
-        });
-        if (token !== whisperStartSeq) return;
-        if (!startRes?.ok) {
-            window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
-                detail: { kind: 'error', videoId, error: startRes?.error || 'offscreen unavailable' }
-            }));
-            return;
-        }
-
-        whisperSession = { active: true, videoId, video: vidEl, connected: true };
+        whisperSession = { active: true, videoId, pendingVideoId: '', video: vidEl, connected: true };
+        entry.zeroBatches = 0;
         let batch = [];
         let len = 0;
 
@@ -305,12 +359,22 @@
                 }
                 batch = [];
                 len = 0;
+                const rms = Math.sqrt(sum / out.length);
+                if (rms < 0.00001 && !vidEl.muted && (vidEl.volume ?? 1) > 0) {
+                    entry.zeroBatches++;
+                    if (entry.zeroBatches >= 12) {
+                        entry.zeroBatches = 0;
+                        refreshEntryAudioSource(vidEl, entry, true);
+                    }
+                } else {
+                    entry.zeroBatches = 0;
+                }
                 chrome.runtime.sendMessage({
                     action: 'SUPRATUBE_WHISPER_PCM',
                     videoId,
                     samples: Array.from(out),
                     videoTime: Number(vidEl.currentTime) || 0,
-                    rms: Math.sqrt(sum / out.length)
+                    rms
                 }).catch(() => {});
             }
         };
