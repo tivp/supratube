@@ -2072,7 +2072,7 @@ function ensureFallbackBox(player, doc, win) {
     }
     const isShorts = Boolean(player.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
     const cw = Number(player.clientWidth) || (isShorts ? 380 : 900);
-    const fontPx = Math.round(Math.max(isShorts ? 21 : 16, Math.min(30, cw * (isShorts ? 0.064 : 0.024))));
+    const fontPx = Math.round(Math.max(isShorts ? 19 : 16, Math.min(isShorts ? 24 : 30, cw * (isShorts ? 0.058 : 0.024))));
     Object.assign(box.style, {
         position: 'absolute',
         left: '50%',
@@ -2093,8 +2093,8 @@ function ensureFallbackBox(player, doc, win) {
             fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
             fontSize: `${fontPx}px`,
             fontWeight: isShorts ? '600' : '500',
-            lineHeight: isShorts ? '1.3' : '1.35',
-            padding: isShorts ? '6px 12px' : '4px 10px',
+            lineHeight: isShorts ? '1.28' : '1.35',
+            padding: isShorts ? '5px 10px' : '4px 10px',
             borderRadius: '4px',
             textShadow: '0 1px 2px rgba(0, 0, 0, 0.9)',
             whiteSpace: 'pre-wrap'
@@ -2133,14 +2133,29 @@ function ensureCcActiveStyle(doc) {
 
 function ensureShortsCaptionStyle(doc) {
     ensureDocStyle(doc, SHORTS_CAPTION_STYLE_ID, [
-        '#shorts-player .ytp-caption-segment, ytd-reel-video-renderer .ytp-caption-segment, ytd-shorts .ytp-caption-segment {',
-        '    font-size: clamp(21px, 2vw, 28px) !important;',
-        '    line-height: 1.3 !important;',
-        '    padding: 4px 10px !important;',
-        '    font-weight: 600 !important;',
-        '}',
         '#shorts-player .caption-window, ytd-reel-video-renderer .caption-window, ytd-shorts .caption-window {',
-        '    max-width: 92% !important;',
+        '    left: 50% !important;',
+        '    right: auto !important;',
+        '    margin-left: 0 !important;',
+        '    margin-right: 0 !important;',
+        '    transform: translateX(-50%) !important;',
+        '    width: max-content !important;',
+        '    max-width: 90% !important;',
+        '    text-align: center !important;',
+        '    box-sizing: border-box !important;',
+        '}',
+        '#shorts-player .caption-window .captions-text, ytd-reel-video-renderer .caption-window .captions-text, ytd-shorts .caption-window .captions-text,',
+        '#shorts-player .caption-visual-line, ytd-reel-video-renderer .caption-visual-line, ytd-shorts .caption-visual-line {',
+        '    display: block !important;',
+        '    text-align: center !important;',
+        '    white-space: normal !important;',
+        '}',
+        '#shorts-player .ytp-caption-segment, ytd-reel-video-renderer .ytp-caption-segment, ytd-shorts .ytp-caption-segment {',
+        '    font-size: clamp(18px, 1.55vw, 21px) !important;',
+        '    line-height: 1.28 !important;',
+        '    padding: 2px 7px !important;',
+        '    font-weight: 600 !important;',
+        '    white-space: normal !important;',
         '}'
     ].join('\n'));
 }

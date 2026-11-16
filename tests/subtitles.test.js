@@ -1539,7 +1539,9 @@ test('Shorts subtitles use larger readable font size for both native CSS and fal
     const shortsStyle = elements.get('supratube-shorts-caption-style');
     assert.ok(shortsStyle, 'injects supratube-shorts-caption-style');
     assert.match(shortsStyle.textContent, /#shorts-player \.ytp-caption-segment/);
-    assert.match(shortsStyle.textContent, /font-size:\s*clamp\(21px/);
+    assert.match(shortsStyle.textContent, /font-size:\s*clamp\(18px/);
+    assert.match(shortsStyle.textContent, /left:\s*50%\s*!important/);
+    assert.match(shortsStyle.textContent, /transform:\s*translateX\(-50%\)\s*!important/);
 
     fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
         detail: { kind: 'caption', videoId: 'shortBigTxt', mode: 'final', translated: 'Subtítulo grande en Shorts' }
@@ -1548,6 +1550,6 @@ test('Shorts subtitles use larger readable font size for both native CSS and fal
     assert.ok(fb);
     assert.equal(fb.style.width, 'max-content');
     const px = parseInt(fb.children[0].style.fontSize, 10);
-    assert.ok(px >= 21, `expected Shorts fallback font >= 21px, got ${px}`);
+    assert.ok(px >= 19, `expected Shorts fallback font >= 19px, got ${px}`);
     clearFallbackCaptions(fakeDoc, fakeWin);
 });
