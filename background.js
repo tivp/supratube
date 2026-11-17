@@ -30,6 +30,7 @@ const DEFAULT_SETTINGS_SYNC = {
     auto1080p: true,
     autoSubtitles: true,
     asrEngine: 'sherpa',
+    aiAudioLang: 'auto',
     aiSummary: true,
     transcriptDownload: true
 };
@@ -605,6 +606,7 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
             targetLang: mensaje.targetLang || 'es',
             spokenLang: mensaje.spokenLang || '',
             asrEngine: mensaje.asrEngine || 'sherpa',
+            aiAudioLang: mensaje.aiAudioLang || 'auto',
             manualForce: Boolean(mensaje.manualForce)
         })
             .then(() => enviarRespuesta({ ok: true }))

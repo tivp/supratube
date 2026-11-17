@@ -27,6 +27,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     auto1080p: true,
     autoSubtitles: true,
     asrEngine: 'sherpa',
+    aiAudioLang: 'auto',
     aiSummary: true,
     transcriptDownload: true
 });

@@ -25,6 +25,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             targetLang: msg.targetLang || 'es',
             spokenLang: msg.spokenLang || '',
             asrEngine: msg.asrEngine || 'sherpa',
+            aiAudioLang: msg.aiAudioLang || 'auto',
             manualForce: Boolean(msg.manualForce)
         });
         sendResponse({ ok: true });

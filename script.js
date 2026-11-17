@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     auto1080p: true,
     autoSubtitles: true,
     asrEngine: 'sherpa',
+    aiAudioLang: 'auto',
     aiSummary: true,
     transcriptDownload: true
 });
@@ -2107,6 +2108,18 @@ function readPreferredAsrEngine(doc) {
     return 'sherpa';
 }
 
+function readPreferredAiAudioLang(doc) {
+    try {
+        const raw = doc?.documentElement?.dataset?.supratubeSettings;
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            const clean = String(parsed?.aiAudioLang || '').trim().toLowerCase().split(/[-_]/)[0];
+            if (['es', 'en', 'fr', 'de'].includes(clean)) return clean;
+        }
+    } catch {}
+    return 'auto';
+}
+
 function loadSavedCaptionPos(win, isShorts) {
     try {
         const raw = win?.localStorage?.getItem?.(CAPTION_POS_STORAGE_KEY);
@@ -2610,6 +2623,7 @@ function startManualAiCaptions({
     videoId,
     userLang = 'es',
     asrEngine = '',
+    aiAudioLang = '',
     doc = typeof document !== 'undefined' ? document : null,
     win = typeof window !== 'undefined' ? window : null,
     requestFn = gmRequest
@@ -2629,6 +2643,7 @@ function startManualAiCaptions({
 
     const baseUser = normalizeBaseLang(userLang) || 'es';
     const engine = (asrEngine || readPreferredAsrEngine(doc)) === 'whisper' ? 'whisper' : 'sherpa';
+    const audioLang = (aiAudioLang || readPreferredAiAudioLang(doc) || 'auto');
     ctrl.sameLangVideos.delete(videoId);
     ctrl.manualForcePendingVid = videoId;
     ctrl.activePlayer = player;
@@ -2649,6 +2664,7 @@ function startManualAiCaptions({
         videoId,
         userLang: baseUser,
         asrEngine: engine,
+        aiAudioLang: audioLang,
         doc,
         win,
         requestFn,
@@ -2664,12 +2680,13 @@ function startManualAiCaptions({
     return ok;
 }
 
-/** Restart active AI live subtitles when the user switches the ASR motor in the popup menu. */
+/** Restart active AI live subtitles when the user switches ASR motor or voice language in the popup menu. */
 function restartActiveAiCaptionsIfRunning({
     player,
     videoId,
     userLang = 'es',
     asrEngine = '',
+    aiAudioLang = '',
     doc = typeof document !== 'undefined' ? document : null,
     win = typeof window !== 'undefined' ? window : null,
     requestFn = gmRequest
@@ -2680,7 +2697,7 @@ function restartActiveAiCaptionsIfRunning({
     const wasManual = Boolean(ctrl.whisperManualForce);
     clearFallbackCaptions(doc, win);
     if (wasManual) {
-        return startManualAiCaptions({ player, videoId, userLang, asrEngine, doc, win, requestFn });
+        return startManualAiCaptions({ player, videoId, userLang, asrEngine, aiAudioLang, doc, win, requestFn });
     }
     const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
     if (!video) return false;
@@ -2690,6 +2707,7 @@ function restartActiveAiCaptionsIfRunning({
         videoId,
         userLang: normalizeBaseLang(userLang) || 'es',
         asrEngine,
+        aiAudioLang,
         doc,
         win,
         requestFn,
@@ -3341,7 +3359,58 @@ function stripInPageOverlap(prevText, nextText) {
     return next;
 }
 
-function inferVideoSpokenLang(player, doc, win, fallbackLang = '') {
+const ES_HINT_WORDS_RE = /\b(?:el|la|los|las|de|del|en|con|para|por|una|uno|unos|unas|como|este|esta|esto|ese|esa|tu|tus|su|sus|todo|toda|todos|eres|soy|somos|son|que|pero|porque|cuando|donde|quien|siempre|nunca|favor|alma|vida|voz|escucha|historia|resumen|capitulo|explicacion|entrevista|completo|completa|gente|amigos|vamos|quiero|puedes|hacer|tener|saber|verdad|mejor|aqui|ahora|hoy|nuevo|nueva|español|espanol|subtitulos|consciencia|ejercicio|usalo)\b/gi;
+const EN_HINT_WORDS_RE = /\b(?:the|and|with|for|from|this|that|these|those|your|our|their|you|are|was|were|have|has|will|can|not|about|into|through|how|what|why|when|who|official|scene|speech|explained|review)\b/gi;
+const FR_HINT_WORDS_RE = /\b(?:le|les|des|une|dans|pour|avec|vous|nous|est|sont|tout|fait|mais|comment|pourquoi|avec)\b/gi;
+const DE_HINT_WORDS_RE = /\b(?:der|die|das|und|mit|für|von|nicht|ist|sind|wie|was|warum|wenn|ich|wir)\b/gi;
+
+/** Score Spanish/English/French/German text signals conservatively; returns '' on ambiguous titles so Acoustic LID can decide. */
+function detectTextLanguageHint(titleText = '', descText = '') {
+    const t = String(titleText || '').trim();
+    const d = String(descText || '').trim();
+    if (!t && !d) return '';
+    const count = (txt, re, weight) => {
+        if (!txt) return 0;
+        const m = txt.match(re);
+        return m ? m.length * weight : 0;
+    };
+    const esDiacritics = (t.match(/[áéíóúñü¿¡]/gi)?.length || 0) * 2 + (d.match(/[áéíóúñü¿¡]/gi)?.length || 0);
+    const scores = {
+        es: esDiacritics + count(t, ES_HINT_WORDS_RE, 2) + count(d, ES_HINT_WORDS_RE, 1),
+        en: count(t, EN_HINT_WORDS_RE, 2) + count(d, EN_HINT_WORDS_RE, 1),
+        fr: (t.match(/[àâçèêëîïôùûüÿœ]/gi)?.length || 0) * 2 + count(t, FR_HINT_WORDS_RE, 2) + count(d, FR_HINT_WORDS_RE, 1),
+        de: (t.match(/[äöüß]/gi)?.length || 0) * 2 + count(t, DE_HINT_WORDS_RE, 2) + count(d, DE_HINT_WORDS_RE, 1)
+    };
+    const ranked = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+    const [topLang, topScore] = ranked[0];
+    const secondScore = ranked[1]?.[1] || 0;
+    if (topScore >= 2 && topScore >= secondScore + 2) return topLang;
+    return '';
+}
+
+function collectDomVideoTextHints(player, doc, resp) {
+    const titleParts = [
+        resp?.videoDetails?.title,
+        player?.getVideoData?.()?.title,
+        doc?.querySelector?.('ytd-reel-video-renderer[is-active] h2, ytd-reel-video-renderer[is-active] .ytShortsVideoTitleViewModelHost, ytd-reel-video-renderer[is-active] [class*="Title"]')?.textContent,
+        doc?.querySelector?.('ytd-watch-metadata h1, #title h1 yt-formatted-string, .ytp-title-link')?.textContent,
+        doc?.querySelector?.('meta[name="title"]')?.getAttribute?.('content'),
+        doc?.title
+    ];
+    const title = titleParts.find(s => String(s || '').trim() && !/^(?:#?shorts?\s*-\s*)?youtube$/i.test(String(s || '').trim())) || '';
+    const descParts = [
+        resp?.videoDetails?.shortDescription,
+        doc?.querySelector?.('ytd-watch-metadata #description-inline-expander, ytd-reel-video-renderer[is-active] #channel-name')?.textContent
+    ];
+    const desc = descParts.filter(Boolean).join(' ').slice(0, 500);
+    return { title: String(title || '').trim(), desc: String(desc || '').trim() };
+}
+
+function inferVideoSpokenLang(player, doc, win, fallbackLang = '', overrideAudioLang = '') {
+    const manualLang = (overrideAudioLang || readPreferredAiAudioLang(doc)).toLowerCase();
+    if (manualLang && manualLang !== 'auto') {
+        return normalizeBaseLang(manualLang) || manualLang;
+    }
     try {
         const pr = player?.getPlayerResponse?.();
         const initPr = win?.ytInitialPlayerResponse;
@@ -3361,15 +3430,9 @@ function inferVideoSpokenLang(player, doc, win, fallbackLang = '') {
         });
         if (detected) return detected;
 
-        const title = String(resp?.videoDetails?.title || player?.getVideoData?.()?.title || doc?.title || '').trim();
-        if (title) {
-            if (/[áéíóúñ¿¡]|\b(?:el|la|los|las|de|del|en|con|para|por|una|un|como|este|esta|tu|su|voz|alma|vida|escucha)\b/i.test(title)) {
-                return 'es';
-            }
-            if (/\b(?:the|and|with|for|from|scene|movie|clip|official|trailer|how|what|why|when|who|vs|ranking|moments|best|top|full|review|doctor|armor|suit|man|speech)\b/i.test(title)) {
-                return 'en';
-            }
-        }
+        const { title, desc } = collectDomVideoTextHints(player, doc, resp);
+        const hinted = detectTextLanguageHint(title, desc);
+        if (hinted) return hinted;
     } catch {}
     return fallbackLang ? (normalizeBaseLang(fallbackLang) || '') : '';
 }
@@ -3698,6 +3761,7 @@ function startWhisperLiveFallback({
     videoId,
     userLang,
     asrEngine = '',
+    aiAudioLang = '',
     doc,
     win,
     requestFn = gmRequest,
@@ -3709,7 +3773,8 @@ function startWhisperLiveFallback({
     const ctrl = getFallbackCtrl(win);
     const wantBase = normalizeBaseLang(userLang) || 'es';
     const effectiveTargetLang = manualForce ? `-${wantBase}` : wantBase;
-    const spokenLang = inferVideoSpokenLang(player, doc, win, '');
+    const prefAudioLang = (aiAudioLang || readPreferredAiAudioLang(doc) || 'auto');
+    const spokenLang = inferVideoSpokenLang(player, doc, win, '', prefAudioLang);
     const engine = (asrEngine || readPreferredAsrEngine(doc)) === 'whisper' ? 'whisper' : 'sherpa';
 
     if (ctrl.whisperVid === videoId) {
@@ -3723,7 +3788,7 @@ function startWhisperLiveFallback({
                         ? `Subtítulos IA (${ctrl.lastWhisperPct}%)...`
                         : (initialMessage || 'Subtítulos IA escuchando...');
                 ctrl.showWhisperLine?.(msg, 0);
-                dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, spokenLang, asrEngine: engine, manualForce: true });
+                dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, spokenLang, asrEngine: engine, aiAudioLang: prefAudioLang, manualForce: true });
                 syncAiSubtitleButtonState(doc, win);
             }
         }
@@ -3916,6 +3981,13 @@ function startWhisperLiveFallback({
             }
             return;
         }
+        if (d.kind === 'lang_detected') {
+            if (ctrl.whisperManualForce && !ctrl.hasReceivedWhisperCaption) {
+                const langLabel = d.lang === 'es' ? 'Español' : (d.lang === 'en' ? 'Inglés' : String(d.lang || '').toUpperCase());
+                showLine(`Voz detectada (${langLabel}) · activando motor rápido...`, 0);
+            }
+            return;
+        }
         if (d.kind === 'caption') {
             const rawTxt = String(d.raw || '').trim();
             const transTxt = String(d.translated || '').trim();
@@ -3923,14 +3995,16 @@ function startWhisperLiveFallback({
             if (!rawTxt && !transTxt) return;
 
             const alreadyTranslated = Boolean(transTxt && (!rawTxt || transTxt !== rawTxt));
+            const foreignBleedInEs = wantBase === 'es' && (rawTxt.match(/\b(?:the|and|that|this|with|for|you|are|was|were|have|has|what|not|but|they|your|can|will)\b/gi) || []).length >= 2;
             const alreadyInTarget = Boolean(
-                rawTxt && spokenBase && spokenBase === wantBase && isConfirmedTargetLanguage(rawTxt, wantBase)
+                rawTxt && spokenBase && spokenBase === wantBase && !foreignBleedInEs &&
+                (d.engine === 'sherpa' || isConfirmedTargetLanguage(rawTxt, wantBase) || rawTxt.split(/\s+/).length <= 6)
             );
             if (alreadyTranslated || alreadyInTarget) {
                 ctrl.hasReceivedWhisperCaption = true;
                 waitingPlayBanner = false;
                 syncAiSubtitleButtonState(doc, win);
-                showLine(alreadyTranslated ? transTxt : rawTxt, 4500);
+                showLine(alreadyTranslated ? transTxt : rawTxt, 5000);
                 return;
             }
 
@@ -4003,7 +4077,7 @@ function startWhisperLiveFallback({
         if (typeof bridgeWatchdog?.unref === 'function') bridgeWatchdog.unref();
     }
 
-    dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, spokenLang, asrEngine: engine, manualForce: Boolean(manualForce) });
+    dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, spokenLang, asrEngine: engine, aiAudioLang: prefAudioLang, manualForce: Boolean(manualForce) });
     return true;
 }
 
@@ -5923,7 +5997,7 @@ const __supratubeTdExports = (() => {
                 tdUpdateIaMenuItemState(doc, btn, iconWrap, sublabelEl, nowActive);
                 tdShowToast(
                     doc,
-                    nowActive ? '✓ Subtítulos IA activados (traducidos a tu idioma)' : 'Subtítulos IA desactivados',
+                    nowActive ? '✓ Subtítulos IA activados' : 'Subtítulos IA desactivados',
                     'ok'
                 );
             } catch (err) {
@@ -6721,6 +6795,7 @@ function toggleAiSubtitlesForVideo(vid = getVideoId() || S.videoId) {
         videoId: targetVid,
         userLang: lang,
         asrEngine: S.settings?.asrEngine || 'sherpa',
+        aiAudioLang: S.settings?.aiAudioLang || 'auto',
         doc: document,
         win: window,
         requestFn: gmRequest
@@ -7049,16 +7124,24 @@ function boot() {
 
     S._unsubSettings = subscribeSettings(window, document, nextSettings => {
         const prevEngine = S.settings?.asrEngine;
+        const prevAudioLang = S.settings?.aiAudioLang;
         S.settings = nextSettings;
         S._tdCtrl.setEnabled(S.settings.transcriptDownload !== false);
         if (!S.settings.autoSubtitles) {
             clearFallbackCaptions(document, window);
-        } else if (S.videoId && prevEngine && nextSettings?.asrEngine && prevEngine !== nextSettings.asrEngine) {
+        } else if (
+            S.videoId &&
+            (
+                (prevEngine && nextSettings?.asrEngine && prevEngine !== nextSettings.asrEngine) ||
+                ((prevAudioLang || 'auto') !== (nextSettings?.aiAudioLang || 'auto'))
+            )
+        ) {
             restartActiveAiCaptionsIfRunning({
                 player: getPlayer(),
                 videoId: S.videoId,
                 userLang: getEffectiveUserLang(),
                 asrEngine: nextSettings.asrEngine,
+                aiAudioLang: nextSettings.aiAudioLang || 'auto',
                 doc: document,
                 win: window,
                 requestFn: gmRequest

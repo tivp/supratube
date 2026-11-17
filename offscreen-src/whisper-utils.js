@@ -166,7 +166,7 @@ export class LanguageVoter {
                 this.lockedAt = ts;
                 this.redetect = false;
             }
-        } else if (this.streak >= 2 && conf >= 0.5) {
+        } else if ((this.streak >= 2 && conf >= 0.45) || (this.streak >= 1 && conf >= 0.85)) {
             this.locked = lang;
             this.lockedAt = ts;
             this.redetect = false;
@@ -200,59 +200,83 @@ const SHERPA_KROKO_REPOS = Object.freeze({
     }
 });
 
+const SUPPORTED_AI_AUDIO_LANGS = new Set(['auto', 'es', 'en', 'fr', 'de']);
+
 /** Normalize user-selected ASR engine name ('sherpa' streaming or 'whisper' fallback). */
 export function normalizeAsrEngine(engine = 'sherpa') {
     const clean = String(engine || '').trim().toLowerCase();
     return clean === 'whisper' ? 'whisper' : 'sherpa';
 }
 
-/** Select the optimal real-time ASR spec (Sherpa-ONNX Streaming Zipformer or Whisper) for the chosen engine, language, and device. */
+/** Normalize user-selected spoken audio language override ('auto' or ISO code supported for forced transcription). */
+export function normalizeAiAudioLang(lang = 'auto') {
+    const clean = String(lang || '').trim().toLowerCase().split(/[-_]/)[0];
+    return SUPPORTED_AI_AUDIO_LANGS.has(clean) ? clean : 'auto';
+}
+
+/** Whether a base language has a dedicated Sherpa Kroko streaming model. */
+export function hasSherpaLanguageModel(lang = '') {
+    return Boolean(SHERPA_KROKO_REPOS[normBase(lang)]);
+}
+
+/** Select the optimal real-time ASR spec (Sherpa Kroko for confirmed/detected languages, or lightweight Whisper Acoustic Auto-LID when unknown). */
 export function selectRealtimeAsrSpec(spokenLang = '', hasWebGpu = true, preferredEngine = 'sherpa') {
     const engine = normalizeAsrEngine(preferredEngine);
     const base = normBase(spokenLang);
     const gpuDtype = { encoder_model: 'fp32', decoder_model_merged: 'q4' };
 
-    const whisperCandidates = [];
-    if (hasWebGpu) {
-        whisperCandidates.push({
+    const whisperBaseGpu = hasWebGpu
+        ? {
             engine: 'whisper',
             id: 'onnx-community/whisper-base',
             device: 'webgpu',
             dtype: gpuDtype,
             lang: base || null,
             session_options: {}
-        });
-    }
-    whisperCandidates.push({
+        }
+        : null;
+    const whisperTinyWasm = {
         engine: 'whisper',
         id: 'onnx-community/whisper-tiny',
         device: 'wasm',
         dtype: 'q8',
         lang: base || null,
         session_options: { graphOptimizationLevel: 'basic' }
-    });
+    };
+    const whisperCandidates = whisperBaseGpu ? [whisperBaseGpu, whisperTinyWasm] : [whisperTinyWasm];
 
     const candidates = [];
+    let lidAutoPromote = false;
     if (engine === 'sherpa') {
-        const sherpaLang = base || 'en';
-        const kroko = SHERPA_KROKO_REPOS[sherpaLang];
+        const kroko = base ? SHERPA_KROKO_REPOS[base] : null;
         if (kroko) {
             candidates.push({
                 engine: 'sherpa',
                 id: kroko.id,
                 device: 'wasm',
                 dtype: 'int8',
-                lang: sherpaLang,
+                lang: base,
                 files: kroko.files,
                 modelingUnit: 'cjkchar'
             });
+            candidates.push(...whisperCandidates);
+        } else if (!base) {
+            // Unknown spoken language: start lightweight 39MB Whisper-Tiny Acoustic LID to detect Spanish/English/etc.
+            // directly from audio waveform before promoting to Sherpa Kroko.
+            lidAutoPromote = true;
+            candidates.push(whisperTinyWasm);
+            if (whisperBaseGpu) candidates.push(whisperBaseGpu);
+        } else {
+            candidates.push(...whisperCandidates);
         }
+    } else {
+        candidates.push(...whisperCandidates);
     }
-    candidates.push(...whisperCandidates);
 
     return {
         primaryEngine: candidates[0].engine,
         requestedEngine: engine,
+        lidAutoPromote,
         lang: candidates[0].engine === 'sherpa' ? candidates[0].lang : (base || 'auto'),
         candidates
     };

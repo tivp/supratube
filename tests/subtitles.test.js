@@ -20,7 +20,8 @@ import {
     encodeBase64Bytes,
     ensureAiSubtitleButton,
     removeAiSubtitleButtons,
-    startManualAiCaptions
+    startManualAiCaptions,
+    detectTextLanguageHint
 } from '../modules/subtitles.js';
 
 test('detectVideoAudioLang inspects active dubbed audio track first, then default audio, then asr caption', () => {
@@ -2502,4 +2503,107 @@ test('fallback caption overlay is draggable inside Watch and Shorts players, per
 
         clearFallbackCaptions(doc, win);
     }
+});
+
+test('detectTextLanguageHint identifies Spanish Watch/Shorts metadata without mislabeling neutral gaming/podcast titles as English', () => {
+    assert.equal(detectTextLanguageHint('Todo eres tu, Úsalo a tu favor. #jau #rsame #manifestation #fullconcept', ''), 'es');
+    assert.equal(detectTextLanguageHint('Resumen del capitulo para todos en español', ''), 'es');
+    assert.equal(detectTextLanguageHint('Podcast #42 - GTA VI', ''), '');
+    assert.equal(detectTextLanguageHint('How to build an electric motor from scratch', ''), 'en');
+});
+
+test('startManualAiCaptions honors aiAudioLang override and renders Spanish Sherpa captions directly without external HTTP translation', () => {
+    const cmds = [];
+    const reqUrls = [];
+    const elements = new Map();
+    const listeners = new Map();
+    const mk = tag => ({
+        tagName: String(tag || 'div').toUpperCase(),
+        id: '',
+        className: '',
+        textContent: '',
+        children: [],
+        style: {},
+        appendChild: ch => ch,
+        setAttribute() {},
+        getAttribute: () => null,
+        removeAttribute() {},
+        addEventListener() {},
+        removeEventListener() {}
+    });
+    const videoEl = mk('video');
+    const player = {
+        id: 'movie_player',
+        clientWidth: 900,
+        clientHeight: 500,
+        children: [],
+        style: {},
+        getVideoData: () => ({ video_id: 'dQw4w9WgXcQ', title: 'GTA VI Gameplay' }),
+        setAttribute() {},
+        removeAttribute() {},
+        querySelector: sel => (sel === 'video' ? videoEl : (sel === '#supratube-fallback-captions' ? (elements.get('supratube-fallback-captions') || null) : null)),
+        querySelectorAll: () => [],
+        appendChild: ch => { if (ch.id) elements.set(ch.id, ch); return ch; }
+    };
+    const doc = {
+        documentElement: {
+            dataset: {
+                supratubeWhisperBridge: '1',
+                supratubeSettings: JSON.stringify({ asrEngine: 'sherpa', aiAudioLang: 'es' })
+            },
+            setAttribute() {},
+            removeAttribute() {}
+        },
+        head: mk('head'),
+        createElement: tag => {
+            const el = mk(tag);
+            el.appendChild = c => { el.children.push(c); return c; };
+            return el;
+        },
+        getElementById: id => elements.get(id) || null,
+        querySelector: sel => (sel === 'video' ? videoEl : null),
+        querySelectorAll: () => []
+    };
+    const win = {
+        location: { href: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', pathname: '/watch' },
+        CustomEvent: class { constructor(t, i) { this.type = t; this.detail = i?.detail; } },
+        addEventListener: (ev, fn) => {
+            if (!listeners.has(ev)) listeners.set(ev, new Set());
+            listeners.get(ev).add(fn);
+        },
+        removeEventListener: (ev, fn) => listeners.get(ev)?.delete(fn),
+        dispatchEvent: ev => {
+            if (ev?.type === 'supratube-whisper-cmd') cmds.push(ev.detail);
+            for (const fn of [...(listeners.get(ev?.type) || [])]) fn(ev);
+        },
+        setTimeout,
+        clearTimeout
+    };
+
+    const ok = startManualAiCaptions({
+        player,
+        videoId: 'dQw4w9WgXcQ',
+        userLang: 'es',
+        doc,
+        win,
+        requestFn: async url => { reqUrls.push(String(url)); return { status: 200, text: '' }; }
+    });
+    assert.equal(ok, true);
+    assert.equal(cmds[0].spokenLang, 'es');
+    assert.equal(cmds[0].aiAudioLang, 'es');
+
+    // Short Spanish phrase from Sherpa ES renders IMMEDIATELY without hitting translate.googleapis.com:
+    win.dispatchEvent(new win.CustomEvent('supratube-whisper-evt', {
+        detail: {
+            kind: 'caption',
+            videoId: 'dQw4w9WgXcQ',
+            engine: 'sherpa',
+            lang: 'es',
+            raw: 'No preguntes si',
+            translated: 'No preguntes si'
+        }
+    }));
+    assert.equal(reqUrls.length, 0);
+    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'No preguntes si');
+    clearFallbackCaptions(doc, win);
 });

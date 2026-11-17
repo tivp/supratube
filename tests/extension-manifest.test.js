@@ -399,6 +399,9 @@ test('SupraTube branding, simple humane copy, and transparent credits stay consi
     assert.match(popupHtml, /<select[^>]*data-setting="asrEngine"[^>]*>/);
     assert.match(popupHtml, /<option value="sherpa">/);
     assert.match(popupHtml, /<option value="whisper">/);
+    assert.match(popupHtml, /<select[^>]*data-setting="aiAudioLang"[^>]*>/);
+    assert.match(popupHtml, /<option value="auto">/);
+    assert.match(popupHtml, /<option value="es">/);
     assert.doesNotMatch(popupHtml, /moonshine/i);
     assert.equal(fs.existsSync(path.resolve('vendor/sherpa-asr.wasm')), true);
     assert.ok(manifest.host_permissions.includes('https://api.mymemory.translated.net/*'));
@@ -452,11 +455,12 @@ test('background.js retries transient offscreen startup connection errors and ex
     vm.runInNewContext(bg, sandbox, { filename: 'background.js' });
 
     const startRes = await new Promise(resolve => {
-        msgListener({ action: 'SUPRATUBE_WHISPER_START', videoId: 'fEt2anArPb4', targetLang: '-es', asrEngine: 'whisper', manualForce: true }, { tab: { id: 9 } }, resolve);
+        msgListener({ action: 'SUPRATUBE_WHISPER_START', videoId: 'fEt2anArPb4', targetLang: '-es', asrEngine: 'whisper', aiAudioLang: 'es', manualForce: true }, { tab: { id: 9 } }, resolve);
     });
     assert.equal(startRes?.ok, true);
     assert.equal(sendAttempts, 3);
     assert.equal(initPayload?.asrEngine, 'whisper');
+    assert.equal(initPayload?.aiAudioLang, 'es');
 
     const statusRes = await new Promise(resolve => {
         msgListener({ action: 'SUPRATUBE_GET_STATUS' }, {}, resolve);

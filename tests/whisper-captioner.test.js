@@ -7,6 +7,8 @@ import {
     computeLangSoftmax,
     selectRealtimeAsrSpec,
     normalizeAsrEngine,
+    normalizeAiAudioLang,
+    hasSherpaLanguageModel,
     formatStreamingTailText,
     computeAdaptiveSpeechThreshold
 } from '../offscreen-src/whisper-utils.js';
@@ -115,12 +117,17 @@ test('leading dash targetLang (-es) bypasses legacy v1.0.9 shouldAbortForSameLan
     assert.equal(voter.shouldAbortForSameLanguage('-es', false), false);
 });
 
-test('selectRealtimeAsrSpec routes Sherpa Streaming Kroko (with Whisper fallback) vs previous Whisper motor and never exposes Moonshine', () => {
+test('selectRealtimeAsrSpec routes known languages to Sherpa Kroko, uses Acoustic LID when unknown, and honors Whisper choice', () => {
     assert.equal(normalizeAsrEngine('moonshine'), 'sherpa');
     assert.equal(normalizeAsrEngine('whisper'), 'whisper');
+    assert.equal(normalizeAiAudioLang('es-419'), 'es');
+    assert.equal(normalizeAiAudioLang('pt'), 'auto');
+    assert.equal(hasSherpaLanguageModel('es'), true);
+    assert.equal(hasSherpaLanguageModel('ja'), false);
 
     const enSherpa = selectRealtimeAsrSpec('en', true, 'sherpa');
     assert.equal(enSherpa.primaryEngine, 'sherpa');
+    assert.equal(enSherpa.lidAutoPromote, false);
     assert.equal(enSherpa.candidates[0].id, 'csukuangfj/sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06');
     assert.equal(enSherpa.candidates[0].device, 'wasm');
     assert.equal(enSherpa.candidates[1].id, 'onnx-community/whisper-base');
@@ -128,10 +135,19 @@ test('selectRealtimeAsrSpec routes Sherpa Streaming Kroko (with Whisper fallback
 
     const esSherpa = selectRealtimeAsrSpec('es-419', true, 'sherpa');
     assert.equal(esSherpa.primaryEngine, 'sherpa');
+    assert.equal(esSherpa.lidAutoPromote, false);
     assert.equal(esSherpa.candidates[0].id, 'csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06');
+
+    // Unknown spokenLang MUST NOT force English — uses 39MB Whisper-Tiny Acoustic LID then auto-promotes:
+    const autoSherpa = selectRealtimeAsrSpec('', true, 'sherpa');
+    assert.equal(autoSherpa.primaryEngine, 'whisper');
+    assert.equal(autoSherpa.lidAutoPromote, true);
+    assert.equal(autoSherpa.candidates[0].id, 'onnx-community/whisper-tiny');
+    assert.equal(autoSherpa.candidates[0].device, 'wasm');
 
     const jaSherpa = selectRealtimeAsrSpec('ja', true, 'sherpa');
     assert.equal(jaSherpa.primaryEngine, 'whisper');
+    assert.equal(jaSherpa.lidAutoPromote, false);
     assert.equal(jaSherpa.candidates[0].id, 'onnx-community/whisper-base');
 
     const whisperChoice = selectRealtimeAsrSpec('es-419', true, 'whisper');

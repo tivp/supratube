@@ -29,6 +29,7 @@
         auto1080p: true,
         autoSubtitles: true,
         asrEngine: 'sherpa',
+        aiAudioLang: 'auto',
         aiSummary: true,
         transcriptDownload: true
     };
@@ -256,7 +257,7 @@
         return out;
     }
 
-    async function startWhisperCapture({ videoId, targetLang = 'es', spokenLang = '', asrEngine = 'sherpa', manualForce = false }) {
+    async function startWhisperCapture({ videoId, targetLang = 'es', spokenLang = '', asrEngine = 'sherpa', aiAudioLang = 'auto', manualForce = false }) {
         if (!videoId) return;
         const vidEl =
             document.querySelector(`video[data-supratube-whisper-target="${videoId}"]`) ||
@@ -281,6 +282,7 @@
                         targetLang,
                         spokenLang: String(spokenLang || ''),
                         asrEngine: String(asrEngine || 'sherpa'),
+                        aiAudioLang: String(aiAudioLang || 'auto'),
                         manualForce: Boolean(manualForce)
                     },
                     r => resolve(chrome.runtime.lastError ? { ok: false, error: chrome.runtime.lastError.message || 'offscreen unavailable' } : (r || { ok: false }))

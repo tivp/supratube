@@ -168,6 +168,7 @@ function toggleAiSubtitlesForVideo(vid = getVideoId() || S.videoId) {
         videoId: targetVid,
         userLang: lang,
         asrEngine: S.settings?.asrEngine || 'sherpa',
+        aiAudioLang: S.settings?.aiAudioLang || 'auto',
         doc: document,
         win: window,
         requestFn: gmRequest
@@ -496,16 +497,24 @@ function boot() {
 
     S._unsubSettings = subscribeSettings(window, document, nextSettings => {
         const prevEngine = S.settings?.asrEngine;
+        const prevAudioLang = S.settings?.aiAudioLang;
         S.settings = nextSettings;
         S._tdCtrl.setEnabled(S.settings.transcriptDownload !== false);
         if (!S.settings.autoSubtitles) {
             clearFallbackCaptions(document, window);
-        } else if (S.videoId && prevEngine && nextSettings?.asrEngine && prevEngine !== nextSettings.asrEngine) {
+        } else if (
+            S.videoId &&
+            (
+                (prevEngine && nextSettings?.asrEngine && prevEngine !== nextSettings.asrEngine) ||
+                ((prevAudioLang || 'auto') !== (nextSettings?.aiAudioLang || 'auto'))
+            )
+        ) {
             restartActiveAiCaptionsIfRunning({
                 player: getPlayer(),
                 videoId: S.videoId,
                 userLang: getEffectiveUserLang(),
                 asrEngine: nextSettings.asrEngine,
+                aiAudioLang: nextSettings.aiAudioLang || 'auto',
                 doc: document,
                 win: window,
                 requestFn: gmRequest

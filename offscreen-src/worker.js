@@ -7,6 +7,8 @@ import {
     computeLangSoftmax,
     selectRealtimeAsrSpec,
     normalizeAsrEngine,
+    normalizeAiAudioLang,
+    hasSherpaLanguageModel,
     formatStreamingTailText,
     computeAdaptiveSpeechThreshold
 } from './whisper-utils.js';
@@ -93,6 +95,9 @@ let loadingKey = '';
 let activeVideoId = '';
 let targetLang = 'es';
 let requestedSpokenLang = '';
+let requestedAiAudioLang = 'auto';
+let lidAutoPromotePending = false;
+let promoting = false;
 let manualForce = false;
 let stopped = false;
 
@@ -327,13 +332,22 @@ async function initModel(spokenHint = '', enginePref = preferredEngine) {
         gpu = Boolean(navigator.gpu && (await navigator.gpu.requestAdapter()));
     } catch {}
 
-    const spec = selectRealtimeAsrSpec(spokenHint, gpu, enginePref);
-    const desiredKey = `${spec.primaryEngine}:${gpu ? 'webgpu' : 'wasm'}:${spec.lang}`;
+    const effectiveHint = requestedAiAudioLang !== 'auto' ? requestedAiAudioLang : spokenHint;
+    const spec = selectRealtimeAsrSpec(effectiveHint, gpu, enginePref);
+    const desiredKey = `${spec.primaryEngine}:${gpu ? 'webgpu' : 'wasm'}:${spec.lang}:${spec.lidAutoPromote ? 'lid' : 'direct'}`;
     if ((sherpaOnlineRec || model) && loadedKey === desiredKey) {
+        lidAutoPromotePending = Boolean(spec.lidAutoPromote);
         if (activeEngine === 'sherpa' && !sherpaStream) {
             recreateSherpaStream();
         }
-        self.postMessage({ kind: 'ready', videoId: activeVideoId, engine: activeEngine, model: loadedKey });
+        self.postMessage({
+            kind: 'ready',
+            videoId: activeVideoId,
+            engine: activeEngine,
+            lang: activeModelLang || (effectiveHint || 'auto'),
+            lid: lidAutoPromotePending,
+            model: loadedKey
+        });
         return;
     }
     if (loading) {
@@ -344,6 +358,7 @@ async function initModel(spokenHint = '', enginePref = preferredEngine) {
     loadingKey = desiredKey;
     loading = (async () => {
         const t0 = performance.now();
+        lidAutoPromotePending = Boolean(spec.lidAutoPromote);
         disposeSherpaResources();
         if (model) {
             try { await model.dispose?.(); } catch {}
@@ -454,6 +469,8 @@ async function initModel(spokenHint = '', enginePref = preferredEngine) {
                     kind: 'ready',
                     videoId: activeVideoId,
                     engine: activeEngine,
+                    lang: activeModelLang || 'auto',
+                    lid: lidAutoPromotePending,
                     backend: cand.device,
                     model: cand.id,
                     loadMs: Math.round(performance.now() - t0)
@@ -626,6 +643,7 @@ async function flushSherpaCaptionQueue() {
                 kind: 'caption',
                 videoId: item.runVid,
                 mode: item.mode,
+                engine: 'sherpa',
                 raw: item.text,
                 lang: item.lang,
                 locked: item.lang,
@@ -675,8 +693,26 @@ async function processSherpaChunk(pcm, videoTime, runVid) {
     }
 }
 
+async function promoteToDetectedSherpa(runVid, detectedBase) {
+    if (promoting || stopped || runVid !== activeVideoId || preferredEngine !== 'sherpa') return;
+    if (!hasSherpaLanguageModel(detectedBase)) return;
+    promoting = true;
+    try {
+        requestedSpokenLang = detectedBase;
+        resetAudioState(false);
+        self.postMessage({ kind: 'lang_detected', videoId: runVid, lang: detectedBase, engine: 'sherpa' });
+        await initModel(detectedBase, 'sherpa');
+    } catch (err) {
+        if (!stopped && runVid === activeVideoId) {
+            self.postMessage({ kind: 'error', videoId: runVid, error: String(err?.message || err) });
+        }
+    } finally {
+        promoting = false;
+    }
+}
+
 async function maybeInfer(videoTime, runVid) {
-    if (busy || stopped || !model || utteranceStart === null || runVid !== activeVideoId) return;
+    if (busy || promoting || stopped || !model || utteranceStart === null || runVid !== activeVideoId) return;
     const now = total;
     if (lastSpeechEnd <= utteranceStart) return;
     const sinceSpeech = now - lastSpeechEnd;
@@ -694,10 +730,14 @@ async function maybeInfer(videoTime, runVid) {
     }
     if (!mode) return;
 
+    let pendingPromoteLang = '';
     busy = true;
     try {
         const t0 = performance.now();
-        const res = await inferSamples(extractWindow(utteranceStart, end), voter.forcedLanguage());
+        const forced = requestedAiAudioLang !== 'auto'
+            ? requestedAiAudioLang
+            : voter.forcedLanguage();
+        const res = await inferSamples(extractWindow(utteranceStart, end), forced);
         if (stopped || runVid !== activeVideoId) return;
 
         const inferMs = Math.round(performance.now() - t0);
@@ -712,6 +752,14 @@ async function maybeInfer(videoTime, runVid) {
             return;
         }
 
+        if (lidAutoPromotePending && voter.locked && preferredEngine === 'sherpa') {
+            const lockedBase = String(voter.locked || '').split(/[-_]/)[0].toLowerCase();
+            lidAutoPromotePending = false;
+            if (hasSherpaLanguageModel(lockedBase)) {
+                pendingPromoteLang = lockedBase;
+            }
+        }
+
         const filtered = filterWhisperText(res.text);
         const clean = prevCommittedRaw ? (stripCaptionOverlap(prevCommittedRaw, filtered) || filtered) : filtered;
         const translated = clean ? await translateCached(clean, res.lang, targetLang) : '';
@@ -722,6 +770,7 @@ async function maybeInfer(videoTime, runVid) {
                 kind: 'caption',
                 videoId: runVid,
                 mode,
+                engine: 'whisper',
                 raw: clean,
                 lang: res.lang,
                 locked: voter.locked,
@@ -744,6 +793,9 @@ async function maybeInfer(videoTime, runVid) {
         }
     } finally {
         busy = false;
+        if (pendingPromoteLang && !stopped && runVid === activeVideoId) {
+            void promoteToDetectedSherpa(runVid, pendingPromoteLang);
+        }
     }
 }
 
@@ -754,17 +806,22 @@ self.onmessage = async e => {
     if (m.kind === 'INIT') {
         const nextVid = String(m.videoId || '');
         const nextEngine = normalizeAsrEngine(m.asrEngine || preferredEngine);
+        const nextAiAudioLang = normalizeAiAudioLang(m.aiAudioLang || 'auto');
+        const nextSpokenLang = String(m.spokenLang || '').trim().toLowerCase();
         const engineChanged = nextEngine !== preferredEngine;
+        const langChanged = nextAiAudioLang !== requestedAiAudioLang || nextSpokenLang !== requestedSpokenLang;
         preferredEngine = nextEngine;
+        requestedAiAudioLang = nextAiAudioLang;
         const sameActiveVid =
             !stopped &&
             !engineChanged &&
+            !langChanged &&
             Boolean(nextVid) &&
             activeVideoId === nextVid &&
             (chunks.length > 0 || (activeEngine === 'sherpa' && Boolean(sherpaStream)));
         activeVideoId = nextVid;
         targetLang = String(m.targetLang || 'es');
-        requestedSpokenLang = String(m.spokenLang || '').trim().toLowerCase();
+        requestedSpokenLang = nextSpokenLang;
         manualForce = Boolean(m.manualForce);
         stopped = false;
         if (!sameActiveVid) {
