@@ -1,5 +1,15 @@
 import { env, WhisperForConditionalGeneration, AutoProcessor, AutoTokenizer, LogitsProcessor, LogitsProcessorList } from '@huggingface/transformers';
-import { filterWhisperText, stripCaptionOverlap, LanguageVoter, computeLangSoftmax } from './whisper-utils.js';
+import { initASRModule, createOnlineRecognizer, OnlineRecognizerTypes } from '@sherpaw/asr';
+import {
+    filterWhisperText,
+    stripCaptionOverlap,
+    LanguageVoter,
+    computeLangSoftmax,
+    selectRealtimeAsrSpec,
+    normalizeAsrEngine,
+    formatStreamingTailText,
+    computeAdaptiveSpeechThreshold
+} from './whisper-utils.js';
 
 const VENDOR = new URL('./vendor/', self.location.href).href;
 const ASYNCIFY = {
@@ -15,13 +25,15 @@ env.backends.onnx.wasm.wasmPaths = ASYNCIFY;
 
 const SR = 16000;
 const S = sec => Math.round(sec * SR);
-const MIN_FIRST_WINDOW = S(1.0);
-const MAX_WINDOW = S(9);
-const OVERLAP = S(1.0);
-const PAUSE_FINAL = S(0.45);
-const PRE_ROLL = S(0.3);
-const SPEECH_RMS = 0.0025;
-const SPEECH_RMS_HOLD = 0.0015;
+const MIN_FIRST_WINDOW = S(0.85);
+const MAX_WINDOW = S(3.8);
+const OVERLAP = S(0.55);
+const PAUSE_FINAL = S(0.38);
+const PRE_ROLL = S(0.28);
+const INTERIM_STEP = S(0.85);
+const SHERPA_DB_NAME = 'supratube-sherpa-models-v1';
+const SHERPA_STORE = 'files';
+const MYMEMORY_CONTACT = 'supratube.ext.translator@gmail.com';
 
 class LangDetectProcessor extends LogitsProcessor {
     constructor(genCfg, forced) {
@@ -53,14 +65,34 @@ class LangDetectProcessor extends LogitsProcessor {
     }
 }
 
+let activeEngine = '';
+let activeModelLang = 'en';
+let preferredEngine = 'sherpa';
+
 let model = null;
 let processor = null;
 let tokenizer = null;
+
+let sherpaMod = null;
+let sherpaModPromise = null;
+let sherpaOnlineRec = null;
+let sherpaStream = null;
+let sherpaPcmPending = Promise.resolve();
+let sherpaLastPartial = '';
+let sherpaEmitSeq = 0;
+let sherpaTranslating = false;
+let sherpaPendingEmit = null;
+let googleRateLimitedUntil = 0;
+let hpPrevIn = 0;
+let hpPrevOut = 0;
+
 let loadedKey = '';
 let loading = null;
+let loadingKey = '';
 
 let activeVideoId = '';
 let targetLang = 'es';
+let requestedSpokenLang = '';
 let manualForce = false;
 let stopped = false;
 
@@ -74,10 +106,193 @@ let lastInferEnd = 0;
 let prevUtteranceEnd = 0;
 let prevCommittedRaw = '';
 let lastVideoTime = 0;
+let noiseFloor = 0.0015;
 let busy = false;
 
 const voter = new LanguageVoter();
 const transCache = new Map();
+
+function openSherpaDb() {
+    if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+    return new Promise(resolve => {
+        try {
+            const req = indexedDB.open(SHERPA_DB_NAME, 1);
+            req.onupgradeneeded = ev => {
+                const db = ev.target.result;
+                if (!db.objectStoreNames.contains(SHERPA_STORE)) {
+                    db.createObjectStore(SHERPA_STORE);
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => resolve(null);
+        } catch {
+            resolve(null);
+        }
+    });
+}
+
+const IDB_CHUNK_BYTES = 16 * 1024 * 1024;
+
+function idbReq(request) {
+    return new Promise(resolve => {
+        try {
+            request.onsuccess = () => resolve(request.result ?? null);
+            request.onerror = () => resolve(null);
+        } catch {
+            resolve(null);
+        }
+    });
+}
+
+async function idbGetBytes(key) {
+    const db = await openSherpaDb();
+    if (!db) return null;
+    try {
+        const tx = db.transaction([SHERPA_STORE], 'readonly');
+        const store = tx.objectStore(SHERPA_STORE);
+        const meta = await idbReq(store.get(key));
+        if (!meta) return null;
+        if (meta instanceof ArrayBuffer || ArrayBuffer.isView(meta)) {
+            return meta.byteLength <= IDB_CHUNK_BYTES ? new Uint8Array(meta) : null;
+        }
+        const chunkCount = Number(meta.chunkCount) || 0;
+        const totalBytes = Number(meta.totalBytes) || 0;
+        if (chunkCount <= 0 || totalBytes <= 0) return null;
+        const out = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (let i = 0; i < chunkCount; i++) {
+            const part = await idbReq(store.get(`${key}#${i}`));
+            if (!part) return null;
+            const u8 = new Uint8Array(part);
+            if (offset + u8.byteLength > totalBytes) return null;
+            out.set(u8, offset);
+            offset += u8.byteLength;
+        }
+        return offset === totalBytes ? out : null;
+    } catch {
+        return null;
+    }
+}
+
+async function idbPutBytes(key, u8) {
+    const db = await openSherpaDb();
+    if (!db) return;
+    const totalBytes = u8.byteLength;
+    const chunkCount = Math.max(1, Math.ceil(totalBytes / IDB_CHUNK_BYTES));
+    try {
+        for (let i = 0; i < chunkCount; i++) {
+            const start = i * IDB_CHUNK_BYTES;
+            const end = Math.min(totalBytes, start + IDB_CHUNK_BYTES);
+            const sliceBuf = u8.buffer.slice(u8.byteOffset + start, u8.byteOffset + end);
+            await new Promise(resolve => {
+                try {
+                    const tx = db.transaction([SHERPA_STORE], 'readwrite');
+                    tx.objectStore(SHERPA_STORE).put(sliceBuf, `${key}#${i}`);
+                    tx.oncomplete = () => resolve();
+                    tx.onerror = () => resolve();
+                } catch {
+                    resolve();
+                }
+            });
+        }
+        await new Promise(resolve => {
+            try {
+                const tx = db.transaction([SHERPA_STORE], 'readwrite');
+                tx.objectStore(SHERPA_STORE).put({ chunkCount, totalBytes }, key);
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => resolve();
+            } catch {
+                resolve();
+            }
+        });
+    } catch {}
+}
+
+async function fetchHfFileCached(repoId, file, progressCallback) {
+    const cacheKey = `hf:${repoId}:${file}`;
+    const cached = await idbGetBytes(cacheKey);
+    if (cached?.byteLength) {
+        progressCallback({ file, status: 'progress', loaded: cached.byteLength, total: cached.byteLength });
+        progressCallback({ file, status: 'done', loaded: cached.byteLength, total: cached.byteLength });
+        return cached;
+    }
+    const url = `https://huggingface.co/${repoId}/resolve/main/${file}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status} descargando ${repoId}/${file}`);
+    }
+    const lenHdr = Number(resp.headers.get('content-length')) || 0;
+    const reader = resp.body?.getReader?.();
+    if (!reader) {
+        const u8 = new Uint8Array(await resp.arrayBuffer());
+        await idbPutBytes(cacheKey, u8);
+        return u8;
+    }
+    const parts = [];
+    let loaded = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        loaded += value.byteLength;
+        if (lenHdr > 0) {
+            progressCallback({ file, status: 'progress', loaded, total: lenHdr });
+        }
+    }
+    const out = new Uint8Array(loaded);
+    let offset = 0;
+    for (const part of parts) {
+        out.set(part, offset);
+        offset += part.byteLength;
+    }
+    parts.length = 0;
+    progressCallback({ file, status: 'done', loaded, total: loaded || lenHdr });
+    await idbPutBytes(cacheKey, out);
+    return out;
+}
+
+function getSherpaModule() {
+    if (sherpaMod) return Promise.resolve(sherpaMod);
+    if (!sherpaModPromise) {
+        sherpaModPromise = initASRModule().then(mod => {
+            sherpaMod = mod;
+            return mod;
+        }).catch(err => {
+            sherpaModPromise = null;
+            throw err;
+        });
+    }
+    return sherpaModPromise;
+}
+
+function recreateSherpaStream() {
+    if (sherpaStream) {
+        try { sherpaStream.free(); } catch {}
+        sherpaStream = null;
+    }
+    sherpaEmitSeq++;
+    sherpaLastPartial = '';
+    sherpaPendingEmit = null;
+    hpPrevIn = 0;
+    hpPrevOut = 0;
+    if (sherpaOnlineRec) {
+        sherpaStream = sherpaOnlineRec.createStream();
+    }
+}
+
+function disposeSherpaResources() {
+    if (sherpaStream) {
+        try { sherpaStream.free(); } catch {}
+        sherpaStream = null;
+    }
+    if (sherpaOnlineRec) {
+        try { sherpaOnlineRec.free(); } catch {}
+        sherpaOnlineRec = null;
+    }
+    sherpaEmitSeq++;
+    sherpaLastPartial = '';
+    sherpaPendingEmit = null;
+}
 
 function resetAudioState(clearOverlap = true) {
     chunks = [];
@@ -89,7 +304,13 @@ function resetAudioState(clearOverlap = true) {
     lastInferEnd = 0;
     prevUtteranceEnd = 0;
     lastVideoTime = 0;
+    noiseFloor = 0.0015;
+    hpPrevIn = 0;
+    hpPrevOut = 0;
     if (clearOverlap) prevCommittedRaw = '';
+    if (activeEngine === 'sherpa') {
+        recreateSherpaStream();
+    }
 }
 
 function setBoundedTrans(key, val) {
@@ -100,33 +321,39 @@ function setBoundedTrans(key, val) {
     transCache.set(key, val);
 }
 
-async function initModel() {
+async function initModel(spokenHint = '', enginePref = preferredEngine) {
     let gpu = false;
     try {
         gpu = Boolean(navigator.gpu && (await navigator.gpu.requestAdapter()));
     } catch {}
 
-    const desiredKey = gpu ? 'webgpu:base' : 'wasm:tiny';
-    if (model && loadedKey === desiredKey) {
-        self.postMessage({ kind: 'ready', videoId: activeVideoId, model: loadedKey });
+    const spec = selectRealtimeAsrSpec(spokenHint, gpu, enginePref);
+    const desiredKey = `${spec.primaryEngine}:${gpu ? 'webgpu' : 'wasm'}:${spec.lang}`;
+    if ((sherpaOnlineRec || model) && loadedKey === desiredKey) {
+        if (activeEngine === 'sherpa' && !sherpaStream) {
+            recreateSherpaStream();
+        }
+        self.postMessage({ kind: 'ready', videoId: activeVideoId, engine: activeEngine, model: loadedKey });
         return;
     }
-    if (loading) return loading;
+    if (loading) {
+        if (loadingKey === desiredKey) return loading;
+        try { await loading; } catch {}
+    }
 
+    loadingKey = desiredKey;
     loading = (async () => {
         const t0 = performance.now();
-        const attempts = gpu
-            ? [
-                ['onnx-community/whisper-base', 'webgpu', { encoder_model: 'q4', decoder_model_merged: 'q4' }, {}],
-                ['onnx-community/whisper-base', 'webgpu', { encoder_model: 'fp32', decoder_model_merged: 'q4' }, {}],
-                ['onnx-community/whisper-tiny', 'wasm', 'q8', { graphOptimizationLevel: 'basic' }]
-            ]
-            : [
-                ['onnx-community/whisper-tiny', 'wasm', 'q8', { graphOptimizationLevel: 'basic' }]
-            ];
+        disposeSherpaResources();
+        if (model) {
+            try { await model.dispose?.(); } catch {}
+            model = null;
+            processor = null;
+            tokenizer = null;
+        }
 
         let lastErr = null;
-        for (const [id, device, dtype, session_options] of attempts) {
+        for (const cand of spec.candidates) {
             let lastPct = -1;
             const files = new Map();
             const progress_callback = p => {
@@ -157,35 +384,90 @@ async function initModel() {
                     });
                 }
             };
+
             try {
-                env.backends.onnx.wasm.wasmPaths = ASYNCIFY;
-                env.backends.onnx.wasm.numThreads = 1;
-                const m = await WhisperForConditionalGeneration.from_pretrained(id, {
-                    device,
-                    dtype,
-                    session_options,
-                    progress_callback
-                });
-                processor = await AutoProcessor.from_pretrained(id);
-                tokenizer = await AutoTokenizer.from_pretrained(id);
-                model = m;
-                loadedKey = desiredKey;
-                await inferSamples(new Float32Array(SR), null);
+                if (cand.engine === 'sherpa') {
+                    const mod = await getSherpaModule();
+                    const prefix = `sherpa_${cand.lang || 'en'}`;
+                    const vPaths = [];
+                    try {
+                        for (const fname of cand.files) {
+                            const bytes = await fetchHfFileCached(cand.id, fname, progress_callback);
+                            const vPath = `/${prefix}_${fname}`;
+                            try { mod.FS_unlink(vPath); } catch {}
+                            mod.FS_createDataFile('/', `${prefix}_${fname}`, bytes, true, true, true);
+                            vPaths.push(vPath);
+                        }
+                        const cfg = {
+                            type: OnlineRecognizerTypes.Transducer,
+                            featConfig: { sampleRate: SR, featureDim: 80 },
+                            modelConfig: {
+                                transducer: {
+                                    encoder: `/${prefix}_encoder.onnx`,
+                                    decoder: `/${prefix}_decoder.onnx`,
+                                    joiner: `/${prefix}_joiner.onnx`
+                                },
+                                tokens: `/${prefix}_tokens.txt`,
+                                numThreads: 1,
+                                provider: 'cpu',
+                                debug: 0,
+                                modelType: '',
+                                modelingUnit: cand.modelingUnit || 'cjkchar',
+                                bpeVocab: ''
+                            },
+                            decodingMethod: 'greedy_search',
+                            maxActivePaths: 4,
+                            enableEndpoint: 1,
+                            rule1MinTrailingSilence: 1.4,
+                            rule2MinTrailingSilence: 0.7,
+                            rule3MinUtteranceLength: 9
+                        };
+                        sherpaOnlineRec = createOnlineRecognizer(mod, cfg);
+                    } finally {
+                        for (const vp of vPaths) {
+                            try { mod.FS_unlink(vp); } catch {}
+                        }
+                    }
+                    recreateSherpaStream();
+                    activeEngine = 'sherpa';
+                    activeModelLang = cand.lang || 'en';
+                    loadedKey = desiredKey;
+                } else {
+                    env.backends.onnx.wasm.wasmPaths = ASYNCIFY;
+                    env.backends.onnx.wasm.numThreads = 1;
+                    const m = await WhisperForConditionalGeneration.from_pretrained(cand.id, {
+                        device: cand.device,
+                        dtype: cand.dtype,
+                        session_options: cand.session_options,
+                        progress_callback
+                    });
+                    processor = await AutoProcessor.from_pretrained(cand.id);
+                    tokenizer = await AutoTokenizer.from_pretrained(cand.id);
+                    model = m;
+                    activeEngine = 'whisper';
+                    activeModelLang = cand.lang || '';
+                    loadedKey = desiredKey;
+                    await inferSamples(new Float32Array(SR), null);
+                }
+
                 self.postMessage({
                     kind: 'ready',
                     videoId: activeVideoId,
-                    backend: device,
-                    model: id,
+                    engine: activeEngine,
+                    backend: cand.device,
+                    model: cand.id,
                     loadMs: Math.round(performance.now() - t0)
                 });
                 return;
             } catch (err) {
+                disposeSherpaResources();
                 lastErr = err;
             }
         }
         self.postMessage({ kind: 'error', videoId: activeVideoId, error: String(lastErr?.message || lastErr) });
     })().finally(() => {
         loading = null;
+        loadingKey = '';
     });
 
     return loading;
@@ -214,6 +496,17 @@ function extractWindow(from, to) {
         const b = Math.min(to, c.end);
         out.set(c.pcm.subarray(a - c.start, b - c.start), a - from);
     }
+    if (out.length > 0) {
+        let prevIn = out[0];
+        let prevOut = 0;
+        for (let i = 0; i < out.length; i++) {
+            const x = out[i];
+            const y = x - prevIn + 0.96 * prevOut;
+            prevIn = x;
+            prevOut = y;
+            out[i] = y;
+        }
+    }
     let maxAbs = 0;
     for (let i = 0; i < out.length; i++) {
         const abs = Math.abs(out[i]);
@@ -228,49 +521,83 @@ function extractWindow(from, to) {
     return out;
 }
 
+function conditionSherpaChunk(rawPcm) {
+    const out = new Float32Array(rawPcm.length);
+    for (let i = 0; i < rawPcm.length; i++) {
+        const x = rawPcm[i];
+        const y = x - hpPrevIn + 0.96 * hpPrevOut;
+        hpPrevIn = x;
+        hpPrevOut = y;
+        out[i] = y;
+    }
+    let maxAbs = 0;
+    for (let i = 0; i < out.length; i++) {
+        const a = Math.abs(out[i]);
+        if (a > maxAbs) maxAbs = a;
+    }
+    if (maxAbs > 0.004 && maxAbs < 0.2) {
+        const gain = Math.min(4, 0.45 / maxAbs);
+        for (let i = 0; i < out.length; i++) {
+            out[i] = Math.max(-1, Math.min(1, out[i] * gain));
+        }
+    }
+    return out;
+}
+
 async function translateCached(text, from, to) {
     const clean = String(text || '').trim();
     if (!clean) return '';
     const baseFrom = String(from || '').replace(/^[-_]+/, '').split('-')[0].toLowerCase();
     const baseTo = String(to || 'es').replace(/^[-_]+/, '').split('-')[0].toLowerCase();
-    if (!baseTo || baseTo === 'und' || baseTo === 'auto' || (!manualForce && baseFrom && baseFrom === baseTo)) {
+    if (!baseTo || baseTo === 'und' || baseTo === 'auto' || (baseFrom && baseFrom === baseTo)) {
         return clean;
     }
 
     const key = `auto:${baseTo}:${clean}`;
     if (transCache.has(key)) return transCache.get(key);
 
-    for (const client of ['it', 'at', 'gtx']) {
-        try {
-            const gtxUrl = `https://translate.googleapis.com/translate_a/single?client=${client}&sl=auto&tl=${encodeURIComponent(baseTo)}&dt=t&q=${encodeURIComponent(clean)}`;
-            const r = await fetch(gtxUrl);
-            if (r.ok) {
-                const j = await r.json();
-                const joined = Array.isArray(j?.[0]) ? j[0].map(s => s?.[0] || '').join('').trim() : '';
-                if (joined) {
-                    setBoundedTrans(key, joined);
-                    return joined;
+    if (Date.now() >= googleRateLimitedUntil) {
+        let saw429 = false;
+        for (const client of ['it', 'at', 'gtx']) {
+            try {
+                const gtxUrl = `https://translate.googleapis.com/translate_a/single?client=${client}&sl=auto&tl=${encodeURIComponent(baseTo)}&dt=t&q=${encodeURIComponent(clean)}`;
+                const r = await fetch(gtxUrl);
+                if (r.ok) {
+                    const j = await r.json();
+                    const joined = Array.isArray(j?.[0]) ? j[0].map(s => s?.[0] || '').join('').trim() : '';
+                    if (joined) {
+                        setBoundedTrans(key, joined);
+                        return joined;
+                    }
+                } else if (r.status === 429) {
+                    saw429 = true;
                 }
+            } catch {}
+        }
+
+        try {
+            const c5Url = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=${encodeURIComponent(baseTo)}&q=${encodeURIComponent(clean)}`;
+            const r2 = await fetch(c5Url);
+            if (r2.ok) {
+                const j2 = await r2.json();
+                const out = Array.isArray(j2) ? String(j2[0] || '').trim() : String(j2 || '').trim();
+                if (out) {
+                    setBoundedTrans(key, out);
+                    return out;
+                }
+            } else if (r2.status === 429) {
+                saw429 = true;
             }
         } catch {}
+
+        if (saw429) {
+            googleRateLimitedUntil = Date.now() + 60_000;
+        }
     }
 
     try {
-        const c5Url = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=${encodeURIComponent(baseTo)}&q=${encodeURIComponent(clean)}`;
-        const r2 = await fetch(c5Url);
-        if (r2.ok) {
-            const j2 = await r2.json();
-            const out = Array.isArray(j2) ? String(j2[0] || '').trim() : String(j2 || '').trim();
-            if (out) {
-                setBoundedTrans(key, out);
-                return out;
-            }
-        }
-    } catch {}
-
-    try {
         const mmPair = `${baseFrom && baseFrom !== 'auto' ? baseFrom : 'autodetect'}|${baseTo}`;
-        const mmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(clean)}&langpair=${encodeURIComponent(mmPair)}`;
+        const mmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(clean)}&langpair=${encodeURIComponent(mmPair)}&de=${encodeURIComponent(MYMEMORY_CONTACT)}`;
         const r3 = await fetch(mmUrl);
         if (r3.ok) {
             const j3 = await r3.json();
@@ -283,6 +610,69 @@ async function translateCached(text, from, to) {
     } catch {}
 
     return clean;
+}
+
+async function flushSherpaCaptionQueue() {
+    if (sherpaTranslating) return;
+    sherpaTranslating = true;
+    try {
+        while (sherpaPendingEmit) {
+            const item = sherpaPendingEmit;
+            sherpaPendingEmit = null;
+            if (stopped || item.runVid !== activeVideoId || item.seq !== sherpaEmitSeq) continue;
+            const translated = await translateCached(item.text, item.lang, targetLang);
+            if (stopped || item.runVid !== activeVideoId || item.seq !== sherpaEmitSeq) continue;
+            self.postMessage({
+                kind: 'caption',
+                videoId: item.runVid,
+                mode: item.mode,
+                raw: item.text,
+                lang: item.lang,
+                locked: item.lang,
+                translated: translated || item.text,
+                inferMs: item.inferMs,
+                videoTime: item.videoTime
+            });
+        }
+    } finally {
+        sherpaTranslating = false;
+        if (sherpaPendingEmit) {
+            void flushSherpaCaptionQueue();
+        }
+    }
+}
+
+async function processSherpaChunk(pcm, videoTime, runVid) {
+    if (stopped || activeEngine !== 'sherpa' || !sherpaOnlineRec || !sherpaStream || runVid !== activeVideoId) return;
+    const t0 = performance.now();
+    const conditioned = conditionSherpaChunk(pcm);
+    sherpaStream.acceptWaveform(SR, conditioned);
+    while (sherpaOnlineRec.isReady(sherpaStream)) {
+        sherpaOnlineRec.decode(sherpaStream);
+    }
+    const rawResult = String(sherpaOnlineRec.getResult(sherpaStream)?.text || '').trim();
+    const isEndpoint = sherpaOnlineRec.isEndpoint(sherpaStream);
+    const displaySrc = formatStreamingTailText(rawResult, 140);
+    const inferMs = Math.round(performance.now() - t0);
+
+    if (displaySrc && (displaySrc !== sherpaLastPartial || isEndpoint)) {
+        sherpaLastPartial = displaySrc;
+        sherpaPendingEmit = {
+            seq: sherpaEmitSeq,
+            runVid,
+            mode: isEndpoint ? 'final' : 'interim',
+            text: displaySrc,
+            lang: activeModelLang || 'en',
+            inferMs,
+            videoTime
+        };
+        void flushSherpaCaptionQueue();
+    }
+
+    if (isEndpoint && rawResult) {
+        sherpaOnlineRec.reset(sherpaStream);
+        sherpaLastPartial = '';
+    }
 }
 
 async function maybeInfer(videoTime, runVid) {
@@ -299,7 +689,7 @@ async function maybeInfer(videoTime, runVid) {
         end = Math.min(now, lastSpeechEnd + S(0.3));
     } else if (winLen >= MAX_WINDOW) {
         mode = 'cut';
-    } else if (sinceSpeech < PAUSE_FINAL && winLen >= MIN_FIRST_WINDOW && now - lastInferEnd >= S(1.2)) {
+    } else if (sinceSpeech < PAUSE_FINAL && winLen >= MIN_FIRST_WINDOW && now - lastInferEnd >= INTERIM_STEP) {
         mode = 'interim';
     }
     if (!mode) return;
@@ -363,17 +753,26 @@ self.onmessage = async e => {
 
     if (m.kind === 'INIT') {
         const nextVid = String(m.videoId || '');
-        const sameActiveVid = !stopped && Boolean(nextVid) && activeVideoId === nextVid && chunks.length > 0;
+        const nextEngine = normalizeAsrEngine(m.asrEngine || preferredEngine);
+        const engineChanged = nextEngine !== preferredEngine;
+        preferredEngine = nextEngine;
+        const sameActiveVid =
+            !stopped &&
+            !engineChanged &&
+            Boolean(nextVid) &&
+            activeVideoId === nextVid &&
+            (chunks.length > 0 || (activeEngine === 'sherpa' && Boolean(sherpaStream)));
         activeVideoId = nextVid;
         targetLang = String(m.targetLang || 'es');
+        requestedSpokenLang = String(m.spokenLang || '').trim().toLowerCase();
         manualForce = Boolean(m.manualForce);
         stopped = false;
         if (!sameActiveVid) {
             voter.reset();
             resetAudioState(true);
         }
-        await initModel();
-        if (sameActiveVid && model) {
+        await initModel(requestedSpokenLang, preferredEngine);
+        if (sameActiveVid && activeEngine === 'whisper' && model) {
             maybeInfer(lastVideoTime, activeVideoId).catch(err => {
                 if (!stopped && activeVideoId === nextVid) {
                     self.postMessage({ kind: 'error', videoId: nextVid, error: String(err?.message || err) });
@@ -401,10 +800,19 @@ self.onmessage = async e => {
     }
 
     if (m.kind === 'PCM') {
-        if (stopped || !model || !m.videoId || m.videoId !== activeVideoId) return;
+        if (stopped || (!sherpaOnlineRec && !model) || !m.videoId || m.videoId !== activeVideoId) return;
         const pcm = m.pcm instanceof Float32Array ? m.pcm : new Float32Array(m.pcm || []);
         if (!pcm.length) return;
         lastVideoTime = Number(m.videoTime) || 0;
+
+        if (activeEngine === 'sherpa' && sherpaOnlineRec && sherpaStream) {
+            sherpaPcmPending = sherpaPcmPending.then(() => processSherpaChunk(pcm, lastVideoTime, m.videoId)).catch(err => {
+                if (!stopped && m.videoId === activeVideoId) {
+                    self.postMessage({ kind: 'error', videoId: m.videoId, error: String(err?.message || err) });
+                }
+            });
+            return;
+        }
 
         const start = total;
         const end = total + pcm.length;
@@ -412,7 +820,9 @@ self.onmessage = async e => {
         total = end;
 
         const recently = lastSpeechEnd > 0 && end - lastSpeechEnd <= S(0.3);
-        if (m.rms > SPEECH_RMS || (recently && m.rms > SPEECH_RMS_HOLD)) {
+        const vad = computeAdaptiveSpeechThreshold(noiseFloor, m.rms, recently);
+        noiseFloor = vad.nextNoiseFloor;
+        if (vad.isSpeech) {
             if (utteranceStart === null) utteranceStart = Math.max(committed, start - PRE_ROLL);
             lastSpeechEnd = end;
         }

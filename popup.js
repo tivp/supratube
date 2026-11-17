@@ -3,8 +3,9 @@
 import { DEFAULT_SETTINGS } from './modules/config.js';
 
 const SETTINGS_KEY = 'supratube_settings';
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.12';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.13';
 const checkboxes = Array.from(document.querySelectorAll('input[data-setting]'));
+const selects = Array.from(document.querySelectorAll('select[data-setting]'));
 const btnActualizar = document.getElementById('btn-actualizar-scripts');
 const estadoEl = document.getElementById('estado-actualizacion');
 const btnPermiso = document.getElementById('btn-permiso-userscripts');
@@ -17,6 +18,10 @@ function leerTogglesDOM() {
         const key = cb.dataset.setting;
         if (key) out[key] = Boolean(cb.checked);
     }
+    for (const sel of selects) {
+        const key = sel.dataset.setting;
+        if (key) out[key] = sel.value || DEFAULT_SETTINGS[key];
+    }
     return out;
 }
 
@@ -28,6 +33,13 @@ function aplicarTogglesDOM(settings) {
             cb.checked = Boolean(merged[key]);
         }
     }
+    for (const sel of selects) {
+        const key = sel.dataset.setting;
+        if (!key) continue;
+        const val = String(merged[key] || DEFAULT_SETTINGS[key] || '');
+        const hasOption = Array.from(sel.options).some(opt => opt.value === val);
+        sel.value = hasOption ? val : String(DEFAULT_SETTINGS[key] || '');
+    }
 }
 
 chrome.storage.local.get(SETTINGS_KEY, datos => {
@@ -36,8 +48,8 @@ chrome.storage.local.get(SETTINGS_KEY, datos => {
     }
 });
 
-for (const cb of checkboxes) {
-    cb.addEventListener('change', () => {
+for (const el of [...checkboxes, ...selects]) {
+    el.addEventListener('change', () => {
         chrome.storage.local.set({ [SETTINGS_KEY]: leerTogglesDOM() });
     });
 }

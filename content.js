@@ -28,6 +28,7 @@
         greenBar: true,
         auto1080p: true,
         autoSubtitles: true,
+        asrEngine: 'sherpa',
         aiSummary: true,
         transcriptDownload: true
     };
@@ -240,7 +241,22 @@
         return [];
     }
 
-    async function startWhisperCapture({ videoId, targetLang = 'es', manualForce = false }) {
+    function resampleTo16k(input, srcRate) {
+        if (!srcRate || srcRate === 16000) return new Float32Array(input);
+        const ratio = srcRate / 16000;
+        const outLen = Math.max(1, Math.floor(input.length / ratio));
+        const out = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+            const idx = i * ratio;
+            const i0 = Math.floor(idx);
+            const i1 = Math.min(i0 + 1, input.length - 1);
+            const frac = idx - i0;
+            out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+        }
+        return out;
+    }
+
+    async function startWhisperCapture({ videoId, targetLang = 'es', spokenLang = '', asrEngine = 'sherpa', manualForce = false }) {
         if (!videoId) return;
         const vidEl =
             document.querySelector(`video[data-supratube-whisper-target="${videoId}"]`) ||
@@ -259,7 +275,14 @@
         const startRes = await new Promise(resolve => {
             try {
                 chrome.runtime.sendMessage(
-                    { action: 'SUPRATUBE_WHISPER_START', videoId, targetLang, manualForce: Boolean(manualForce) },
+                    {
+                        action: 'SUPRATUBE_WHISPER_START',
+                        videoId,
+                        targetLang,
+                        spokenLang: String(spokenLang || ''),
+                        asrEngine: String(asrEngine || 'sherpa'),
+                        manualForce: Boolean(manualForce)
+                    },
                     r => resolve(chrome.runtime.lastError ? { ok: false, error: chrome.runtime.lastError.message || 'offscreen unavailable' } : (r || { ok: false }))
                 );
             } catch (err) {
@@ -371,8 +394,8 @@
                 len = 0;
                 return;
             }
-            const ch = ev.inputBuffer.getChannelData(0);
-            batch.push(new Float32Array(ch));
+            const ch = resampleTo16k(ev.inputBuffer.getChannelData(0), entry.ctx.sampleRate || 16000);
+            batch.push(ch);
             len += ch.length;
             if (len >= 4000) {
                 const out = new Float32Array(len);

@@ -23,6 +23,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             kind: 'INIT',
             videoId: msg.videoId || '',
             targetLang: msg.targetLang || 'es',
+            spokenLang: msg.spokenLang || '',
+            asrEngine: msg.asrEngine || 'sherpa',
             manualForce: Boolean(msg.manualForce)
         });
         sendResponse({ ok: true });

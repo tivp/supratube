@@ -1822,10 +1822,10 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
         clearInterval
     });
     for (const fn of (cListeners['supratube-whisper-cmd'] || [])) {
-        fn({ detail: { action: 'start', videoId: 'fEt2anArPb4', targetLang: '-es', manualForce: true } });
+        fn({ detail: { action: 'start', videoId: 'fEt2anArPb4', targetLang: '-es', spokenLang: 'en', manualForce: true } });
     }
     await new Promise(r => setTimeout(r, 30));
-    assert.ok(sent.some(m => m.action === 'SUPRATUBE_WHISPER_START' && m.videoId === 'fEt2anArPb4' && m.targetLang === '-es' && m.manualForce === true));
+    assert.ok(sent.some(m => m.action === 'SUPRATUBE_WHISPER_START' && m.videoId === 'fEt2anArPb4' && m.targetLang === '-es' && m.spokenLang === 'en' && m.manualForce === true));
 });
 
 test('manual [IA] survives in-flight auto fallback, keeps paused readiness banner, and translates foreign legacy captions on the fly', async () => {
@@ -2307,6 +2307,7 @@ test('in-page STT detects English audio, translates AI captions to IP language b
     await new Promise(r => setTimeout(r, 40));
     assert.equal(sttBridgeReqs.length, 1);
     assert.equal(sttBridgeReqs[0].language, 'en');
+    assert.equal(sttBridgeReqs[0].modelId, 'onnx-community/whisper-small');
     assert.ok(gtxReqs.some(r => String(r.url).includes('sl=auto') && String(r.url).includes('tl=es')));
     assert.equal(shownHistory.includes('Oh, that is skinny.'), false, 'never flashes untranslated English before Spanish translation');
     assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Oh, eso es muy flaco.');
@@ -2341,6 +2342,164 @@ test('translateCueBatch falls back cleanly through client=it/at/gtx, clients5, a
     assert.ok(seenUrls.some(u => u.includes('client=at')));
     assert.ok(seenUrls.some(u => u.includes('client=gtx')));
     assert.ok(seenUrls.some(u => u.includes('clients5.google.com')));
-    assert.ok(seenUrls.some(u => u.includes('api.mymemory.translated.net') && u.includes('autodetect%7Ces')));
+    assert.ok(seenUrls.some(u => u.includes('api.mymemory.translated.net') && u.includes('autodetect%7Ces') && u.includes('de=')));
     assert.deepEqual(out, ['Como pueden ver estos hombres están fuertemente armados.']);
+});
+
+test('fallback caption overlay is draggable inside Watch and Shorts players, persists coordinates, and blocks video toggle clicks', () => {
+    const store = new Map();
+    const createMockEl = tag => {
+        const listeners = new Map();
+        const attrs = new Map();
+        const el = {
+            tagName: String(tag || 'div').toUpperCase(),
+            id: '',
+            className: '',
+            textContent: '',
+            children: [],
+            style: {},
+            clientWidth: 800,
+            clientHeight: 450,
+            offsetWidth: 220,
+            offsetHeight: 44,
+            appendChild: child => { el.children.push(child); return child; },
+            setAttribute: (k, v) => attrs.set(k, String(v)),
+            getAttribute: k => (attrs.has(k) ? attrs.get(k) : null),
+            removeAttribute: k => attrs.delete(k),
+            addEventListener: (ev, fn) => {
+                if (!listeners.has(ev)) listeners.set(ev, new Set());
+                listeners.get(ev).add(fn);
+            },
+            removeEventListener: (ev, fn) => {
+                listeners.get(ev)?.delete(fn);
+            },
+            emit: (ev, payload = {}) => {
+                for (const fn of [...(listeners.get(ev) || [])]) fn(payload);
+            },
+            getBoundingClientRect: () => {
+                const l = parseFloat(el.style.left);
+                const t = parseFloat(el.style.top);
+                return {
+                    left: Number.isFinite(l) ? l : 290,
+                    top: Number.isFinite(t) ? t : 350,
+                    width: el.offsetWidth,
+                    height: el.offsetHeight
+                };
+            }
+        };
+        return el;
+    };
+
+    for (const [playerId, pathname, testVid] of [['movie_player', '/watch', 'dQw4w9WgXcQ'], ['shorts-player', '/shorts/abc12345678', 'abc12345678']]) {
+        const elements = new Map();
+        const winListeners = new Map();
+        const videoEl = createMockEl('video');
+        let playerClicked = 0;
+        const player = createMockEl('div');
+        player.id = playerId;
+        player.clientWidth = playerId === 'shorts-player' ? 380 : 900;
+        player.clientHeight = playerId === 'shorts-player' ? 680 : 500;
+        player.offsetWidth = player.clientWidth;
+        player.offsetHeight = player.clientHeight;
+        player.getBoundingClientRect = () => ({ left: 0, top: 0, width: player.clientWidth, height: player.clientHeight });
+        player.appendChild = child => {
+            if (child.id) elements.set(child.id, child);
+            player.children.push(child);
+            return child;
+        };
+        player.querySelector = sel => (sel === 'video' ? videoEl : (sel === '#supratube-fallback-captions' ? (elements.get('supratube-fallback-captions') || null) : null));
+        player.addEventListener('click', () => { playerClicked++; });
+
+        const doc = {
+            documentElement: {
+                dataset: { supratubeWhisperBridge: '1', supratubeSettings: JSON.stringify({ asrEngine: 'sherpa' }) },
+                setAttribute() {},
+                removeAttribute() {}
+            },
+            head: createMockEl('head'),
+            createElement: tag => createMockEl(tag),
+            getElementById: id => elements.get(id) || null,
+            querySelector: sel => (sel === 'video' ? videoEl : null),
+            querySelectorAll: () => []
+        };
+        const win = {
+            location: { href: pathname === '/watch' ? `https://www.youtube.com/watch?v=${testVid}` : `https://www.youtube.com/shorts/${testVid}`, pathname },
+            localStorage: {
+                getItem: k => (store.has(k) ? store.get(k) : null),
+                setItem: (k, v) => store.set(k, String(v))
+            },
+            addEventListener: (ev, fn) => {
+                if (!winListeners.has(ev)) winListeners.set(ev, new Set());
+                winListeners.get(ev).add(fn);
+            },
+            removeEventListener: (ev, fn) => {
+                winListeners.get(ev)?.delete(fn);
+            },
+            emit: (ev, payload = {}) => {
+                for (const fn of [...(winListeners.get(ev) || [])]) fn(payload);
+            },
+            dispatchEvent: () => {},
+            setTimeout,
+            clearTimeout
+        };
+
+        startManualAiCaptions({
+            player,
+            videoId: testVid,
+            userLang: 'es',
+            doc,
+            win,
+            requestFn: async () => ({ status: 200, text: '' })
+        });
+        const box = elements.get('supratube-fallback-captions');
+        assert.ok(box, `${playerId} created caption overlay`);
+        assert.equal(box.style.pointerEvents, 'auto');
+        assert.equal(box.style.cursor, 'grab');
+
+        let stoppedClick = false;
+        box.emit('click', { stopPropagation: () => { stoppedClick = true; } });
+        assert.equal(stoppedClick, true);
+        assert.equal(playerClicked, 0);
+
+        let downStopped = false;
+        box.emit('pointerdown', {
+            button: 0,
+            clientX: 120,
+            clientY: 200,
+            stopPropagation: () => { downStopped = true; },
+            preventDefault: () => {}
+        });
+        assert.equal(downStopped, true);
+
+        win.emit('pointermove', { clientX: 60, clientY: 80, stopPropagation: () => {} });
+        win.emit('pointerup', { stopPropagation: () => {} });
+        assert.equal(box.getAttribute('data-supratube-custom-pos'), '1');
+        const draggedLeft = parseFloat(box.style.left);
+        const draggedTop = parseFloat(box.style.top);
+        assert.ok(Number.isFinite(draggedLeft) && draggedLeft >= 4);
+        assert.ok(Number.isFinite(draggedTop) && draggedTop >= 4);
+        assert.equal(box.style.bottom, 'auto');
+
+        // Next video inherits saved dragged position for this player type, until double-click resets it:
+        clearFallbackCaptions(doc, win);
+        win.location.href = pathname === '/watch' ? 'https://www.youtube.com/watch?v=xYz98765432' : 'https://www.youtube.com/shorts/xYz98765432';
+        startManualAiCaptions({
+            player,
+            videoId: 'xYz98765432',
+            userLang: 'es',
+            doc,
+            win,
+            requestFn: async () => ({ status: 200, text: '' })
+        });
+        const nextBox = elements.get('supratube-fallback-captions');
+        assert.equal(nextBox.getAttribute('data-supratube-custom-pos'), '1');
+        assert.equal(parseFloat(nextBox.style.left), draggedLeft);
+        assert.equal(parseFloat(nextBox.style.top), draggedTop);
+
+        nextBox.emit('dblclick', { stopPropagation: () => {}, preventDefault: () => {} });
+        assert.equal(nextBox.getAttribute('data-supratube-custom-pos'), null);
+        assert.equal(nextBox.style.left, '50%');
+
+        clearFallbackCaptions(doc, win);
+    }
 });

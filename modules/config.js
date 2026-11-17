@@ -1,5 +1,5 @@
 export const CFG = Object.freeze({
-    version: '1.0.12',
+    version: '1.0.13',
     sbApi: 'https://sponsor.ajay.app/api/skipSegments',
     sbCacheTTL: 5 * 60 * 1000,
     geoRefreshMs: 24 * 60 * 60 * 1000,
@@ -26,6 +26,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     greenBar: true,
     auto1080p: true,
     autoSubtitles: true,
+    asrEngine: 'sherpa',
     aiSummary: true,
     transcriptDownload: true
 });

@@ -8,7 +8,7 @@ const SYNC_CHECK_KEY = 'supratube_last_sync_check';
 const AUTO_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 const USER_SCRIPT_ID = 'supratube-github-bundle';
 const MATCHES_YOUTUBE = ['https://www.youtube.com/*', 'https://m.youtube.com/*'];
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.12';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.13';
 
 const ORDEN_MODULOS = [
     'config.js',
@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS_SYNC = {
     greenBar: true,
     auto1080p: true,
     autoSubtitles: true,
+    asrEngine: 'sherpa',
     aiSummary: true,
     transcriptDownload: true
 };
@@ -602,6 +603,8 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
             type: 'INIT',
             videoId: activeWhisperVideoId,
             targetLang: mensaje.targetLang || 'es',
+            spokenLang: mensaje.spokenLang || '',
+            asrEngine: mensaje.asrEngine || 'sherpa',
             manualForce: Boolean(mensaje.manualForce)
         })
             .then(() => enviarRespuesta({ ok: true }))

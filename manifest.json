@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "SupraTube",
-    "version": "1.0.12",
+    "version": "1.0.13",
     "description": "Equilibra YouTube conservando lo vanilla: moddea solo lo injusto (anuncios, calidad baja y subtítulos que no se activan).",
     "author": "tivp",
     "icons": {
@@ -34,9 +34,11 @@
         "https://api.github.com/*",
         "https://translate.googleapis.com/*",
         "https://clients5.google.com/*",
+        "https://api.mymemory.translated.net/*",
         "https://huggingface.co/*",
         "https://*.huggingface.co/*",
         "https://*.hf.co/*",
+        "https://*.xethub.hf.co/*",
         "https://cdn-lfs.huggingface.com/*",
         "https://cdn-lfs-us-1.hf.co/*"
     ],

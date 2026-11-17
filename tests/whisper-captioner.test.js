@@ -4,7 +4,11 @@ import {
     filterWhisperText,
     stripCaptionOverlap,
     LanguageVoter,
-    computeLangSoftmax
+    computeLangSoftmax,
+    selectRealtimeAsrSpec,
+    normalizeAsrEngine,
+    formatStreamingTailText,
+    computeAdaptiveSpeechThreshold
 } from '../offscreen-src/whisper-utils.js';
 
 test('filterWhisperText suppresses instrumental single stopwords, hallucinations, and n-gram loops', () => {
@@ -109,4 +113,53 @@ test('leading dash targetLang (-es) bypasses legacy v1.0.9 shouldAbortForSameLan
     // Legacy v1.0.9 caller without manualForce arg (defaults to false) MUST NOT abort when targetLang is '-es':
     assert.equal(voter.shouldAbortForSameLanguage('-es'), false);
     assert.equal(voter.shouldAbortForSameLanguage('-es', false), false);
+});
+
+test('selectRealtimeAsrSpec routes Sherpa Streaming Kroko (with Whisper fallback) vs previous Whisper motor and never exposes Moonshine', () => {
+    assert.equal(normalizeAsrEngine('moonshine'), 'sherpa');
+    assert.equal(normalizeAsrEngine('whisper'), 'whisper');
+
+    const enSherpa = selectRealtimeAsrSpec('en', true, 'sherpa');
+    assert.equal(enSherpa.primaryEngine, 'sherpa');
+    assert.equal(enSherpa.candidates[0].id, 'csukuangfj/sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06');
+    assert.equal(enSherpa.candidates[0].device, 'wasm');
+    assert.equal(enSherpa.candidates[1].id, 'onnx-community/whisper-base');
+    assert.equal(enSherpa.candidates[2].id, 'onnx-community/whisper-tiny');
+
+    const esSherpa = selectRealtimeAsrSpec('es-419', true, 'sherpa');
+    assert.equal(esSherpa.primaryEngine, 'sherpa');
+    assert.equal(esSherpa.candidates[0].id, 'csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06');
+
+    const jaSherpa = selectRealtimeAsrSpec('ja', true, 'sherpa');
+    assert.equal(jaSherpa.primaryEngine, 'whisper');
+    assert.equal(jaSherpa.candidates[0].id, 'onnx-community/whisper-base');
+
+    const whisperChoice = selectRealtimeAsrSpec('es-419', true, 'whisper');
+    assert.equal(whisperChoice.primaryEngine, 'whisper');
+    assert.equal(whisperChoice.candidates[0].id, 'onnx-community/whisper-base');
+    assert.deepEqual(whisperChoice.candidates[0].dtype, { encoder_model: 'fp32', decoder_model_merged: 'q4' });
+    assert.equal(whisperChoice.candidates[1].id, 'onnx-community/whisper-tiny');
+    assert.ok(whisperChoice.candidates.every(c => !/moonshine/i.test(c.engine) && !/moonshine/i.test(c.id)));
+});
+
+test('formatStreamingTailText truncates cleanly on word boundaries without losing trailing speech', () => {
+    assert.equal(formatStreamingTailText('hello   world'), 'hello world');
+    const longText = 'one two three four five six seven eight nine ten eleven twelve';
+    const tail = formatStreamingTailText(longText, 28);
+    assert.ok(tail.length <= 28);
+    assert.ok(tail.endsWith('eleven twelve'));
+});
+
+test('computeAdaptiveSpeechThreshold raises floor gradually during steady background music and detects speech peaks above it', () => {
+    let floor = 0.0015;
+    for (let i = 0; i < 40; i++) {
+        const res = computeAdaptiveSpeechThreshold(floor, 0.007, false);
+        floor = res.nextNoiseFloor;
+    }
+    assert.ok(floor > 0.005 && floor <= 0.008, `noise floor adapted to music bed: ${floor}`);
+    const musicHold = computeAdaptiveSpeechThreshold(floor, 0.0075, true);
+    assert.equal(musicHold.isSpeech, false, 'steady music no longer locks VAD open after adaptation');
+
+    const voicePeak = computeAdaptiveSpeechThreshold(floor, 0.025, false);
+    assert.equal(voicePeak.isSpeech, true, 'clear speech peak above adapted floor triggers VAD');
 });

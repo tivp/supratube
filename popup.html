@@ -63,6 +63,16 @@
             height: 15px;
             cursor: pointer;
         }
+        .toggle-row select {
+            font: 600 11px Arial, sans-serif;
+            color: #1e293b;
+            background: #f8fafc;
+            border: 1px solid #cbd5e1;
+            border-radius: 4px;
+            padding: 3px 6px;
+            max-width: 160px;
+            cursor: pointer;
+        }
         .nota {
             margin-top: 8px;
             padding: 7px 9px;
@@ -145,7 +155,7 @@
         <img src="icons/icon-48.png" alt="SupraTube">
         <div>
             <div class="titulo">SupraTube</div>
-            <div class="version">v1.0.10 · Equilibrio simple y transparente</div>
+            <div class="version">v1.0.13 · Equilibrio simple y transparente</div>
         </div>
     </div>
     <div class="controles">
@@ -168,6 +178,13 @@
         <label class="toggle-row">
             <span>Subtítulos automáticos por IP</span>
             <input type="checkbox" data-setting="autoSubtitles" checked>
+        </label>
+        <label class="toggle-row">
+            <span>Motor IA (en vivo)</span>
+            <select data-setting="asrEngine">
+                <option value="sherpa">Sherpa Streaming (Nuevo)</option>
+                <option value="whisper">Whisper (Anterior)</option>
+            </select>
         </label>
         <label class="toggle-row">
             <span>Botones IA ("Resume de verdad" / "Versión corregida")</span>

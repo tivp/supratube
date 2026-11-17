@@ -837,7 +837,7 @@ async function translateSingleViaClients5(text, sl, tl, requestFn) {
 
 async function translateSingleViaMyMemory(text, sl, tl, requestFn) {
     const src = (!sl || sl === 'auto') ? 'autodetect' : sl;
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(`${src}|${tl}`)}`;
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(`${src}|${tl}`)}&de=${encodeURIComponent('supratube.ext.translator@gmail.com')}`;
     const res = await requestTranslateHttp(url, { method: 'GET', anonymous: true, timeout: 8000 }, requestFn);
     if (res?.status !== 200 || !res.text) return null;
     try {
@@ -1000,6 +1000,231 @@ function hasVisibleNativeCaptions(player) {
     return false;
 }
 
+const CAPTION_POS_STORAGE_KEY = 'supratube_caption_pos_v1';
+
+function readPreferredAsrEngine(doc) {
+    try {
+        const raw = doc?.documentElement?.dataset?.supratubeSettings;
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed?.asrEngine === 'whisper') return 'whisper';
+        }
+    } catch {}
+    return 'sherpa';
+}
+
+function loadSavedCaptionPos(win, isShorts) {
+    try {
+        const raw = win?.localStorage?.getItem?.(CAPTION_POS_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        const slot = parsed?.[isShorts ? 'shorts' : 'watch'];
+        if (!slot || typeof slot.leftPct !== 'number' || typeof slot.topPct !== 'number') return null;
+        if (!Number.isFinite(slot.leftPct) || !Number.isFinite(slot.topPct)) return null;
+        return {
+            leftPct: Math.min(0.95, Math.max(0.01, slot.leftPct)),
+            topPct: Math.min(0.95, Math.max(0.01, slot.topPct))
+        };
+    } catch {
+        return null;
+    }
+}
+
+function saveCaptionPos(win, isShorts, pos) {
+    try {
+        const st = win?.localStorage;
+        if (!st || typeof st.setItem !== 'function') return;
+        let all = {};
+        try {
+            all = JSON.parse(st.getItem(CAPTION_POS_STORAGE_KEY) || '{}') || {};
+        } catch {
+            all = {};
+        }
+        const key = isShorts ? 'shorts' : 'watch';
+        if (pos) all[key] = pos;
+        else delete all[key];
+        st.setItem(CAPTION_POS_STORAGE_KEY, JSON.stringify(all));
+    } catch {}
+}
+
+function applyBoxPositionStyle(box, player, isShorts, savedPos) {
+    if (!box?.style) return;
+    if (savedPos) {
+        const pw = Number(player?.clientWidth) || Number(player?.getBoundingClientRect?.()?.width) || 0;
+        const ph = Number(player?.clientHeight) || Number(player?.getBoundingClientRect?.()?.height) || 0;
+        if (pw > 0 && ph > 0) {
+            const bw = Number(box.offsetWidth) || Number(box.getBoundingClientRect?.()?.width) || 0;
+            const bh = Number(box.offsetHeight) || Number(box.getBoundingClientRect?.()?.height) || 0;
+            const maxL = Math.max(4, pw - bw - 4);
+            const maxT = Math.max(4, ph - bh - 4);
+            const leftPx = Math.max(4, Math.min(maxL, Math.round(savedPos.leftPct * pw)));
+            const topPx = Math.max(4, Math.min(maxT, Math.round(savedPos.topPct * ph)));
+            box.style.left = `${leftPx}px`;
+            box.style.top = `${topPx}px`;
+        } else {
+            box.style.left = `${(savedPos.leftPct * 100).toFixed(2)}%`;
+            box.style.top = `${(savedPos.topPct * 100).toFixed(2)}%`;
+        }
+        box.style.bottom = 'auto';
+        box.style.transform = 'none';
+        box.setAttribute?.('data-supratube-custom-pos', '1');
+        return;
+    }
+    box.style.left = '50%';
+    box.style.top = 'auto';
+    box.style.bottom = isShorts ? '19%' : '11%';
+    box.style.transform = 'translateX(-50%)';
+    box.removeAttribute?.('data-supratube-custom-pos');
+}
+
+function reclampFallbackBoxPosition(box, player, doc, win) {
+    if (!box || box.getAttribute?.('data-supratube-custom-pos') !== '1') return;
+    const isShorts = Boolean(player?.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
+    const pw = Number(player?.clientWidth) || Number(player?.getBoundingClientRect?.()?.width) || 0;
+    const ph = Number(player?.clientHeight) || Number(player?.getBoundingClientRect?.()?.height) || 0;
+    if (pw <= 0 || ph <= 0) {
+        const saved = loadSavedCaptionPos(win, isShorts);
+        if (saved) applyBoxPositionStyle(box, player, isShorts, saved);
+        return;
+    }
+    const bw = Number(box.offsetWidth) || Number(box.getBoundingClientRect?.()?.width) || 0;
+    const bh = Number(box.offsetHeight) || Number(box.getBoundingClientRect?.()?.height) || 0;
+    const curL = parseFloat(box.style.left);
+    const curT = parseFloat(box.style.top);
+    if (Number.isFinite(curL) && Number.isFinite(curT)) {
+        const maxL = Math.max(4, pw - bw - 4);
+        const maxT = Math.max(4, ph - bh - 4);
+        box.style.left = `${Math.max(4, Math.min(maxL, curL))}px`;
+        box.style.top = `${Math.max(4, Math.min(maxT, curT))}px`;
+    }
+}
+
+function bindFallbackBoxDrag(box, player, doc, win) {
+    if (!box || typeof box.addEventListener !== 'function') return;
+    if (box.getAttribute?.('data-supratube-drag-bound') === '1') return;
+    box.setAttribute?.('data-supratube-drag-bound', '1');
+
+    let drag = null;
+    const moveTarget = (win && typeof win.addEventListener === 'function')
+        ? win
+        : (doc && typeof doc.addEventListener === 'function' ? doc : box);
+
+    const setFrameVisible = (active, strong = false) => {
+        if (!box?.style) return;
+        box.style.border = active
+            ? `1px solid rgba(255, 255, 255, ${strong ? '0.65' : '0.35'})`
+            : '1px solid transparent';
+    };
+
+    const onMove = ev => {
+        if (!drag) return;
+        const cx = Number(ev?.clientX);
+        const cy = Number(ev?.clientY);
+        if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+        const dx = cx - drag.startX;
+        const dy = cy - drag.startY;
+        if (Math.abs(dx) > 2 || Math.abs(dy) > 2) drag.moved = true;
+        const nextLeft = Math.max(4, Math.min(drag.maxL, Math.round(drag.origLeft + dx)));
+        const nextTop = Math.max(4, Math.min(drag.maxT, Math.round(drag.origTop + dy)));
+        drag.curLeft = nextLeft;
+        drag.curTop = nextTop;
+        box.style.left = `${nextLeft}px`;
+        box.style.top = `${nextTop}px`;
+        box.style.bottom = 'auto';
+        box.style.transform = 'none';
+        box.style.cursor = 'grabbing';
+        box.setAttribute?.('data-supratube-custom-pos', '1');
+        ev.stopPropagation?.();
+    };
+
+    const onEnd = ev => {
+        if (!drag) return;
+        const finished = drag;
+        drag = null;
+        moveTarget.removeEventListener?.('pointermove', onMove, true);
+        moveTarget.removeEventListener?.('mousemove', onMove, true);
+        moveTarget.removeEventListener?.('pointerup', onEnd, true);
+        moveTarget.removeEventListener?.('pointercancel', onEnd, true);
+        moveTarget.removeEventListener?.('mouseup', onEnd, true);
+        if (box.style) box.style.cursor = 'grab';
+        setFrameVisible(false, false);
+        if (ev?.pointerId != null) {
+            try { box.releasePointerCapture?.(ev.pointerId); } catch {}
+        }
+        if (finished.moved && finished.pw > 0 && finished.ph > 0) {
+            const isShorts = Boolean(player?.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
+            saveCaptionPos(win, isShorts, {
+                leftPct: Math.min(0.95, Math.max(0.01, finished.curLeft / finished.pw)),
+                topPct: Math.min(0.95, Math.max(0.01, finished.curTop / finished.ph))
+            });
+        }
+        ev?.stopPropagation?.();
+    };
+
+    const onStart = ev => {
+        if (drag) return;
+        if (ev?.button !== undefined && ev.button !== 0) return;
+        const cx = Number(ev?.clientX);
+        const cy = Number(ev?.clientY);
+        ev?.stopPropagation?.();
+        ev?.preventDefault?.();
+        if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+
+        const pRect = player?.getBoundingClientRect?.();
+        const bRect = box.getBoundingClientRect?.();
+        const pw = Number(pRect?.width) || Number(player?.clientWidth) || 0;
+        const ph = Number(pRect?.height) || Number(player?.clientHeight) || 0;
+        const bw = Number(bRect?.width) || Number(box.offsetWidth) || 0;
+        const bh = Number(bRect?.height) || Number(box.offsetHeight) || 0;
+        const origLeft = (pRect && bRect)
+            ? (bRect.left - pRect.left)
+            : (parseFloat(box.style.left) || Math.max(4, (pw - bw) / 2));
+        const origTop = (pRect && bRect)
+            ? (bRect.top - pRect.top)
+            : (parseFloat(box.style.top) || Math.max(4, ph - bh - 48));
+
+        drag = {
+            startX: cx,
+            startY: cy,
+            origLeft,
+            origTop,
+            curLeft: origLeft,
+            curTop: origTop,
+            pw,
+            ph,
+            maxL: Math.max(4, pw > 0 ? pw - bw - 4 : origLeft + 800),
+            maxT: Math.max(4, ph > 0 ? ph - bh - 4 : origTop + 600),
+            moved: false
+        };
+        box.style.cursor = 'grabbing';
+        setFrameVisible(true, true);
+        if (ev?.pointerId != null) {
+            try { box.setPointerCapture?.(ev.pointerId); } catch {}
+        }
+        moveTarget.addEventListener?.('pointermove', onMove, true);
+        moveTarget.addEventListener?.('mousemove', onMove, true);
+        moveTarget.addEventListener?.('pointerup', onEnd, true);
+        moveTarget.addEventListener?.('pointercancel', onEnd, true);
+        moveTarget.addEventListener?.('mouseup', onEnd, true);
+    };
+
+    box.addEventListener('pointerenter', () => { if (!drag) setFrameVisible(true, false); });
+    box.addEventListener('mouseenter', () => { if (!drag) setFrameVisible(true, false); });
+    box.addEventListener('pointerleave', () => { if (!drag) setFrameVisible(false, false); });
+    box.addEventListener('mouseleave', () => { if (!drag) setFrameVisible(false, false); });
+    box.addEventListener('pointerdown', onStart);
+    box.addEventListener('mousedown', onStart);
+    box.addEventListener('touchstart', ev => { ev?.stopPropagation?.(); }, { passive: true });
+    box.addEventListener('click', ev => { ev?.stopPropagation?.(); });
+    box.addEventListener('dblclick', ev => {
+        ev?.stopPropagation?.();
+        ev?.preventDefault?.();
+        const isShorts = Boolean(player?.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
+        saveCaptionPos(win, isShorts, null);
+        applyBoxPositionStyle(box, player, isShorts, null);
+    });
+}
+
 function ensureFallbackBox(player, doc, win) {
     if (!player || !doc) return null;
     let box = player.querySelector?.(`#${FALLBACK_BOX_ID}`) || doc.getElementById?.(FALLBACK_BOX_ID);
@@ -1018,15 +1243,23 @@ function ensureFallbackBox(player, doc, win) {
     const fontPx = Math.round(Math.max(isShorts ? 19 : 16, Math.min(isShorts ? 24 : 30, cw * (isShorts ? 0.058 : 0.024))));
     Object.assign(box.style, {
         position: 'absolute',
-        left: '50%',
-        transform: 'translateX(-50%)',
-        bottom: isShorts ? '19%' : '11%',
         width: 'max-content',
         maxWidth: isShorts ? '90%' : '84%',
-        zIndex: '60',
-        pointerEvents: 'none',
+        zIndex: '200',
+        pointerEvents: 'auto',
+        cursor: 'grab',
+        userSelect: 'none',
+        touchAction: 'none',
+        border: '1px solid transparent',
+        borderRadius: '4px',
+        padding: '2px',
         textAlign: 'center'
     });
+    if (box.getAttribute?.('data-supratube-custom-pos') !== '1') {
+        const savedPos = loadSavedCaptionPos(win, isShorts);
+        applyBoxPositionStyle(box, player, isShorts, savedPos);
+    }
+    bindFallbackBoxDrag(box, player, doc, win);
     const segEl = box.children?.[0];
     if (segEl?.style) {
         Object.assign(segEl.style, {
@@ -1282,6 +1515,7 @@ export function startManualAiCaptions({
     player,
     videoId,
     userLang = 'es',
+    asrEngine = '',
     doc = typeof document !== 'undefined' ? document : null,
     win = typeof window !== 'undefined' ? window : null,
     requestFn = gmRequest
@@ -1300,6 +1534,7 @@ export function startManualAiCaptions({
     if (!video) return false;
 
     const baseUser = normalizeBaseLang(userLang) || 'es';
+    const engine = (asrEngine || readPreferredAsrEngine(doc)) === 'whisper' ? 'whisper' : 'sherpa';
     ctrl.sameLangVideos.delete(videoId);
     ctrl.manualForcePendingVid = videoId;
     ctrl.activePlayer = player;
@@ -1319,6 +1554,7 @@ export function startManualAiCaptions({
         video,
         videoId,
         userLang: baseUser,
+        asrEngine: engine,
         doc,
         win,
         requestFn,
@@ -1332,6 +1568,39 @@ export function startManualAiCaptions({
     }
     syncAiSubtitleButtonState(doc, win);
     return ok;
+}
+
+/** Restart active AI live subtitles when the user switches the ASR motor in the popup menu. */
+export function restartActiveAiCaptionsIfRunning({
+    player,
+    videoId,
+    userLang = 'es',
+    asrEngine = '',
+    doc = typeof document !== 'undefined' ? document : null,
+    win = typeof window !== 'undefined' ? window : null,
+    requestFn = gmRequest
+} = {}) {
+    if (!player || !videoId || !doc || !win) return false;
+    const ctrl = getFallbackCtrl(win);
+    if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return false;
+    const wasManual = Boolean(ctrl.whisperManualForce);
+    clearFallbackCaptions(doc, win);
+    if (wasManual) {
+        return startManualAiCaptions({ player, videoId, userLang, asrEngine, doc, win, requestFn });
+    }
+    const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
+    if (!video) return false;
+    return startWhisperLiveFallback({
+        player,
+        video,
+        videoId,
+        userLang: normalizeBaseLang(userLang) || 'es',
+        asrEngine,
+        doc,
+        win,
+        requestFn,
+        manualForce: false
+    });
 }
 
 const UNAVAILABLE_CC_TT_RE = /subt[ií]tulos no disponibles|captions unavailable|subtitles.*unavailable/i;
@@ -1660,6 +1929,7 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
         const segEl = box.children?.[0];
         if (segEl) segEl.textContent = txt;
         box.style.display = txt ? 'block' : 'none';
+        if (txt) reclampFallbackBoxPosition(box, player, doc, win);
     };
 
     const onTime = () => renderTick();
@@ -1734,9 +2004,21 @@ export function cleanInPageWhisperText(raw) {
     return collapsed.length >= t.length * 0.4 ? collapsed : '';
 }
 
-/** Convert peak-normalized Float32Array samples into signed 16-bit PCM. */
+/** Convert high-pass filtered, peak-normalized Float32Array samples into signed 16-bit PCM. */
 export function float32ToPcm16(f32) {
-    const src = f32 instanceof Float32Array ? f32 : new Float32Array(f32 || 0);
+    const raw = f32 instanceof Float32Array ? f32 : new Float32Array(f32 || 0);
+    const src = new Float32Array(raw.length);
+    if (raw.length > 0) {
+        let prevIn = raw[0];
+        let prevOut = 0;
+        for (let i = 0; i < raw.length; i++) {
+            const x = raw[i];
+            const y = x - prevIn + 0.96 * prevOut;
+            prevIn = x;
+            prevOut = y;
+            src[i] = y;
+        }
+    }
     let maxAbs = 0;
     for (let i = 0; i < src.length; i++) {
         const a = Math.abs(src[i]);
@@ -1803,7 +2085,7 @@ export function buildMultipartWav(wavBytes, fieldName = 'files', fileName = 'aud
 }
 
 /** Transcribe a 16kHz PCM16 slice through companion Chan2TXT maximus-bridge-stt DOM bridge when present. */
-export function transcribePcm16ViaMaximusBridge(win, pcm16, lang = 'es', timeoutMs = 45000) {
+export function transcribePcm16ViaMaximusBridge(win, pcm16, lang = 'es', timeoutMs = 45000, modelId = 'onnx-community/whisper-small') {
     return new Promise(resolve => {
         const Ev = typeof win?.CustomEvent === 'function' ? win.CustomEvent : (typeof CustomEvent === 'function' ? CustomEvent : null);
         if (!win || typeof win.dispatchEvent !== 'function' || typeof win.addEventListener !== 'function' || !Ev) {
@@ -1831,81 +2113,98 @@ export function transcribePcm16ViaMaximusBridge(win, pcm16, lang = 'es', timeout
                 op: 'transcribe',
                 pcm16B64: pcm16ToBase64(pcm16),
                 language: lang || 'es',
-                modelId: 'onnx-community/whisper-tiny'
+                modelId: modelId || 'onnx-community/whisper-small'
             }
         }));
     });
 }
 
 let inPageHfSpaceCooldownUntil = 0;
+const HF_GRADIO_SPACES = Object.freeze([
+    'https://hf-audio-whisper-large-v3-turbo.hf.space',
+    'https://hf-audio-whisper-large-v3.hf.space'
+]);
 
-/** Transcribe a 16kHz PCM16 slice via public Hugging Face Gradio Whisper Space as final serverless fallback. */
+async function queryGradioWhisperSpace(base, mp, requestFn, fetchFn) {
+    const upResp = await fetchFn(`${base}/gradio_api/upload`, {
+        method: 'POST',
+        headers: { 'Content-Type': mp.contentType },
+        body: mp.body,
+        credentials: 'omit'
+    });
+    if (!upResp?.ok) {
+        return { ok: false, error: `HF upload HTTP ${upResp?.status || 0}` };
+    }
+    const uploaded = typeof upResp.json === 'function' ? await upResp.json() : JSON.parse(await upResp.text());
+    const serverPath = Array.isArray(uploaded) ? uploaded[0] : '';
+    if (!serverPath) return { ok: false, error: 'HF upload empty' };
+
+    const callBody = JSON.stringify({ data: [{ path: serverPath, meta: { _type: 'gradio.FileData' } }, 'transcribe'] });
+    const callResp = await fetchFn(`${base}/gradio_api/call/transcribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: callBody,
+        credentials: 'omit'
+    });
+    if (!callResp?.ok) {
+        return { ok: false, error: `HF call HTTP ${callResp?.status || 0}` };
+    }
+    const callJson = typeof callResp.json === 'function' ? await callResp.json() : JSON.parse(await callResp.text());
+    const eventId = callJson?.event_id;
+    if (!eventId) return { ok: false, error: 'HF missing event_id' };
+
+    const sseUrl = `${base}/gradio_api/call/transcribe/${eventId}`;
+    let sseText = '';
+    let sseStatus = 0;
+    try {
+        const sseResp = await fetchFn(sseUrl, { method: 'GET', credentials: 'omit' });
+        sseStatus = sseResp?.status || 0;
+        if (sseResp?.ok) sseText = await sseResp.text();
+    } catch {}
+    if (!sseText && typeof requestFn === 'function') {
+        const res = await requestFn(sseUrl, { method: 'GET', anonymous: true, timeout: 45000 }).catch(() => null);
+        sseStatus = res?.status || 0;
+        sseText = res?.text || '';
+    }
+    if (sseStatus !== 200 || !sseText) {
+        return { ok: false, error: `HF stream HTTP ${sseStatus}` };
+    }
+    if (/event:\s*error/i.test(sseText)) {
+        return { ok: false, quotaError: true, error: 'HF ZeroGPU quota exhausted' };
+    }
+    const match = sseText.match(/event:\s*complete[\s\S]*?data:\s*(\[[\s\S]*?\])(?:\n|$)/);
+    if (!match) return { ok: false, error: 'HF stream incomplete' };
+    const arr = JSON.parse(match[1]);
+    return { ok: true, text: String(arr?.[0] || '').trim() };
+}
+
+/** Transcribe a 16kHz PCM16 slice via public Hugging Face Gradio Whisper Spaces as final serverless fallback. */
 export async function transcribePcm16ViaHfSpace(pcm16, requestFn = gmRequest, win = typeof window !== 'undefined' ? window : null) {
     if (Date.now() < inPageHfSpaceCooldownUntil) {
         return { ok: false, error: 'hf_space cooldown' };
     }
-    const base = 'https://hf-audio-whisper-large-v3.hf.space';
     const mp = buildMultipartWav(encodeWavFromPcm16(pcm16, 16000), 'files', 'audio.wav');
     const fetchFn = typeof win?.fetch === 'function' ? win.fetch.bind(win) : (typeof fetch === 'function' ? fetch : null);
     if (!fetchFn) {
         return { ok: false, error: 'fetch unavailable' };
     }
 
-    try {
-        const upResp = await fetchFn(`${base}/gradio_api/upload`, {
-            method: 'POST',
-            headers: { 'Content-Type': mp.contentType },
-            body: mp.body,
-            credentials: 'omit'
-        });
-        if (!upResp?.ok) {
-            return { ok: false, error: `HF upload HTTP ${upResp?.status || 0}` };
-        }
-        const uploaded = typeof upResp.json === 'function' ? await upResp.json() : JSON.parse(await upResp.text());
-        const serverPath = Array.isArray(uploaded) ? uploaded[0] : '';
-        if (!serverPath) return { ok: false, error: 'HF upload empty' };
-
-        const callBody = JSON.stringify({ data: [{ path: serverPath, meta: { _type: 'gradio.FileData' } }, 'transcribe'] });
-        const callResp = await fetchFn(`${base}/gradio_api/call/transcribe`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: callBody,
-            credentials: 'omit'
-        });
-        if (!callResp?.ok) {
-            return { ok: false, error: `HF call HTTP ${callResp?.status || 0}` };
-        }
-        const callJson = typeof callResp.json === 'function' ? await callResp.json() : JSON.parse(await callResp.text());
-        const eventId = callJson?.event_id;
-        if (!eventId) return { ok: false, error: 'HF missing event_id' };
-
-        const sseUrl = `${base}/gradio_api/call/transcribe/${eventId}`;
-        let sseText = '';
-        let sseStatus = 0;
+    let lastErr = 'HF Space error';
+    let quotaHits = 0;
+    for (let i = 0; i < HF_GRADIO_SPACES.length; i++) {
         try {
-            const sseResp = await fetchFn(sseUrl, { method: 'GET', credentials: 'omit' });
-            sseStatus = sseResp?.status || 0;
-            if (sseResp?.ok) sseText = await sseResp.text();
-        } catch {}
-        if (!sseText && typeof requestFn === 'function') {
-            const res = await requestFn(sseUrl, { method: 'GET', anonymous: true, timeout: 45000 }).catch(() => null);
-            sseStatus = res?.status || 0;
-            sseText = res?.text || '';
+            const res = await queryGradioWhisperSpace(HF_GRADIO_SPACES[i], mp, requestFn, fetchFn);
+            if (res?.ok) return res;
+            if (res?.quotaError) quotaHits++;
+            if (res?.error) lastErr = res.error;
+        } catch (err) {
+            lastErr = String(err?.message || err || 'HF Space error');
         }
-        if (sseStatus !== 200 || !sseText) {
-            return { ok: false, error: `HF stream HTTP ${sseStatus}` };
-        }
-        if (/event:\s*error/i.test(sseText)) {
-            inPageHfSpaceCooldownUntil = Date.now() + 15 * 60 * 1000;
-            return { ok: false, error: 'HF ZeroGPU quota exhausted' };
-        }
-        const match = sseText.match(/event:\s*complete[\s\S]*?data:\s*(\[[\s\S]*?\])(?:\n|$)/);
-        if (!match) return { ok: false, error: 'HF stream incomplete' };
-        const arr = JSON.parse(match[1]);
-        return { ok: true, text: String(arr?.[0] || '').trim() };
-    } catch (err) {
-        return { ok: false, error: String(err?.message || err || 'HF Space error') };
     }
+    if (quotaHits === HF_GRADIO_SPACES.length) {
+        inPageHfSpaceCooldownUntil = Date.now() + 15 * 60 * 1000;
+    }
+    return { ok: false, error: lastErr };
 }
 
 function downsampleFloat32To16k(input, srcRate) {
@@ -1925,7 +2224,30 @@ function downsampleFloat32To16k(input, srcRate) {
 
 const aiLineTransCache = new Map();
 
-function inferVideoSpokenLang(player, doc, win, fallbackLang = 'es') {
+function stripInPageOverlap(prevText, nextText) {
+    const prev = String(prevText || '').trim();
+    const next = String(nextText || '').trim();
+    if (!prev || !next) return next;
+    const norm = w => String(w || '').toLowerCase().replace(/[\p{P}\p{S}]/gu, '');
+    const pw = prev.split(/\s+/);
+    const nw = next.split(/\s+/);
+    const maxK = Math.min(10, pw.length, nw.length);
+    for (let k = maxK; k >= 1; k--) {
+        let match = true;
+        for (let j = 0; j < k; j++) {
+            const a = norm(pw[pw.length - k + j]);
+            const b = norm(nw[j]);
+            if (!a || a !== b) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return nw.slice(k).join(' ').trim();
+    }
+    return next;
+}
+
+function inferVideoSpokenLang(player, doc, win, fallbackLang = '') {
     try {
         const pr = player?.getPlayerResponse?.();
         const initPr = win?.ytInitialPlayerResponse;
@@ -1955,7 +2277,7 @@ function inferVideoSpokenLang(player, doc, win, fallbackLang = 'es') {
             }
         }
     } catch {}
-    return normalizeBaseLang(fallbackLang) || 'es';
+    return fallbackLang ? (normalizeBaseLang(fallbackLang) || '') : '';
 }
 
 function isConfirmedTargetLanguage(text, wantBase) {
@@ -2029,17 +2351,17 @@ function startInPageSttFallback({
     let transSeq = 0;
 
     const SR = 16000;
-    const MIN_SPEECH = Math.round(SR * 1.6);
-    const MAX_WINDOW = Math.round(SR * 4.5);
-    const PAUSE_END = Math.round(SR * 0.45);
-    const OVERLAP = Math.round(SR * 0.4);
-    const RMS_START = 0.0025;
-    const RMS_HOLD = 0.0015;
+    const MIN_SPEECH = Math.round(SR * 1.1);
+    const MAX_WINDOW = Math.round(SR * 3.4);
+    const PAUSE_END = Math.round(SR * 0.38);
+    const OVERLAP = Math.round(SR * 0.45);
 
     let buf = [];
     let totalSamples = 0;
     let speechEndSample = -1;
     let winStartSample = null;
+    let noiseFloor = 0.0015;
+    let prevRawLine = '';
     let zeroBatches = 0;
 
     const readTracks = () => {
@@ -2098,9 +2420,13 @@ function startInPageSttFallback({
 
             const cleaned = cleanInPageWhisperText(res?.text || '');
             if (!cleaned) return;
+            const spokenForLine = isCut && prevRawLine
+                ? (stripInPageOverlap(prevRawLine, cleaned) || cleaned)
+                : cleaned;
+            prevRawLine = isCut ? cleaned : '';
 
             const mySeq = ++transSeq;
-            const finalLine = await translateAiTextImmediate(cleaned, wantBase, requestFn, spokenLang);
+            const finalLine = await translateAiTextImmediate(spokenForLine, wantBase, requestFn, spokenLang);
             if (
                 stopped ||
                 mySeq !== transSeq ||
@@ -2114,7 +2440,7 @@ function startInPageSttFallback({
 
             ctrl.hasReceivedWhisperCaption = true;
             syncAiSubtitleButtonState(doc, win);
-            showLine(finalLine || cleaned, 5000);
+            showLine(finalLine || spokenForLine, 5000);
         } finally {
             busy = false;
         }
@@ -2205,7 +2531,14 @@ function startInPageSttFallback({
             totalSamples = end;
 
             const recent = speechEndSample > 0 && end - speechEndSample <= Math.round(SR * 0.3);
-            if (rms > RMS_START || (recent && rms > RMS_HOLD)) {
+            const clampedFloor = Math.min(0.015, Math.max(0.0012, noiseFloor));
+            const startThresh = Math.max(0.0032, clampedFloor * 2.2);
+            const holdThresh = Math.max(0.0020, clampedFloor * 1.45);
+            const isSpeech = rms > startThresh || (recent && rms > holdThresh);
+            if (!isSpeech || rms <= 0.015) {
+                noiseFloor = Math.min(0.015, Math.max(0.0012, clampedFloor * 0.94 + rms * 0.06));
+            }
+            if (isSpeech) {
                 if (winStartSample === null) winStartSample = Math.max(0, start - Math.round(SR * 0.25));
                 speechEndSample = end;
             }
@@ -2270,6 +2603,7 @@ function startWhisperLiveFallback({
     video,
     videoId,
     userLang,
+    asrEngine = '',
     doc,
     win,
     requestFn = gmRequest,
@@ -2281,6 +2615,8 @@ function startWhisperLiveFallback({
     const ctrl = getFallbackCtrl(win);
     const wantBase = normalizeBaseLang(userLang) || 'es';
     const effectiveTargetLang = manualForce ? `-${wantBase}` : wantBase;
+    const spokenLang = inferVideoSpokenLang(player, doc, win, '');
+    const engine = (asrEngine || readPreferredAsrEngine(doc)) === 'whisper' ? 'whisper' : 'sherpa';
 
     if (ctrl.whisperVid === videoId) {
         if (manualForce) {
@@ -2293,7 +2629,7 @@ function startWhisperLiveFallback({
                         ? `Subtítulos IA (${ctrl.lastWhisperPct}%)...`
                         : (initialMessage || 'Subtítulos IA escuchando...');
                 ctrl.showWhisperLine?.(msg, 0);
-                dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, manualForce: true });
+                dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, spokenLang, asrEngine: engine, manualForce: true });
                 syncAiSubtitleButtonState(doc, win);
             }
         }
@@ -2338,6 +2674,7 @@ function startWhisperLiveFallback({
         const segEl = box.children?.[0];
         if (segEl) segEl.textContent = text;
         box.style.display = text ? 'block' : 'none';
+        if (text) reclampFallbackBoxPosition(box, player, doc, win);
         clearTimeout(fadeTimer);
         if (text && autoFadeMs > 0) {
             fadeTimer = setTimeout(() => {
@@ -2572,7 +2909,7 @@ function startWhisperLiveFallback({
         if (typeof bridgeWatchdog?.unref === 'function') bridgeWatchdog.unref();
     }
 
-    dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, manualForce: Boolean(manualForce) });
+    dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, spokenLang, asrEngine: engine, manualForce: Boolean(manualForce) });
     return true;
 }
 

@@ -180,3 +180,106 @@ export class LanguageVoter {
         return Boolean(lockedBase && targetBase && lockedBase === targetBase);
     }
 }
+
+const SHERPA_KROKO_REPOS = Object.freeze({
+    en: {
+        id: 'csukuangfj/sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06',
+        files: ['encoder.onnx', 'decoder.onnx', 'joiner.onnx', 'tokens.txt']
+    },
+    es: {
+        id: 'csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06',
+        files: ['encoder.onnx', 'decoder.onnx', 'joiner.onnx', 'tokens.txt']
+    },
+    fr: {
+        id: 'csukuangfj/sherpa-onnx-streaming-zipformer-fr-kroko-2025-08-06',
+        files: ['encoder.onnx', 'decoder.onnx', 'joiner.onnx', 'tokens.txt']
+    },
+    de: {
+        id: 'csukuangfj/sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06',
+        files: ['encoder.onnx', 'decoder.onnx', 'joiner.onnx', 'tokens.txt']
+    }
+});
+
+/** Normalize user-selected ASR engine name ('sherpa' streaming or 'whisper' fallback). */
+export function normalizeAsrEngine(engine = 'sherpa') {
+    const clean = String(engine || '').trim().toLowerCase();
+    return clean === 'whisper' ? 'whisper' : 'sherpa';
+}
+
+/** Select the optimal real-time ASR spec (Sherpa-ONNX Streaming Zipformer or Whisper) for the chosen engine, language, and device. */
+export function selectRealtimeAsrSpec(spokenLang = '', hasWebGpu = true, preferredEngine = 'sherpa') {
+    const engine = normalizeAsrEngine(preferredEngine);
+    const base = normBase(spokenLang);
+    const gpuDtype = { encoder_model: 'fp32', decoder_model_merged: 'q4' };
+
+    const whisperCandidates = [];
+    if (hasWebGpu) {
+        whisperCandidates.push({
+            engine: 'whisper',
+            id: 'onnx-community/whisper-base',
+            device: 'webgpu',
+            dtype: gpuDtype,
+            lang: base || null,
+            session_options: {}
+        });
+    }
+    whisperCandidates.push({
+        engine: 'whisper',
+        id: 'onnx-community/whisper-tiny',
+        device: 'wasm',
+        dtype: 'q8',
+        lang: base || null,
+        session_options: { graphOptimizationLevel: 'basic' }
+    });
+
+    const candidates = [];
+    if (engine === 'sherpa') {
+        const sherpaLang = base || 'en';
+        const kroko = SHERPA_KROKO_REPOS[sherpaLang];
+        if (kroko) {
+            candidates.push({
+                engine: 'sherpa',
+                id: kroko.id,
+                device: 'wasm',
+                dtype: 'int8',
+                lang: sherpaLang,
+                files: kroko.files,
+                modelingUnit: 'cjkchar'
+            });
+        }
+    }
+    candidates.push(...whisperCandidates);
+
+    return {
+        primaryEngine: candidates[0].engine,
+        requestedEngine: engine,
+        lang: candidates[0].engine === 'sherpa' ? candidates[0].lang : (base || 'auto'),
+        candidates
+    };
+}
+
+/** Keep streaming Zipformer partial text readable in 1-2 lines without losing sentence endings. */
+export function formatStreamingTailText(rawText = '', maxChars = 135) {
+    const clean = String(rawText || '').replace(/\s+/g, ' ').trim();
+    if (!clean || clean.length <= maxChars) return clean;
+    const tail = clean.slice(-maxChars);
+    const firstSpace = tail.indexOf(' ');
+    return (firstSpace > 0 && firstSpace < tail.length - 12 ? tail.slice(firstSpace + 1) : tail).trim();
+}
+
+/** Adaptive noise-floor speech detector that separates voice from background music/ambience. */
+export function computeAdaptiveSpeechThreshold(noiseFloor = 0.0015, rms = 0, recentlyActive = false) {
+    const clampedFloor = Math.min(0.015, Math.max(0.0012, Number(noiseFloor) || 0.0015));
+    const startThreshold = Math.max(0.0032, clampedFloor * 2.2);
+    const holdThreshold = Math.max(0.0020, clampedFloor * 1.45);
+    const isSpeech = rms > startThreshold || (recentlyActive && rms > holdThreshold);
+    let nextNoiseFloor = clampedFloor;
+    if (!isSpeech) {
+        nextNoiseFloor = clampedFloor * 0.94 + rms * 0.06;
+    } else if (rms <= 0.015) {
+        // Steady music/ambience slightly above floor still slowly adapts the bed without chasing loud speech.
+        nextNoiseFloor = clampedFloor * 0.94 + rms * 0.06;
+    }
+    nextNoiseFloor = Math.min(0.015, Math.max(0.0012, nextNoiseFloor));
+    return { isSpeech, nextNoiseFloor, startThreshold, holdThreshold };
+}

@@ -64,7 +64,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.12' }),
+                getManifest: () => ({ version: '1.0.13' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -107,7 +107,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
     const storeData = {
         supratube_last_sync_check: Date.now() - (20 * 60 * 1000),
         supratube_github_cache: {
-            extVersion: '1.0.12',
+            extVersion: '1.0.13',
             sha: 'sha_old',
             modulos: modMap,
             codigoCompilado: compileBundle(modMap)
@@ -117,7 +117,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.12' }),
+                getManifest: () => ({ version: '1.0.13' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -192,7 +192,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.12' }),
+                getManifest: () => ({ version: '1.0.13' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -369,7 +369,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
                 return { ok: true, json: async () => ({ sha: 'sha_old_109', commit: { message: 'v1.0.9' } }) };
             }
             if (url.includes('/modules/config.js')) {
-                return { ok: true, text: async () => modMap['config.js'].replace("version: '1.0.12'", "version: '1.0.9'") };
+                return { ok: true, text: async () => modMap['config.js'].replace("version: '1.0.13'", "version: '1.0.9'") };
             }
             return { ok: false, status: 500 };
         }
@@ -396,6 +396,12 @@ test('SupraTube branding, simple humane copy, and transparent credits stay consi
     assert.match(popupHtml, /<div class="titulo">SupraTube<\/div>/);
     assert.doesNotMatch(popupHtml, /Maximus Motor/i);
     assert.match(popupHtml, /Gemini 4 Hydrogen Extra/);
+    assert.match(popupHtml, /<select[^>]*data-setting="asrEngine"[^>]*>/);
+    assert.match(popupHtml, /<option value="sherpa">/);
+    assert.match(popupHtml, /<option value="whisper">/);
+    assert.doesNotMatch(popupHtml, /moonshine/i);
+    assert.equal(fs.existsSync(path.resolve('vendor/sherpa-asr.wasm')), true);
+    assert.ok(manifest.host_permissions.includes('https://api.mymemory.translated.net/*'));
 
     assert.match(readme, /^#\s+SupraTube/m);
     assert.match(readme, /conserven?d?o lo vanilla|conservando lo vanilla/i);
@@ -409,11 +415,12 @@ test('background.js retries transient offscreen startup connection errors and ex
     const bg = fs.readFileSync(path.resolve('background.js'), 'utf8');
     let msgListener = null;
     let sendAttempts = 0;
+    let initPayload = null;
     const sandbox = {
         chrome: {
             runtime: {
                 id: 'ext_test',
-                getManifest: () => ({ version: '1.0.12' }),
+                getManifest: () => ({ version: '1.0.13' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener: fn => { msgListener = fn; } },
@@ -421,6 +428,7 @@ test('background.js retries transient offscreen startup connection errors and ex
                 sendMessage: async payload => {
                     if (payload?.target === 'offscreen' && payload?.type === 'INIT') {
                         sendAttempts++;
+                        initPayload = payload;
                         if (sendAttempts < 3) {
                             throw new Error('Could not establish connection. Receiving end does not exist.');
                         }
@@ -444,14 +452,15 @@ test('background.js retries transient offscreen startup connection errors and ex
     vm.runInNewContext(bg, sandbox, { filename: 'background.js' });
 
     const startRes = await new Promise(resolve => {
-        msgListener({ action: 'SUPRATUBE_WHISPER_START', videoId: 'fEt2anArPb4', targetLang: '-es', manualForce: true }, { tab: { id: 9 } }, resolve);
+        msgListener({ action: 'SUPRATUBE_WHISPER_START', videoId: 'fEt2anArPb4', targetLang: '-es', asrEngine: 'whisper', manualForce: true }, { tab: { id: 9 } }, resolve);
     });
     assert.equal(startRes?.ok, true);
     assert.equal(sendAttempts, 3);
+    assert.equal(initPayload?.asrEngine, 'whisper');
 
     const statusRes = await new Promise(resolve => {
         msgListener({ action: 'SUPRATUBE_GET_STATUS' }, {}, resolve);
     });
     assert.equal(statusRes?.ok, true);
-    assert.equal(statusRes?.swVersion, '1.0.12');
+    assert.equal(statusRes?.swVersion, '1.0.13');
 });
