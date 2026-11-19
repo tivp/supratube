@@ -363,6 +363,19 @@ export function isFallbackCaptionsActive(win = typeof window !== 'undefined' ? w
     return ctrl.activeVid === videoId || ctrl.whisperVid === videoId;
 }
 
+/** Return true while manual AI captions (Whisper or manual overlay) are active for videoId. */
+export function isManualAiCaptionsActive(win = typeof window !== 'undefined' ? window : null, videoId = '') {
+    const ctrl = getFallbackCtrl(win);
+    if (!videoId) {
+        return Boolean((ctrl.whisperVid && ctrl.whisperManualForce) || (ctrl.activeVid && ctrl.manualOverlayActive) || ctrl.manualForcePendingVid);
+    }
+    return Boolean(
+        (ctrl.whisperVid === videoId && ctrl.whisperManualForce) ||
+        (ctrl.activeVid === videoId && ctrl.manualOverlayActive) ||
+        ctrl.manualForcePendingVid === videoId
+    );
+}
+
 function setBoundedCache(map, key, value, limit = 20) {
     if (map.has(key)) map.delete(key);
     while (map.size >= limit) {
@@ -988,6 +1001,26 @@ function getActiveVideoIdSafe(player, win) {
     return player?.getVideoData?.()?.video_id || getVideoId(win?.location?.href || '');
 }
 
+function isVideoStillActive(player, win, videoId) {
+    if (!videoId) return false;
+    const urlVid = getVideoId(win?.location?.href || '');
+    const playerVid = player?.getVideoData?.()?.video_id || '';
+    if (urlVid && urlVid === videoId) return true;
+    if (playerVid && playerVid === videoId && (!urlVid || urlVid === videoId)) return true;
+    return !urlVid && !playerVid;
+}
+
+function resolveActiveVideoElement(player, doc) {
+    return (
+        player?.querySelector?.('video.html5-main-video') ||
+        player?.querySelector?.('video') ||
+        doc?.querySelector?.('ytd-reel-video-renderer[is-active] video') ||
+        doc?.querySelector?.('#shorts-player video') ||
+        doc?.querySelector?.('video') ||
+        null
+    );
+}
+
 function hasVisibleNativeCaptions(player) {
     if (!player?.querySelectorAll) return false;
     if (player.getAttribute?.('data-supratube-ai-subs-active') === '1') return false;
@@ -1253,6 +1286,11 @@ function ensureFallbackBox(player, doc, win) {
         span.className = 'supratube-caption-segment';
         span.setAttribute('data-supratube-seg', '1');
         box.appendChild(span);
+        player.appendChild?.(box);
+    } else if (
+        (box.parentElement && box.parentElement !== player) ||
+        (box.parentNode && box.parentNode !== player)
+    ) {
         player.appendChild?.(box);
     }
     const isShorts = Boolean(player.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
@@ -1549,7 +1587,7 @@ export function startManualAiCaptions({
         return false;
     }
 
-    const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
+    const video = resolveActiveVideoElement(player, doc);
     if (!video) return false;
 
     const baseUser = normalizeBaseLang(userLang) || 'es';
@@ -1615,7 +1653,7 @@ export function restartActiveAiCaptionsIfRunning({
     if (wasManual) {
         return startManualAiCaptions({ player, videoId, userLang, asrEngine, aiAudioLang, doc, win, requestFn });
     }
-    const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
+    const video = resolveActiveVideoElement(player, doc);
     if (!video) return false;
     return startWhisperLiveFallback({
         player,
@@ -1972,8 +2010,7 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
 
     const renderTick = () => {
         if (ctrl.activeVid !== videoId) return;
-        const curVid = getActiveVideoIdSafe(player, win);
-        if (curVid && curVid !== videoId) {
+        if (!isVideoStillActive(player, win, videoId)) {
             clearFallbackCaptions(doc, win);
             return;
         }
@@ -2767,6 +2804,12 @@ function startWhisperLiveFallback({
     ctrl.hasReceivedWhisperCaption = false;
     ctrl.lastWhisperPct = 0;
     ctrl.forceOverlay = true;
+    try {
+        const oldTargets = doc?.querySelectorAll?.('[data-supratube-whisper-target]') || [];
+        for (let i = 0; i < oldTargets.length; i++) {
+            if (oldTargets[i] !== video) oldTargets[i]?.removeAttribute?.('data-supratube-whisper-target');
+        }
+    } catch {}
     video?.setAttribute?.('data-supratube-whisper-target', videoId);
     syncWhisperCcButtonVisual(player, doc, win, ctrl, true);
     syncAiSubtitleButtonState(doc, win);
@@ -2780,8 +2823,7 @@ function startWhisperLiveFallback({
 
     const showLine = (text, autoFadeMs = 0) => {
         if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
-        const curVid = getActiveVideoIdSafe(player, win);
-        if ((curVid && curVid !== videoId) || (!ctrl.whisperManualForce && hasVisibleNativeCaptions(player))) {
+        if (!isVideoStillActive(player, win, videoId) || (!ctrl.whisperManualForce && hasVisibleNativeCaptions(player))) {
             clearFallbackCaptions(doc, win);
             return;
         }
@@ -3060,9 +3102,9 @@ async function renderRecoveredOverlaySegments({
     const alreadyInTarget = Boolean(recovered?.alreadyTranslated) || (segLang && segLang === targetBase);
 
     const prepareOverlay = () => {
+        if (ctrl.whisperVid === videoId && ctrl.whisperManualForce) return false;
         if (manualOverlay && ctrl.hasReceivedWhisperCaption) return false;
-        if (manualOverlay || (ctrl.whisperVid === videoId && ctrl.whisperManualForce)) {
-            const wasManual = Boolean(manualOverlay || ctrl.whisperManualForce);
+        if (manualOverlay) {
             if (ctrl.hasReceivedWhisperCaption) return false;
             if (typeof ctrl.stopWhisper === 'function') {
                 try { ctrl.stopWhisper(); } catch {}
@@ -3070,7 +3112,7 @@ async function renderRecoveredOverlaySegments({
             }
             ctrl.whisperVid = null;
             ctrl.whisperManualForce = false;
-            ctrl.manualOverlayActive = wasManual;
+            ctrl.manualOverlayActive = true;
         }
         ctrl.forceOverlay = Boolean(forceOverlay);
         return true;
@@ -3145,14 +3187,15 @@ async function runFallbackSubtitles({
     manualForce = false
 }) {
     const ctrl = getFallbackCtrl(win);
-    if (ctrl.sameLangVideos.has(videoId) && !manualForce && !ctrl.whisperManualForce) return;
+    if (ctrl.whisperVid === videoId && ctrl.whisperManualForce) return;
+    if (ctrl.sameLangVideos.has(videoId) && !manualForce) return;
     if (ctrl.activeVid === videoId && !manualForce) return;
     if (ctrl.inflightVid === videoId) {
         if (manualForce) ctrl.manualForcePendingVid = videoId;
         return;
     }
     if (hasVisibleNativeCaptions(player)) return;
-    const video = player?.querySelector?.('video') || doc?.querySelector?.('video');
+    const video = resolveActiveVideoElement(player, doc);
     if (!video) return;
 
     ctrl.inflightVid = videoId;
@@ -3168,6 +3211,7 @@ async function runFallbackSubtitles({
         }
 
         const recovered = await obtainRawSegmentsForVideo(videoId, win, { userLang: targetBase, captionTracks, doc, requestFn });
+        if (ctrl.whisperVid === videoId && ctrl.whisperManualForce) return;
         const forced = Boolean(manualForce || ctrl.manualForcePendingVid === videoId || ctrl.whisperManualForce);
         if (ctrl.manualForcePendingVid === videoId) ctrl.manualForcePendingVid = null;
         const segments = recovered?.segments || [];
@@ -3223,7 +3267,8 @@ function armFallbackWatchdog({ player, decision, videoId, userLang, captionTrack
         if (ctrl.activeVid === videoId || ctrl.inflightVid === videoId) return;
         if (getActiveVideoIdSafe(player, win) !== videoId) return;
         if (hasVisibleNativeCaptions(player)) return;
-        if (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn() === false) return;
+        const isShorts = Boolean(player?.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
+        if (!isShorts && typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn() === false) return;
         runFallbackSubtitles({
             player,
             videoId,
@@ -3257,12 +3302,38 @@ function armFallbackWatchdog({ player, decision, videoId, userLang, captionTrack
 }
 
 function isShortsCaptionMenuClick(target) {
-    const popup = target?.closest?.('ytd-popup-container, tp-yt-iron-dropdown, .ytp-settings-menu');
+    const el = target?.nodeType === 3 ? target.parentElement : target;
+    if (!el?.closest) return false;
+    if (el.closest(`[data-supratube-ia-menu-item="1"], [data-supratube-td-item="1"], #${IA_CC_BTN_ID}, .${IA_CC_BTN_ID}`)) {
+        return false;
+    }
+    const popup = el.closest('ytd-popup-container, tp-yt-iron-dropdown, .ytp-settings-menu');
     if (!popup) return false;
-    const item = target.closest('yt-list-item-view-model, [role="menuitemradio"], [role="menuitem"], tp-yt-paper-item, .ytp-menuitem');
+    const item = el.closest('yt-list-item-view-model, [role="menuitemradio"], [role="menuitem"], tp-yt-paper-item, .ytp-menuitem');
     if (!item) return false;
-    const popupText = popup.textContent || '';
-    return /subt[ií]tulos|captions|traducir autom[aá]ticamente|traducción autom[aá]tica|auto-translate/i.test(popupText);
+    if (
+        item.getAttribute?.('data-supratube-ia-menu-item') === '1' ||
+        item.getAttribute?.('data-supratube-td-item') === '1' ||
+        item.querySelector?.('[data-supratube-ia-menu-item="1"], [data-supratube-td-item="1"]')
+    ) {
+        return false;
+    }
+    const itemText = String(item.textContent || '').trim();
+    const captionRe = /subt[ií]tulos|captions|subtitles|traducir autom[aá]ticamente|traducción autom[aá]tica|auto-translate/i;
+    if (captionRe.test(itemText)) return true;
+
+    const header = popup.querySelector?.('.ytContextualSheetLayoutHeaderContainer, .ytp-panel-title, yt-panel-header-view-model');
+    const headerText = String(header?.textContent || '').trim();
+    if (headerText) {
+        return captionRe.test(headerText);
+    }
+    if (
+        (item.getAttribute?.('role') === 'menuitemradio' || item.hasAttribute?.('aria-checked')) &&
+        !/^(?:0\.\d+|1\.\d+|2(?:\.0+)?|normal)(?:x)?$/i.test(itemText)
+    ) {
+        return captionRe.test(popup.textContent || '');
+    }
+    return false;
 }
 
 export function bindManualCaptionListeners(
@@ -3298,11 +3369,9 @@ export function bindManualCaptionListeners(
             (ev.target?.closest?.('.ytp-subtitles-button') && !ev.target?.closest?.(`#${IA_CC_BTN_ID}`)) ||
             isDisabledCcClick(ev);
         if (clickedNormalCc || isShortsCaptionMenuClick(ev.target)) {
-            if (clickedNormalCc) {
-                const ctrl = getFallbackCtrl(win);
-                if (ctrl.whisperVid || ctrl.manualOverlayActive) {
-                    clearFallbackCaptions(doc, win);
-                }
+            const ctrl = getFallbackCtrl(win);
+            if (ctrl.whisperVid || ctrl.manualOverlayActive) {
+                clearFallbackCaptions(doc, win);
             }
             clearAutoFlag();
         }

@@ -262,6 +262,7 @@
         const vidEl =
             document.querySelector(`video[data-supratube-whisper-target="${videoId}"]`) ||
             document.querySelector('ytd-reel-video-renderer[is-active] video') ||
+            document.querySelector('#shorts-player video') ||
             document.querySelector('video.html5-main-video') ||
             document.querySelector('video');
         if (!vidEl) return;
@@ -309,6 +310,9 @@
             try { if (!entry.usedMediaElement) entry.ctx?.close?.(); } catch {}
             captureByVideo.delete(vidEl);
             entry = null;
+        }
+        if (entry) {
+            refreshEntryAudioSource(vidEl, entry, true);
         }
         if (!entry) {
             const aTracks = await waitAudioTracks(vidEl, token, videoId);

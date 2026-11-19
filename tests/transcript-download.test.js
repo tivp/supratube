@@ -14,7 +14,16 @@ import {
     TD_HEROICON_SVG_URL,
     TD_HEROICON_FALLBACK_URL
 } from '../modules/transcript-download.js';
-import { getTtState } from '../modules/subtitles.js';
+import {
+    getTtState,
+    bindManualCaptionListeners,
+    applySmartSubtitles,
+    startManualAiCaptions,
+    clearFallbackCaptions,
+    isFallbackCaptionsActive,
+    isManualAiCaptionsActive
+} from '../modules/subtitles.js';
+import { selectActivePlayer } from '../modules/utils.js';
 
 function createMenuFakeDom({ pathname = '/shorts/KBIKtrmM80Y', search = '', videoTitle = 'Doctor Who Short' } = {}) {
     class ClassList {
@@ -648,4 +657,218 @@ test('controller injects Descargar transcripción in Shorts root dropdown (not s
     wCtrl.destroy();
     assert.equal(wDoc.querySelectorAll('[data-supratube-td-item="1"]').length, 0);
     assert.equal(wDoc.querySelectorAll(`[${TD_IA_ITEM_ATTR}="1"]`).length, 0);
+});
+
+test('Shorts Subtítulos IA survives capture-phase bindManualCaptionListeners, prefers #shorts-player over #movie_player, and ignores unrelated Shorts menu items', async () => {
+    const { doc, win } = createMenuFakeDom({ pathname: '/shorts/sHoRtId1234', videoTitle: 'BBC Doctor Who Short' });
+    doc.documentElement.dataset.supratubeWhisperBridge = '1';
+    doc.documentElement.dataset.supratubeSettings = JSON.stringify({ asrEngine: 'turbo', aiAudioLang: 'auto' });
+
+    const docCaptureClicks = [];
+    const origDocAdd = doc.addEventListener.bind(doc);
+    doc.addEventListener = (type, fn, opts) => {
+        origDocAdd(type, fn);
+        const cap = opts === true || Boolean(opts && typeof opts === 'object' && opts.capture);
+        if (type === 'click' && cap) docCaptureClicks.push(fn);
+    };
+
+    const winListeners = new Map();
+    const whisperCmds = [];
+    win.CustomEvent = class {
+        constructor(type, init = {}) {
+            this.type = type;
+            this.detail = init.detail;
+        }
+    };
+    win.addEventListener = (type, fn) => {
+        if (!winListeners.has(type)) winListeners.set(type, new Set());
+        winListeners.get(type).add(fn);
+    };
+    win.removeEventListener = (type, fn) => {
+        winListeners.get(type)?.delete(fn);
+    };
+    win.dispatchEvent = ev => {
+        if (ev?.type === 'supratube-whisper-cmd') whisperCmds.push(ev.detail);
+        for (const fn of [...(winListeners.get(ev?.type) || [])]) fn(ev);
+    };
+
+    // Simulate leftover hidden #movie_player from previous /watch navigation + active #shorts-player.
+    const watchPlayer = doc.createElement('div');
+    watchPlayer.id = 'movie_player';
+    watchPlayer.getVideoData = () => ({ video_id: 'sHoRtId1234' });
+    doc.body.appendChild(watchPlayer);
+
+    const reel = doc.createElement('ytd-reel-video-renderer');
+    reel.setAttribute('is-active', '');
+    const shortsPlayer = doc.createElement('div');
+    shortsPlayer.id = 'shorts-player';
+    shortsPlayer.clientWidth = 380;
+    shortsPlayer.clientHeight = 680;
+    let toggleCalls = 0;
+    let nativeSubsOn = false;
+    shortsPlayer.isSubtitlesOn = () => nativeSubsOn;
+    shortsPlayer.toggleSubtitles = () => {
+        toggleCalls++;
+        nativeSubsOn = !nativeSubsOn;
+    };
+    shortsPlayer.setOption = () => {};
+    shortsPlayer.unloadModule = () => {};
+    // Lagging player video_id (still previous Short) while URL is already /shorts/sHoRtId1234.
+    shortsPlayer.getVideoData = () => ({ video_id: 'prevShort99' });
+    shortsPlayer.getPlayerResponse = () => ({
+        videoDetails: { videoId: 'sHoRtId1234', defaultAudioLanguage: 'en', title: 'BBC Clip' }
+    });
+    const shortsVideo = doc.createElement('video');
+    shortsVideo.paused = false;
+    shortsPlayer.appendChild(shortsVideo);
+    reel.appendChild(shortsPlayer);
+    doc.body.appendChild(reel);
+
+    const selected = selectActivePlayer(doc, win.location.pathname, 'sHoRtId1234');
+    assert.equal(selected, shortsPlayer);
+
+    // Build Shorts 3-dots popup matching YouTube UI from screenshot.
+    const sheet = doc.createElement('yt-sheet-view-model');
+    const header = doc.createElement('div');
+    header.className = 'ytContextualSheetLayoutHeaderContainer';
+    const list = doc.createElement('yt-list-view-model');
+    list.setAttribute('role', 'menu');
+    const menuItems = {};
+    for (const label of ['Descripción', 'Modo ambiente', 'Subtítulos', 'Denunciar']) {
+        const it = doc.createElement('yt-list-item-view-model');
+        it.setAttribute('role', 'menuitem');
+        const span = doc.createElement('span');
+        span.className = 'ytListItemViewModelTitle';
+        span.textContent = label;
+        it.appendChild(span);
+        list.appendChild(it);
+        menuItems[label] = it;
+    }
+    sheet.appendChild(header);
+    sheet.appendChild(list);
+    const shortsDd = doc.createElement('tp-yt-iron-dropdown');
+    shortsDd.appendChild(sheet);
+    doc.body.appendChild(shortsDd);
+
+    // Bind capture-phase manual caption listeners with the exact main.js 60ms callback behavior.
+    doc.__supratubeCapListenerBound = false;
+    let currentVid = 'sHoRtId1234';
+    bindManualCaptionListeners(doc, win, null, () => {
+        const vid = currentVid;
+        if (isFallbackCaptionsActive(win, vid)) {
+            clearFallbackCaptions(doc, win);
+            return;
+        }
+        const wasNativeOn = Boolean(shortsPlayer.isSubtitlesOn());
+        setTimeout(() => {
+            if (isManualAiCaptionsActive(win, vid)) return;
+            const nowOn = Boolean(shortsPlayer.isSubtitlesOn());
+            if (!wasNativeOn && !nowOn) {
+                applySmartSubtitles(shortsPlayer, {
+                    enabled: true,
+                    userLang: 'es',
+                    expectedVideoId: vid,
+                    doc,
+                    win,
+                    manualForce: true
+                }).catch(() => {});
+            } else if (!nowOn) {
+                clearFallbackCaptions(doc, win);
+            }
+        }, 60);
+    });
+
+    const tdCtrl = createTranscriptDownloadController({
+        doc,
+        win,
+        getUserLang: () => 'es',
+        requestFn: async () => ({
+            status: 200,
+            text: JSON.stringify({ sentences: [{ trans: 'Hola desde el Short en vivo.' }] })
+        }),
+        onToggleAiSubtitles: ({ videoId, userLang }) =>
+            startManualAiCaptions({
+                player: selectActivePlayer(doc, win.location.pathname, videoId),
+                videoId,
+                userLang,
+                doc,
+                win,
+                requestFn: async () => ({
+                    status: 200,
+                    text: JSON.stringify({ sentences: [{ trans: 'Hola desde el Short en vivo.' }] })
+                })
+            })
+    });
+    tdCtrl.setEnabled(true);
+    tdCtrl.scan();
+
+    const iaBtn = shortsDd.querySelector(`[${TD_IA_ITEM_ATTR}="1"]`);
+    const iaLabel = iaBtn?.querySelector('.supratube-td-label');
+    assert.ok(iaBtn && iaLabel);
+
+    const simulateTrustedClick = target => {
+        const ev = {
+            type: 'click',
+            isTrusted: true,
+            target,
+            clientX: 720,
+            clientY: 280,
+            preventDefault() {},
+            stopPropagation() {}
+        };
+        for (const fn of docCaptureClicks) fn(ev);
+        let cur = target;
+        while (cur) {
+            cur.dispatchEvent?.(ev);
+            cur = cur.parentElement;
+        }
+    };
+
+    // Click inside the nested label span of [IA] Subtítulos IA -> starts AI captions without triggering manual-caption kill switch.
+    simulateTrustedClick(iaLabel);
+    await new Promise(r => setTimeout(r, 120));
+
+    assert.equal(isManualAiCaptionsActive(win, 'sHoRtId1234'), true);
+    assert.equal(isFallbackCaptionsActive(win, 'sHoRtId1234'), true);
+    assert.equal(whisperCmds.filter(c => c.action === 'stop').length, 0);
+    const startCmd = whisperCmds.find(c => c.action === 'start');
+    assert.equal(startCmd?.videoId, 'sHoRtId1234');
+    assert.equal(startCmd?.asrEngine, 'turbo');
+    assert.equal(shortsPlayer.getAttribute('data-supratube-ai-subs-active'), '1');
+
+    const box = shortsPlayer.querySelector('#supratube-fallback-captions');
+    assert.ok(box, 'overlay must mount inside #shorts-player, not #movie_player');
+    assert.equal(watchPlayer.querySelector('#supratube-fallback-captions'), null);
+
+    // Emitting a live caption event renders inside #shorts-player even while player.getVideoData() still lags behind.
+    win.dispatchEvent(new win.CustomEvent('supratube-whisper-evt', {
+        detail: {
+            kind: 'caption',
+            videoId: 'sHoRtId1234',
+            mode: 'final',
+            engine: 'whisper',
+            lang: 'en',
+            raw: 'Hello from live Short.',
+            translated: 'Hola desde el Short en vivo.'
+        }
+    }));
+    assert.equal(box.children[0]?.textContent, 'Hola desde el Short en vivo.');
+    assert.equal(box.style.display, 'block');
+
+    // Clicking unrelated items in the Shorts root 3-dots menu (e.g. Descripción) must NOT kill AI captions.
+    simulateTrustedClick(menuItems['Descripción'].children[0]);
+    await new Promise(r => setTimeout(r, 80));
+    assert.equal(isManualAiCaptionsActive(win, 'sHoRtId1234'), true);
+    assert.equal(shortsPlayer.querySelector('#supratube-fallback-captions')?.children[0]?.textContent, 'Hola desde el Short en vivo.');
+
+    // Clicking the native Subtítulos item in the Shorts 3-dots menu DOES turn off AI captions cleanly.
+    simulateTrustedClick(menuItems['Subtítulos'].children[0]);
+    assert.equal(isManualAiCaptionsActive(win, 'sHoRtId1234'), false);
+    assert.equal(isFallbackCaptionsActive(win, 'sHoRtId1234'), false);
+    assert.equal(shortsPlayer.querySelector('#supratube-fallback-captions'), null);
+    assert.equal(toggleCalls, 0);
+
+    await new Promise(r => setTimeout(r, 200));
+    tdCtrl.destroy();
+    clearFallbackCaptions(doc, win);
 });

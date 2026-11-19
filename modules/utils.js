@@ -22,7 +22,9 @@ export function selectActivePlayer(doc, hrefOrPath = '', expectedVideoId = '') {
         ? [
               doc.querySelector?.('ytd-reel-video-renderer[is-active] #shorts-player'),
               doc.getElementById?.('shorts-player'),
+              doc.querySelector?.('ytd-shorts #shorts-player'),
               doc.querySelector?.('ytd-reel-video-renderer[is-active] .html5-video-player'),
+              doc.querySelector?.('ytd-shorts .html5-video-player'),
               doc.getElementById?.('movie_player'),
               doc.querySelector?.('.html5-video-player')
           ]
@@ -32,7 +34,13 @@ export function selectActivePlayer(doc, hrefOrPath = '', expectedVideoId = '') {
               doc.querySelector?.('.html5-video-player')
           ];
 
-    const unique = candidates.filter((p, i) => p && p.isConnected !== false && candidates.indexOf(p) === i);
+    let unique = candidates.filter((p, i) => p && p.isConnected !== false && candidates.indexOf(p) === i);
+    if (onShorts) {
+        const nonWatchPlayers = unique.filter(p => p.id !== 'movie_player');
+        if (nonWatchPlayers.length) {
+            unique = nonWatchPlayers;
+        }
+    }
     if (expectedVideoId) {
         const matched = unique.find(p => p.getVideoData?.()?.video_id === expectedVideoId);
         if (matched) return matched;

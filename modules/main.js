@@ -10,6 +10,7 @@ import {
     installTimedtextMonitor,
     clearFallbackCaptions,
     isFallbackCaptionsActive,
+    isManualAiCaptionsActive,
     detectVideoAudioLang,
     ensureAiSubtitleButton,
     removeAiSubtitleButtons,
@@ -75,7 +76,7 @@ const S = {
 };
 
 function getPlayer() {
-    const selected = selectActivePlayer(document, location.pathname, S.videoId);
+    const selected = selectActivePlayer(document, location.pathname, getVideoId() || S.videoId);
     if (selected) {
         if (S._player !== selected) {
             S._player = selected;
@@ -160,6 +161,10 @@ function getEffectiveUserLang() {
 
 function toggleAiSubtitlesForVideo(vid = getVideoId() || S.videoId) {
     const targetVid = vid || getVideoId() || S.videoId;
+    if (targetVid && S.videoId !== targetVid) {
+        S.videoId = targetVid;
+        S.lastUrl = location.href;
+    }
     const p = getPlayer();
     if (!targetVid || !p) return false;
     const lang = getEffectiveUserLang();
@@ -211,7 +216,7 @@ async function runSubtitlesForCurrentVideo() {
         if (!S.userNativeLang) {
             S.userNativeLang = await resolveUserNativeLang();
         }
-        if (getVideoId() !== vid || S.subsUserTouchedVideo === vid) return;
+        if (getVideoId() !== vid || S.subsUserTouchedVideo === vid || isFallbackCaptionsActive(window, vid)) return;
         const activePlayer = getPlayer();
         if (!activePlayer || activePlayer.classList?.contains?.('ad-showing') || activePlayer.classList?.contains?.('ad-interrupting')) return;
         const activeAudioLang = detectVideoAudioLang({ activeAudioTrack: activePlayer.getAudioTrack?.() });
@@ -466,6 +471,7 @@ function boot() {
         S.subsUserTouchedVideo = vid;
         setTimeout(() => {
             if (getVideoId() !== vid) return;
+            if (isManualAiCaptionsActive(window, vid)) return;
             const curPlayer = getPlayer();
             if (!curPlayer) return;
             const nowOn = Boolean(curPlayer.isSubtitlesOn?.());
