@@ -10,7 +10,9 @@ import {
     normalizeAiAudioLang,
     hasSherpaLanguageModel,
     formatStreamingTailText,
-    computeAdaptiveSpeechThreshold
+    computeAdaptiveSpeechThreshold,
+    gentleConditionPcm,
+    SileroStreamingVadState
 } from '../offscreen-src/whisper-utils.js';
 
 test('filterWhisperText suppresses instrumental single stopwords, hallucinations, and n-gram loops', () => {
@@ -178,4 +180,84 @@ test('computeAdaptiveSpeechThreshold raises floor gradually during steady backgr
 
     const voicePeak = computeAdaptiveSpeechThreshold(floor, 0.025, false);
     assert.equal(voicePeak.isSpeech, true, 'clear speech peak above adapted floor triggers VAD');
+});
+
+test('SileroStreamingVadState rejects short transient pops and confirms sustained speech with hysteresis', () => {
+    const vad = new SileroStreamingVadState({ onset: 0.45, offset: 0.30, minSpeechFrames: 8, minSilenceFrames: 13 });
+
+    // 4-frame transient pop (< 8 frames) followed by 13 frames of silence must NOT confirm speech:
+    assert.equal(vad.pushProb(0.8).justStarted, true);
+    for (let i = 0; i < 3; i++) {
+        const s = vad.pushProb(0.7);
+        assert.equal(s.isSpeech, true);
+        assert.equal(s.speechConfirmed, false);
+    }
+    for (let i = 0; i < 12; i++) {
+        const s = vad.pushProb(0.05);
+        assert.equal(s.isSpeech, true);
+        assert.equal(s.justEnded, false);
+    }
+    const popEnd = vad.pushProb(0.05);
+    assert.equal(popEnd.isSpeech, false);
+    assert.equal(popEnd.justEnded, false, 'short transient pop must not emit justEnded confirmed speech');
+
+    // Sustained speech (>= 8 frames) holds across minor dips (>= offset 0.30) and fires justEnded after 13 silence frames:
+    assert.equal(vad.pushProb(0.6).justStarted, true);
+    for (let i = 0; i < 6; i++) assert.equal(vad.pushProb(0.55).speechConfirmed, false);
+    const confirmed = vad.pushProb(0.32); // 8th active frame >= offset 0.30
+    assert.equal(confirmed.speechConfirmed, true);
+    assert.equal(confirmed.isSpeech, true);
+    for (let i = 0; i < 12; i++) {
+        const s = vad.pushProb(0.1);
+        assert.equal(s.isSpeech, true);
+        assert.equal(s.justEnded, false);
+    }
+    const cleanEnd = vad.pushProb(0.1);
+    assert.equal(cleanEnd.isSpeech, false);
+    assert.equal(cleanEnd.justEnded, true);
+});
+
+test('gentleConditionPcm avoids amplifying quiet SFX/noise floor while mildly lifting quiet speech', () => {
+    const noise = new Float32Array(256);
+    for (let i = 0; i < noise.length; i++) noise[i] = (i % 2 === 0 ? 1 : -1) * 0.004;
+    const condNoise = gentleConditionPcm(noise);
+    let maxNoise = 0;
+    for (let i = 0; i < condNoise.length; i++) maxNoise = Math.max(maxNoise, Math.abs(condNoise[i]));
+    assert.ok(maxNoise < 0.015, `quiet room tone must not be boosted (max=${maxNoise})`);
+
+    const quietSpeech = new Float32Array(256);
+    for (let i = 0; i < quietSpeech.length; i++) quietSpeech[i] = Math.sin(i * 0.2) * 0.08;
+    const condSpeech = gentleConditionPcm(quietSpeech);
+    let maxQuiet = 0;
+    for (let i = 0; i < condSpeech.length; i++) maxQuiet = Math.max(maxQuiet, Math.abs(condSpeech[i]));
+    assert.ok(maxQuiet >= 0.12 && maxQuiet <= 0.48, `quiet speech gently lifted without over-gain (max=${maxQuiet})`);
+
+    const normalSpeech = new Float32Array(256);
+    for (let i = 0; i < normalSpeech.length; i++) normalSpeech[i] = Math.sin(i * 0.2) * 0.4;
+    const condNormal = gentleConditionPcm(normalSpeech);
+    let maxNormal = 0;
+    for (let i = 0; i < condNormal.length; i++) maxNormal = Math.max(maxNormal, Math.abs(condNormal[i]));
+    assert.ok(maxNormal >= 0.35 && maxNormal <= 0.45, `normal speech left unboosted (max=${maxNormal})`);
+});
+
+test('filterWhisperText suppresses empirical onomatopoeias, filler hallucinations, and non-Latin stray output on Latin videos', () => {
+    for (const junk of ['Ahhh...', 'Jajaja', 'Oh!', 'Mmm', 'Rue de la Cicada', '9 o\'clock on', 'Nine o\'clock on.', 'Margerizer.', '1-0-0-0-0-0-0']) {
+        assert.equal(filterWhisperText(junk, 'en'), '', `expected empty for junk: ${junk}`);
+    }
+    assert.equal(filterWhisperText('わっ', 'en'), '');
+    assert.equal(filterWhisperText('고춧가루', 'es'), '');
+    assert.equal(filterWhisperText('Para entender cómo medimos el ritmo.', 'es'), 'Para entender cómo medimos el ritmo.');
+});
+
+test('selectRealtimeAsrSpec routes turbo engine to Whisper Large-v3-Turbo WebGPU q4f16 with safe fallbacks', () => {
+    assert.equal(normalizeAsrEngine('turbo'), 'turbo');
+    const turboSpec = selectRealtimeAsrSpec('es', true, 'turbo', true);
+    assert.equal(turboSpec.primaryEngine, 'whisper');
+    assert.equal(turboSpec.candidates[0].id, 'onnx-community/whisper-large-v3-turbo');
+    assert.deepEqual(turboSpec.candidates[0].dtype, { encoder_model: 'q4f16', decoder_model_merged: 'q4f16' });
+    assert.equal(turboSpec.candidates[1].id, 'onnx-community/whisper-base');
+    assert.equal(turboSpec.candidates[2].id, 'onnx-community/whisper-tiny');
+
+    const turboNoF16 = selectRealtimeAsrSpec('en', true, 'turbo', false);
+    assert.deepEqual(turboNoF16.candidates[0].dtype, { encoder_model: 'q4', decoder_model_merged: 'q4' });
 });

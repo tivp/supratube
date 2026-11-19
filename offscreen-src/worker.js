@@ -1,3 +1,4 @@
+import * as ort from 'onnxruntime-web';
 import { env, WhisperForConditionalGeneration, AutoProcessor, AutoTokenizer, LogitsProcessor, LogitsProcessorList } from '@huggingface/transformers';
 import { initASRModule, createOnlineRecognizer, OnlineRecognizerTypes } from '@sherpaw/asr';
 import {
@@ -10,7 +11,9 @@ import {
     normalizeAiAudioLang,
     hasSherpaLanguageModel,
     formatStreamingTailText,
-    computeAdaptiveSpeechThreshold
+    computeAdaptiveSpeechThreshold,
+    gentleConditionPcm,
+    SileroStreamingVadState
 } from './whisper-utils.js';
 
 const VENDOR = new URL('./vendor/', self.location.href).href;
@@ -24,6 +27,8 @@ env.allowRemoteModels = true;
 env.useBrowserCache = true;
 env.useWasmCache = false;
 env.backends.onnx.wasm.wasmPaths = ASYNCIFY;
+ort.env.wasm.wasmPaths = ASYNCIFY;
+ort.env.wasm.numThreads = 1;
 
 const SR = 16000;
 const S = sec => Math.round(sec * SR);
@@ -46,6 +51,7 @@ class LangDetectProcessor extends LogitsProcessor {
         this.noTsId = genCfg.no_timestamps_token_id;
         this.forced = forced && this.langToId[forced] != null ? forced : null;
         this.result = null;
+        this.tokenProbs = [];
     }
 
     _call(inputIds, logits) {
@@ -62,8 +68,26 @@ class LangDetectProcessor extends LogitsProcessor {
         } else if (step === 3) {
             data.fill(-Infinity);
             data[this.noTsId] = 0;
+        } else if (step >= 4) {
+            let maxLogit = -Infinity;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > maxLogit) maxLogit = data[i];
+            }
+            let sumExp = 0;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > maxLogit - 25) sumExp += Math.exp(data[i] - maxLogit);
+            }
+            const topProb = sumExp > 0 ? 1 / sumExp : 0;
+            this.tokenProbs.push(topProb);
         }
         return logits;
+    }
+
+    get avgTokenProb() {
+        if (!this.tokenProbs.length) return 1;
+        let sum = 0;
+        for (let i = 0; i < this.tokenProbs.length; i++) sum += this.tokenProbs[i];
+        return +(sum / this.tokenProbs.length).toFixed(3);
     }
 }
 
@@ -79,14 +103,23 @@ let sherpaMod = null;
 let sherpaModPromise = null;
 let sherpaOnlineRec = null;
 let sherpaStream = null;
-let sherpaPcmPending = Promise.resolve();
 let sherpaLastPartial = '';
 let sherpaEmitSeq = 0;
 let sherpaTranslating = false;
 let sherpaPendingEmit = null;
 let googleRateLimitedUntil = 0;
-let hpPrevIn = 0;
-let hpPrevOut = 0;
+const hpState = { prevIn: 0, prevOut: 0 };
+
+let sileroSession = null;
+let sileroInitPromise = null;
+let sileroState = new Float32Array(2 * 1 * 128);
+let sileroContext = new Float32Array(64);
+let sileroSr = null;
+const sileroVad = new SileroStreamingVadState({ onset: 0.45, offset: 0.30, minSpeechFrames: 8, minSilenceFrames: 13 });
+let vadResidual = new Float32Array(0);
+let vadPreRoll = [];
+let utteranceConfirmedByVad = false;
+let pcmChain = Promise.resolve();
 
 let loadedKey = '';
 let loading = null;
@@ -256,6 +289,44 @@ async function fetchHfFileCached(repoId, file, progressCallback) {
     return out;
 }
 
+async function ensureSileroSession() {
+    if (sileroSession) return sileroSession;
+    if (!sileroInitPromise) {
+        sileroInitPromise = (async () => {
+            try {
+                const resp = await fetch(`${VENDOR}silero_vad.onnx`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const bytes = new Uint8Array(await resp.arrayBuffer());
+                sileroSr = new ort.Tensor('int64', BigInt64Array.from([16000n]), []);
+                sileroSession = await ort.InferenceSession.create(bytes, {
+                    executionProviders: ['wasm'],
+                    graphOptimizationLevel: 'all'
+                });
+                return sileroSession;
+            } catch {
+                sileroInitPromise = null;
+                return null;
+            }
+        })();
+    }
+    return sileroInitPromise;
+}
+
+async function evalSileroFrame(frame512) {
+    if (!sileroSession) return 0;
+    const win = new Float32Array(64 + 512);
+    win.set(sileroContext, 0);
+    win.set(frame512, 64);
+    sileroContext.set(frame512.subarray(512 - 64));
+    const out = await sileroSession.run({
+        input: new ort.Tensor('float32', win, [1, 576]),
+        state: new ort.Tensor('float32', sileroState, [2, 1, 128]),
+        sr: sileroSr
+    });
+    sileroState = new Float32Array(out.stateN.data);
+    return out.output.data[0];
+}
+
 function getSherpaModule() {
     if (sherpaMod) return Promise.resolve(sherpaMod);
     if (!sherpaModPromise) {
@@ -278,8 +349,9 @@ function recreateSherpaStream() {
     sherpaEmitSeq++;
     sherpaLastPartial = '';
     sherpaPendingEmit = null;
-    hpPrevIn = 0;
-    hpPrevOut = 0;
+    hpState.prevIn = 0;
+    hpState.prevOut = 0;
+    vadPreRoll = [];
     if (sherpaOnlineRec) {
         sherpaStream = sherpaOnlineRec.createStream();
     }
@@ -310,8 +382,14 @@ function resetAudioState(clearOverlap = true) {
     prevUtteranceEnd = 0;
     lastVideoTime = 0;
     noiseFloor = 0.0015;
-    hpPrevIn = 0;
-    hpPrevOut = 0;
+    hpState.prevIn = 0;
+    hpState.prevOut = 0;
+    sileroState.fill(0);
+    sileroContext.fill(0);
+    sileroVad.reset();
+    vadResidual = new Float32Array(0);
+    vadPreRoll = [];
+    utteranceConfirmedByVad = false;
     if (clearOverlap) prevCommittedRaw = '';
     if (activeEngine === 'sherpa') {
         recreateSherpaStream();
@@ -328,13 +406,18 @@ function setBoundedTrans(key, val) {
 
 async function initModel(spokenHint = '', enginePref = preferredEngine) {
     let gpu = false;
+    let hasShaderF16 = false;
     try {
-        gpu = Boolean(navigator.gpu && (await navigator.gpu.requestAdapter()));
+        const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+        gpu = Boolean(adapter);
+        hasShaderF16 = Boolean(adapter?.features?.has?.('shader-f16'));
     } catch {}
+    await ensureSileroSession();
 
     const effectiveHint = requestedAiAudioLang !== 'auto' ? requestedAiAudioLang : spokenHint;
-    const spec = selectRealtimeAsrSpec(effectiveHint, gpu, enginePref);
-    const desiredKey = `${spec.primaryEngine}:${gpu ? 'webgpu' : 'wasm'}:${spec.lang}:${spec.lidAutoPromote ? 'lid' : 'direct'}`;
+    const spec = selectRealtimeAsrSpec(effectiveHint, gpu, enginePref, hasShaderF16);
+    const primaryId = spec.candidates[0]?.id || spec.primaryEngine;
+    const desiredKey = `${primaryId}:${spec.primaryEngine}:${gpu ? 'webgpu' : 'wasm'}:${spec.lang}:${spec.lidAutoPromote ? 'lid' : 'direct'}`;
     if ((sherpaOnlineRec || model) && loadedKey === desiredKey) {
         lidAutoPromotePending = Boolean(spec.lidAutoPromote);
         if (activeEngine === 'sherpa' && !sherpaStream) {
@@ -499,10 +582,12 @@ async function inferSamples(samples, forced) {
         inputs: feats.input_features,
         decoder_input_ids: [model.generation_config.decoder_start_token_id],
         logits_processor: list,
-        max_new_tokens: 96
+        max_new_tokens: 112,
+        no_repeat_ngram_size: 3,
+        repetition_penalty: 1.15
     });
     const text = (tokenizer.batch_decode(out, { skip_special_tokens: true })[0] || '').trim();
-    return { text, ...(lp.result || { lang: 'en', detected: 'en', conf: 0 }) };
+    return { text, avgTokenProb: lp.avgTokenProb, ...(lp.result || { lang: 'en', detected: 'en', conf: 0 }) };
 }
 
 function extractWindow(from, to) {
@@ -513,52 +598,11 @@ function extractWindow(from, to) {
         const b = Math.min(to, c.end);
         out.set(c.pcm.subarray(a - c.start, b - c.start), a - from);
     }
-    if (out.length > 0) {
-        let prevIn = out[0];
-        let prevOut = 0;
-        for (let i = 0; i < out.length; i++) {
-            const x = out[i];
-            const y = x - prevIn + 0.96 * prevOut;
-            prevIn = x;
-            prevOut = y;
-            out[i] = y;
-        }
-    }
-    let maxAbs = 0;
-    for (let i = 0; i < out.length; i++) {
-        const abs = Math.abs(out[i]);
-        if (abs > maxAbs) maxAbs = abs;
-    }
-    if (maxAbs > 0.002 && maxAbs < 0.25) {
-        const gain = Math.min(8, 0.5 / maxAbs);
-        for (let i = 0; i < out.length; i++) {
-            out[i] *= gain;
-        }
-    }
-    return out;
+    return gentleConditionPcm(out);
 }
 
 function conditionSherpaChunk(rawPcm) {
-    const out = new Float32Array(rawPcm.length);
-    for (let i = 0; i < rawPcm.length; i++) {
-        const x = rawPcm[i];
-        const y = x - hpPrevIn + 0.96 * hpPrevOut;
-        hpPrevIn = x;
-        hpPrevOut = y;
-        out[i] = y;
-    }
-    let maxAbs = 0;
-    for (let i = 0; i < out.length; i++) {
-        const a = Math.abs(out[i]);
-        if (a > maxAbs) maxAbs = a;
-    }
-    if (maxAbs > 0.004 && maxAbs < 0.2) {
-        const gain = Math.min(4, 0.45 / maxAbs);
-        for (let i = 0; i < out.length; i++) {
-            out[i] = Math.max(-1, Math.min(1, out[i] * gain));
-        }
-    }
-    return out;
+    return gentleConditionPcm(rawPcm, hpState);
 }
 
 async function translateCached(text, from, to) {
@@ -668,7 +712,7 @@ async function processSherpaChunk(pcm, videoTime, runVid) {
     while (sherpaOnlineRec.isReady(sherpaStream)) {
         sherpaOnlineRec.decode(sherpaStream);
     }
-    const rawResult = String(sherpaOnlineRec.getResult(sherpaStream)?.text || '').trim();
+    const rawResult = filterWhisperText(sherpaOnlineRec.getResult(sherpaStream)?.text || '', activeModelLang || 'en');
     const isEndpoint = sherpaOnlineRec.isEndpoint(sherpaStream);
     const displaySrc = formatStreamingTailText(rawResult, 140);
     const inferMs = Math.round(performance.now() - t0);
@@ -687,7 +731,7 @@ async function processSherpaChunk(pcm, videoTime, runVid) {
         void flushSherpaCaptionQueue();
     }
 
-    if (isEndpoint && rawResult) {
+    if (isEndpoint && sherpaOnlineRec.getResult(sherpaStream)?.text) {
         sherpaOnlineRec.reset(sherpaStream);
         sherpaLastPartial = '';
     }
@@ -742,8 +786,11 @@ async function maybeInfer(videoTime, runVid) {
 
         const inferMs = Math.round(performance.now() - t0);
         lastInferEnd = end;
-        const silMs = ((utteranceStart - prevUtteranceEnd) / SR) * 1000;
-        voter.observe({ lang: res.detected, conf: res.conf, lockedConf: res.lockedConf, ts: Date.now(), silenceMs: silMs });
+        const confident = (res.avgTokenProb ?? 1) >= 0.45;
+        if (confident) {
+            const silMs = ((utteranceStart - prevUtteranceEnd) / SR) * 1000;
+            voter.observe({ lang: res.detected, conf: res.conf, lockedConf: res.lockedConf, ts: Date.now(), silenceMs: silMs });
+        }
 
         if (voter.shouldAbortForSameLanguage(targetLang, manualForce)) {
             stopped = true;
@@ -760,7 +807,8 @@ async function maybeInfer(videoTime, runVid) {
             }
         }
 
-        const filtered = filterWhisperText(res.text);
+        const expectedLang = res.lang || forced || requestedSpokenLang || '';
+        const filtered = confident ? filterWhisperText(res.text, expectedLang) : '';
         const clean = prevCommittedRaw ? (stripCaptionOverlap(prevCommittedRaw, filtered) || filtered) : filtered;
         const translated = clean ? await translateCached(clean, res.lang, targetLang) : '';
         if (stopped || runVid !== activeVideoId) return;
@@ -785,6 +833,7 @@ async function maybeInfer(videoTime, runVid) {
             prevUtteranceEnd = lastSpeechEnd;
             committed = end;
             utteranceStart = null;
+            utteranceConfirmedByVad = false;
             prevCommittedRaw = clean;
         } else if (mode === 'cut') {
             prevCommittedRaw = clean;
@@ -860,37 +909,118 @@ self.onmessage = async e => {
         if (stopped || (!sherpaOnlineRec && !model) || !m.videoId || m.videoId !== activeVideoId) return;
         const pcm = m.pcm instanceof Float32Array ? m.pcm : new Float32Array(m.pcm || []);
         if (!pcm.length) return;
-        lastVideoTime = Number(m.videoTime) || 0;
+        const videoTime = Number(m.videoTime) || 0;
+        const rms = Number(m.rms) || 0;
+        const runVid = m.videoId;
 
-        if (activeEngine === 'sherpa' && sherpaOnlineRec && sherpaStream) {
-            sherpaPcmPending = sherpaPcmPending.then(() => processSherpaChunk(pcm, lastVideoTime, m.videoId)).catch(err => {
-                if (!stopped && m.videoId === activeVideoId) {
-                    self.postMessage({ kind: 'error', videoId: m.videoId, error: String(err?.message || err) });
+        pcmChain = pcmChain.then(async () => {
+            if (stopped || (!sherpaOnlineRec && !model) || runVid !== activeVideoId) return;
+            lastVideoTime = videoTime;
+
+            if (sileroSession) {
+                const combined = new Float32Array(vadResidual.length + pcm.length);
+                combined.set(vadResidual, 0);
+                combined.set(pcm, vadResidual.length);
+                let off = 0;
+                while (off + 512 <= combined.length) {
+                    if (stopped || runVid !== activeVideoId) return;
+                    const frame512 = combined.subarray(off, off + 512);
+                    off += 512;
+                    const prob = await evalSileroFrame(frame512);
+                    if (stopped || runVid !== activeVideoId) return;
+                    const st = sileroVad.pushProb(prob);
+
+                    if (activeEngine === 'sherpa' && sherpaOnlineRec && sherpaStream) {
+                        if (st.justStarted) {
+                            for (const pre of vadPreRoll) {
+                                await processSherpaChunk(pre, videoTime, runVid);
+                            }
+                            vadPreRoll = [];
+                            await processSherpaChunk(frame512, videoTime, runVid);
+                        } else if (st.isSpeech) {
+                            await processSherpaChunk(frame512, videoTime, runVid);
+                        } else if (st.justEnded) {
+                            await processSherpaChunk(new Float32Array(8000), videoTime, runVid);
+                            if (sherpaOnlineRec && sherpaStream) {
+                                const remRaw = filterWhisperText(sherpaOnlineRec.getResult(sherpaStream)?.text || '', activeModelLang || 'en');
+                                const remDisplay = formatStreamingTailText(remRaw, 140);
+                                if (remDisplay && remDisplay !== sherpaLastPartial) {
+                                    sherpaLastPartial = remDisplay;
+                                    sherpaPendingEmit = {
+                                        seq: sherpaEmitSeq,
+                                        runVid,
+                                        mode: 'final',
+                                        text: remDisplay,
+                                        lang: activeModelLang || 'en',
+                                        inferMs: 0,
+                                        videoTime
+                                    };
+                                    void flushSherpaCaptionQueue();
+                                }
+                                sherpaOnlineRec.reset(sherpaStream);
+                                sherpaLastPartial = '';
+                            }
+                        } else {
+                            vadPreRoll.push(new Float32Array(frame512));
+                            if (vadPreRoll.length > 12) vadPreRoll.shift();
+                        }
+                    } else if (activeEngine === 'whisper') {
+                        const start = total;
+                        const end = total + 512;
+                        chunks.push({ start, end, pcm: new Float32Array(frame512) });
+                        total = end;
+
+                        if (st.isSpeech) {
+                            if (utteranceStart === null) utteranceStart = Math.max(committed, start - PRE_ROLL);
+                            lastSpeechEnd = end;
+                            if (st.speechConfirmed) utteranceConfirmedByVad = true;
+                        } else if (st.justEnded && utteranceStart !== null && !utteranceConfirmedByVad) {
+                            utteranceStart = null;
+                            lastSpeechEnd = lastFinalEnd;
+                        }
+                    }
                 }
-            });
-            return;
-        }
+                vadResidual = combined.slice(off);
 
-        const start = total;
-        const end = total + pcm.length;
-        chunks.push({ start, end, pcm });
-        total = end;
+                if (activeEngine === 'whisper' && model) {
+                    const keepFrom = Math.min(committed, utteranceStart ?? committed) - S(2);
+                    while (chunks.length && chunks[0].end < keepFrom) {
+                        chunks.shift();
+                    }
+                    if (utteranceConfirmedByVad) {
+                        await maybeInfer(videoTime, runVid);
+                    }
+                }
+                return;
+            }
 
-        const recently = lastSpeechEnd > 0 && end - lastSpeechEnd <= S(0.3);
-        const vad = computeAdaptiveSpeechThreshold(noiseFloor, m.rms, recently);
-        noiseFloor = vad.nextNoiseFloor;
-        if (vad.isSpeech) {
-            if (utteranceStart === null) utteranceStart = Math.max(committed, start - PRE_ROLL);
-            lastSpeechEnd = end;
-        }
+            if (activeEngine === 'sherpa' && sherpaOnlineRec && sherpaStream) {
+                await processSherpaChunk(pcm, videoTime, runVid);
+                return;
+            }
 
-        const keepFrom = Math.min(committed, utteranceStart ?? committed) - S(2);
-        while (chunks.length && chunks[0].end < keepFrom) {
-            chunks.shift();
-        }
-        maybeInfer(m.videoTime, m.videoId).catch(err => {
-            if (!stopped && m.videoId === activeVideoId) {
-                self.postMessage({ kind: 'error', videoId: m.videoId, error: String(err?.message || err) });
+            const start = total;
+            const end = total + pcm.length;
+            chunks.push({ start, end, pcm });
+            total = end;
+
+            const recently = lastSpeechEnd > 0 && end - lastSpeechEnd <= S(0.3);
+            const vad = computeAdaptiveSpeechThreshold(noiseFloor, rms, recently);
+            noiseFloor = vad.nextNoiseFloor;
+            if (vad.isSpeech) {
+                if (utteranceStart === null) utteranceStart = Math.max(committed, start - PRE_ROLL);
+                lastSpeechEnd = end;
+                utteranceConfirmedByVad = true;
+            }
+
+            const keepFrom = Math.min(committed, utteranceStart ?? committed) - S(2);
+            while (chunks.length && chunks[0].end < keepFrom) {
+                chunks.shift();
+            }
+            await maybeInfer(videoTime, runVid);
+        }).catch(err => {
+            if (!stopped && runVid === activeVideoId) {
+                self.postMessage({ kind: 'error', videoId: runVid, error: String(err?.message || err) });
             }
         });
     }

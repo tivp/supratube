@@ -8,7 +8,7 @@ const SYNC_CHECK_KEY = 'supratube_last_sync_check';
 const AUTO_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 const USER_SCRIPT_ID = 'supratube-github-bundle';
 const MATCHES_YOUTUBE = ['https://www.youtube.com/*', 'https://m.youtube.com/*'];
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.13';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.14';
 
 const ORDEN_MODULOS = [
     'config.js',

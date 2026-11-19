@@ -64,7 +64,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.13' }),
+                getManifest: () => ({ version: '1.0.14' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -107,7 +107,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
     const storeData = {
         supratube_last_sync_check: Date.now() - (20 * 60 * 1000),
         supratube_github_cache: {
-            extVersion: '1.0.13',
+            extVersion: '1.0.14',
             sha: 'sha_old',
             modulos: modMap,
             codigoCompilado: compileBundle(modMap)
@@ -117,7 +117,7 @@ test('background.js targets tivp/supratube, keeps ORDEN_MODULOS parity, and comp
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.13' }),
+                getManifest: () => ({ version: '1.0.14' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -192,7 +192,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
         chrome: {
             runtime: {
                 id: 'test-ext',
-                getManifest: () => ({ version: '1.0.13' }),
+                getManifest: () => ({ version: '1.0.14' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener() {} }
@@ -369,7 +369,7 @@ test('actualizarScriptsDesdeGithub hot-reinitializes modern tabs, reloads legacy
                 return { ok: true, json: async () => ({ sha: 'sha_old_109', commit: { message: 'v1.0.9' } }) };
             }
             if (url.includes('/modules/config.js')) {
-                return { ok: true, text: async () => modMap['config.js'].replace("version: '1.0.13'", "version: '1.0.9'") };
+                return { ok: true, text: async () => modMap['config.js'].replace("version: '1.0.14'", "version: '1.0.9'") };
             }
             return { ok: false, status: 500 };
         }
@@ -398,12 +398,14 @@ test('SupraTube branding, simple humane copy, and transparent credits stay consi
     assert.match(popupHtml, /Gemini 4 Hydrogen Extra/);
     assert.match(popupHtml, /<select[^>]*data-setting="asrEngine"[^>]*>/);
     assert.match(popupHtml, /<option value="sherpa">/);
+    assert.match(popupHtml, /<option value="turbo">/);
     assert.match(popupHtml, /<option value="whisper">/);
     assert.match(popupHtml, /<select[^>]*data-setting="aiAudioLang"[^>]*>/);
     assert.match(popupHtml, /<option value="auto">/);
     assert.match(popupHtml, /<option value="es">/);
     assert.doesNotMatch(popupHtml, /moonshine/i);
     assert.equal(fs.existsSync(path.resolve('vendor/sherpa-asr.wasm')), true);
+    assert.equal(fs.existsSync(path.resolve('vendor/silero_vad.onnx')), true);
     assert.ok(manifest.host_permissions.includes('https://api.mymemory.translated.net/*'));
 
     assert.match(readme, /^#\s+SupraTube/m);
@@ -423,7 +425,7 @@ test('background.js retries transient offscreen startup connection errors and ex
         chrome: {
             runtime: {
                 id: 'ext_test',
-                getManifest: () => ({ version: '1.0.13' }),
+                getManifest: () => ({ version: '1.0.14' }),
                 onInstalled: { addListener() {} },
                 onStartup: { addListener() {} },
                 onMessage: { addListener: fn => { msgListener = fn; } },
@@ -466,5 +468,5 @@ test('background.js retries transient offscreen startup connection errors and ex
         msgListener({ action: 'SUPRATUBE_GET_STATUS' }, {}, resolve);
     });
     assert.equal(statusRes?.ok, true);
-    assert.equal(statusRes?.swVersion, '1.0.13');
+    assert.equal(statusRes?.swVersion, '1.0.14');
 });

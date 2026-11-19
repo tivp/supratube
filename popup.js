@@ -3,7 +3,7 @@
 import { DEFAULT_SETTINGS } from './modules/config.js';
 
 const SETTINGS_KEY = 'supratube_settings';
-const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.13';
+const EXT_VERSION = chrome.runtime?.getManifest?.()?.version || '1.0.14';
 const checkboxes = Array.from(document.querySelectorAll('input[data-setting]'));
 const selects = Array.from(document.querySelectorAll('select[data-setting]'));
 const btnActualizar = document.getElementById('btn-actualizar-scripts');

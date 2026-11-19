@@ -65,4 +65,9 @@ for (const basePath of allNodePaths) {
         break;
     }
 }
+const sileroDst = path.join(vendorDir, 'silero_vad.onnx');
+const sileroSrc = path.resolve(root, '../asr-bench/models/silero_vad.onnx');
+if (!fs.existsSync(sileroDst) && fs.existsSync(sileroSrc)) {
+    fs.copyFileSync(sileroSrc, sileroDst);
+}
 console.log('[build-offscreen] bundles and vendor WASM synced.');

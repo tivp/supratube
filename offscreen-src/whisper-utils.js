@@ -3,12 +3,17 @@
 const HALLUC_RE = [
     /^(?:thank you|thanks|thanks for watching|thank you for watching|gracias|obrigado|merci)[\s.!]*$/i,
     /^(?:bye|goodbye|adios|adiós|see you|the end|subtitles by|transcribed by|subtítulos|music|música|applause|laughter|cheering)[\s.!]*$/i,
+    /^(?:ah+|oh+|uh+|eh+|um+|hm+|mm+|mhm+|sh+|wow+|ooh+|aah+|ha{2,}|(?:ha){2,}|he{2,}|(?:he){2,}|ho+|(?:ho){2,}|(?:ja){2,}|(?:je){2,})[\s.,!?]*$/i,
+    /^(?:rue de la cicada|9 o'?clock on|nine o'?clock on|margerizer|\d+(?:[.\-\s]\d+){4,}.*)[\s.,!?]*$/i,
     /^\[[^\]]*\]$/,
     /^\([^)]*\)$/,
     /^\*[^*]*\*$/,
     /^♪.*♪$/,
     /^♪+$/
 ];
+
+const LATIN_LANGS = new Set(['en', 'es', 'fr', 'de']);
+const LATIN_CHAR_RE = /[a-zA-ZáéíóúüñÁÉÍÓÚÜÑàâçèêëîïôùûÿœäöß]/u;
 
 const SINGLE_STOPWORD_RE = /^(?:the|an?|el|la|los|las|lo|le|les|un|una|uno|unas|unos|de|del|al|en|con|por|para|and|or|but|so|if|of|to|in|on|at|it|is|as|be|by|we|you|your|he|she|me|my|they|this|that|um+|uh+|ah+|eh+|oh+|hm+|mm+|mhm+|sh+|music|song)$/i;
 
@@ -22,9 +27,11 @@ function normWord(word) {
 }
 
 /** Filter Whisper non-speech hallucinations, instrumental stopword artifacts, and repeated n-gram loops. */
-export function filterWhisperText(raw) {
+export function filterWhisperText(raw, expectedLang = '') {
     const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
     if (!t || !/[\p{L}\p{N}]/u.test(t)) return '';
+    const baseExpected = normBase(expectedLang);
+    if (LATIN_LANGS.has(baseExpected) && !LATIN_CHAR_RE.test(t)) return '';
     for (const re of HALLUC_RE) {
         if (re.test(t)) return '';
     }
@@ -202,9 +209,10 @@ const SHERPA_KROKO_REPOS = Object.freeze({
 
 const SUPPORTED_AI_AUDIO_LANGS = new Set(['auto', 'es', 'en', 'fr', 'de']);
 
-/** Normalize user-selected ASR engine name ('sherpa' streaming or 'whisper' fallback). */
+/** Normalize user-selected ASR engine name ('sherpa' streaming, 'turbo' WebGPU Pro, or 'whisper' base fallback). */
 export function normalizeAsrEngine(engine = 'sherpa') {
     const clean = String(engine || '').trim().toLowerCase();
+    if (clean === 'turbo') return 'turbo';
     return clean === 'whisper' ? 'whisper' : 'sherpa';
 }
 
@@ -219,12 +227,24 @@ export function hasSherpaLanguageModel(lang = '') {
     return Boolean(SHERPA_KROKO_REPOS[normBase(lang)]);
 }
 
-/** Select the optimal real-time ASR spec (Sherpa Kroko for confirmed/detected languages, or lightweight Whisper Acoustic Auto-LID when unknown). */
-export function selectRealtimeAsrSpec(spokenLang = '', hasWebGpu = true, preferredEngine = 'sherpa') {
+/** Select the optimal real-time ASR spec (Sherpa Kroko, Whisper-Large-v3-Turbo WebGPU, or Whisper-Base fallback). */
+export function selectRealtimeAsrSpec(spokenLang = '', hasWebGpu = true, preferredEngine = 'sherpa', hasShaderF16 = true) {
     const engine = normalizeAsrEngine(preferredEngine);
     const base = normBase(spokenLang);
     const gpuDtype = { encoder_model: 'fp32', decoder_model_merged: 'q4' };
 
+    const whisperTurboGpu = hasWebGpu
+        ? {
+            engine: 'whisper',
+            id: 'onnx-community/whisper-large-v3-turbo',
+            device: 'webgpu',
+            dtype: hasShaderF16
+                ? { encoder_model: 'q4f16', decoder_model_merged: 'q4f16' }
+                : { encoder_model: 'q4', decoder_model_merged: 'q4' },
+            lang: base || null,
+            session_options: {}
+        }
+        : null;
     const whisperBaseGpu = hasWebGpu
         ? {
             engine: 'whisper',
@@ -247,7 +267,10 @@ export function selectRealtimeAsrSpec(spokenLang = '', hasWebGpu = true, preferr
 
     const candidates = [];
     let lidAutoPromote = false;
-    if (engine === 'sherpa') {
+    if (engine === 'turbo') {
+        if (whisperTurboGpu) candidates.push(whisperTurboGpu);
+        candidates.push(...whisperCandidates);
+    } else if (engine === 'sherpa') {
         const kroko = base ? SHERPA_KROKO_REPOS[base] : null;
         if (kroko) {
             candidates.push({
@@ -306,4 +329,106 @@ export function computeAdaptiveSpeechThreshold(noiseFloor = 0.0015, rms = 0, rec
     }
     nextNoiseFloor = Math.min(0.015, Math.max(0.0012, nextNoiseFloor));
     return { isSpeech, nextNoiseFloor, startThreshold, holdThreshold };
+}
+
+/** High-pass condition PCM gently without amplifying quiet background SFX/room tone (< 0.025 peak). */
+export function gentleConditionPcm(rawPcm, state = null) {
+    const len = rawPcm?.length || 0;
+    const out = new Float32Array(len);
+    if (!len) return out;
+
+    let prevIn = state ? (Number(state.prevIn) || 0) : rawPcm[0];
+    let prevOut = state ? (Number(state.prevOut) || 0) : 0;
+    let maxAbs = 0;
+    for (let i = 0; i < len; i++) {
+        const x = rawPcm[i];
+        const y = x - prevIn + 0.96 * prevOut;
+        prevIn = x;
+        prevOut = y;
+        out[i] = y;
+        const abs = Math.abs(y);
+        if (abs > maxAbs) maxAbs = abs;
+    }
+    if (state) {
+        state.prevIn = prevIn;
+        state.prevOut = prevOut;
+    }
+
+    if (maxAbs >= 0.025 && maxAbs < 0.25) {
+        const gain = Math.min(2.2, 0.45 / maxAbs);
+        for (let i = 0; i < len; i++) {
+            const scaled = out[i] * gain;
+            out[i] = scaled < -1 ? -1 : (scaled > 1 ? 1 : scaled);
+        }
+    }
+    return out;
+}
+
+/** Hysteresis state machine for frame-by-frame Silero VAD v5 streaming gating (512-sample frames at 16 kHz). */
+export class SileroStreamingVadState {
+    constructor({ onset = 0.45, offset = 0.30, minSpeechFrames = 8, minSilenceFrames = 13 } = {}) {
+        this.onset = onset;
+        this.offset = offset;
+        this.minSpeechFrames = minSpeechFrames;
+        this.minSilenceFrames = minSilenceFrames;
+        this.reset();
+    }
+
+    reset() {
+        this.inSpeech = false;
+        this.activeFrames = 0;
+        this.silenceFrames = 0;
+        this.speechConfirmed = false;
+    }
+
+    pushProb(prob) {
+        if (!this.inSpeech) {
+            if (prob >= this.onset) {
+                this.inSpeech = true;
+                this.activeFrames = 1;
+                this.silenceFrames = 0;
+                this.speechConfirmed = this.minSpeechFrames <= 1;
+                return {
+                    isSpeech: true,
+                    justStarted: true,
+                    justEnded: false,
+                    speechConfirmed: this.speechConfirmed
+                };
+            }
+            return {
+                isSpeech: false,
+                justStarted: false,
+                justEnded: false,
+                speechConfirmed: false
+            };
+        }
+
+        if (prob >= this.offset) {
+            this.activeFrames++;
+            this.silenceFrames = 0;
+            if (this.activeFrames >= this.minSpeechFrames) {
+                this.speechConfirmed = true;
+            }
+        } else {
+            this.silenceFrames++;
+        }
+
+        if (this.silenceFrames >= this.minSilenceFrames) {
+            const wasConfirmed = this.speechConfirmed;
+            this.reset();
+            return {
+                isSpeech: false,
+                justStarted: false,
+                justEnded: wasConfirmed,
+                speechConfirmed: false
+            };
+        }
+
+        return {
+            isSpeech: true,
+            justStarted: false,
+            justEnded: false,
+            speechConfirmed: this.speechConfirmed
+        };
+    }
 }

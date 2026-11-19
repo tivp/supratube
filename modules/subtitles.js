@@ -1002,12 +1002,17 @@ function hasVisibleNativeCaptions(player) {
 
 const CAPTION_POS_STORAGE_KEY = 'supratube_caption_pos_v1';
 
+function resolveAsrEngineChoice(raw) {
+    const clean = String(raw || '').trim().toLowerCase();
+    return (clean === 'whisper' || clean === 'turbo') ? clean : 'sherpa';
+}
+
 function readPreferredAsrEngine(doc) {
     try {
         const raw = doc?.documentElement?.dataset?.supratubeSettings;
         if (raw) {
             const parsed = JSON.parse(raw);
-            if (parsed?.asrEngine === 'whisper') return 'whisper';
+            return resolveAsrEngineChoice(parsed?.asrEngine);
         }
     } catch {}
     return 'sherpa';
@@ -1547,7 +1552,7 @@ export function startManualAiCaptions({
     if (!video) return false;
 
     const baseUser = normalizeBaseLang(userLang) || 'es';
-    const engine = (asrEngine || readPreferredAsrEngine(doc)) === 'whisper' ? 'whisper' : 'sherpa';
+    const engine = resolveAsrEngineChoice(asrEngine || readPreferredAsrEngine(doc));
     const audioLang = (aiAudioLang || readPreferredAiAudioLang(doc) || 'auto');
     ctrl.sameLangVideos.delete(videoId);
     ctrl.manualForcePendingVid = videoId;
@@ -2041,7 +2046,7 @@ export function float32ToPcm16(f32) {
         const a = Math.abs(src[i]);
         if (a > maxAbs) maxAbs = a;
     }
-    const gain = (maxAbs > 0.002 && maxAbs < 0.25) ? Math.min(8, 0.5 / maxAbs) : 1;
+    const gain = (maxAbs >= 0.025 && maxAbs < 0.25) ? Math.min(2.2, 0.45 / maxAbs) : 1;
     const pcm16 = new Int16Array(src.length);
     for (let i = 0; i < src.length; i++) {
         let s = src[i] * gain;
@@ -2680,7 +2685,7 @@ function startWhisperLiveFallback({
     const effectiveTargetLang = manualForce ? `-${wantBase}` : wantBase;
     const prefAudioLang = (aiAudioLang || readPreferredAiAudioLang(doc) || 'auto');
     const spokenLang = inferVideoSpokenLang(player, doc, win, '', prefAudioLang);
-    const engine = (asrEngine || readPreferredAsrEngine(doc)) === 'whisper' ? 'whisper' : 'sherpa';
+    const engine = resolveAsrEngineChoice(asrEngine || readPreferredAsrEngine(doc));
 
     if (ctrl.whisperVid === videoId) {
         if (manualForce) {
