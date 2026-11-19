@@ -1367,7 +1367,8 @@ function ensureIaButtonStyle(doc) {
         '.supratube-ia-cc-btn .ytp-subtitles-button-icon { display: inline-flex; align-items: center; justify-content: center; }',
         '[data-supratube-ai-subs-active="1"] .ytp-caption-window-container,',
         'html[data-supratube-ai-subs-active="1"] #shorts-player .ytp-caption-window-container,',
-        'html[data-supratube-ai-subs-active="1"] #movie_player .ytp-caption-window-container { display: none !important; visibility: hidden !important; opacity: 0 !important; }'
+        'html[data-supratube-ai-subs-active="1"] #movie_player .ytp-caption-window-container { display: none !important; visibility: hidden !important; opacity: 0 !important; }',
+        '[data-supratube-ai-subs-active="1"] .ytp-subtitles-button::after, html[data-supratube-ai-subs-active="1"] .ytp-subtitles-button::after { display: none !important; opacity: 0 !important; }'
     ].join('\n'));
 }
 
@@ -1561,11 +1562,16 @@ export function startManualAiCaptions({
     ensureShortsCaptionStyle(doc);
     player.setAttribute?.('data-supratube-ai-subs-active', '1');
     doc.documentElement?.setAttribute?.('data-supratube-ai-subs-active', '1');
+    const ccBtn = findFallbackCcButton(player, doc);
+    const nativeSubsOn =
+        (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn()) ||
+        ccBtn?.getAttribute?.('aria-pressed') === 'true';
+    if (nativeSubsOn && typeof player.toggleSubtitles === 'function') {
+        try { player.toggleSubtitles(); } catch {}
+    }
     try { player.setOption?.('captions', 'track', {}); } catch {}
     try { player.unloadModule?.('captions'); } catch {}
-    if (typeof player.isSubtitlesOn === 'function' && player.isSubtitlesOn()) {
-        try { player.toggleSubtitles?.(); } catch {}
-    }
+    deactivateNativeCcButtonVisual(player, doc, win);
 
     const initialMsg = video?.paused ? 'Subtítulos IA listos (reproduce el video)' : 'Iniciando subtítulos IA...';
     const ok = startWhisperLiveFallback({
@@ -1782,6 +1788,40 @@ function restoreFallbackCcButton(win) {
     }
 }
 
+const HOLLOW_CC_SVG_PATH =
+    'M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H5V6h14v12zM7 11h2v2H7v-2zm4 0h6v2h-6v-2zm0 4h2v2h-2v-2zm-4 0h2v2H7v-2zm8 0h2v2h-2v-2z';
+
+function hasDedicatedIaButton(doc, ctrl) {
+    return Boolean(
+        ctrl?.whisperManualForce ||
+        ctrl?.manualOverlayActive ||
+        doc?.getElementById?.(IA_CC_BTN_ID) ||
+        doc?.documentElement?.getAttribute?.('data-supratube-ai-subs-active') === '1'
+    );
+}
+
+function deactivateNativeCcButtonVisual(player, doc, win) {
+    restoreFallbackCcButton(win);
+    const ccBtn = findFallbackCcButton(player, doc);
+    if (!ccBtn) return;
+    ccBtn.removeAttribute?.('data-supratube-cc-active');
+    if (ccBtn.getAttribute?.('aria-pressed') === 'true') {
+        ccBtn.setAttribute?.('aria-pressed', 'false');
+    }
+    const path = ccBtn.querySelector?.('svg path');
+    if (path && path.getAttribute?.('d') === FILLED_CC_SVG_PATH) {
+        path.setAttribute?.('d', HOLLOW_CC_SVG_PATH);
+    }
+}
+
+function syncWhisperCcButtonVisual(player, doc, win, ctrl, forceReattach = false) {
+    if (hasDedicatedIaButton(doc, ctrl)) {
+        deactivateNativeCcButtonVisual(player, doc, win);
+    } else if (forceReattach || !ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
+        setFallbackCcActive(player, doc, win, 'whisper');
+    }
+}
+
 function setFallbackCcActive(player, doc, win, mode = 'layer1') {
     const ccBtn = findFallbackCcButton(player, doc);
     if (!ccBtn) return;
@@ -1924,7 +1964,11 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
         try { ctrl.stopLoop(); } catch {}
     }
     ctrl.activeVid = videoId;
-    setFallbackCcActive(player, doc, win, 'layer1');
+    if (ctrl.manualOverlayActive) {
+        deactivateNativeCcButtonVisual(player, doc, win);
+    } else {
+        setFallbackCcActive(player, doc, win, 'layer1');
+    }
 
     const renderTick = () => {
         if (ctrl.activeVid !== videoId) return;
@@ -1937,7 +1981,9 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
             clearFallbackCaptions(doc, win);
             return;
         }
-        if (!ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
+        if (ctrl.manualOverlayActive) {
+            deactivateNativeCcButtonVisual(player, doc, win);
+        } else if (!ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
             setFallbackCcActive(player, doc, win, 'layer1');
         }
         const box = ensureFallbackBox(player, doc, win);
@@ -2692,6 +2738,7 @@ function startWhisperLiveFallback({
             const wasForced = Boolean(ctrl.whisperManualForce);
             ctrl.whisperManualForce = true;
             ctrl.forceOverlay = true;
+            deactivateNativeCcButtonVisual(player, doc, win);
             if (!wasForced) {
                 const msg =
                     ctrl.lastWhisperPct > 0 && ctrl.lastWhisperPct < 100
@@ -2721,7 +2768,7 @@ function startWhisperLiveFallback({
     ctrl.lastWhisperPct = 0;
     ctrl.forceOverlay = true;
     video?.setAttribute?.('data-supratube-whisper-target', videoId);
-    setFallbackCcActive(player, doc, win, 'whisper');
+    syncWhisperCcButtonVisual(player, doc, win, ctrl, true);
     syncAiSubtitleButtonState(doc, win);
 
     let fadeTimer = null;
@@ -2850,9 +2897,7 @@ function startWhisperLiveFallback({
             }
         }
 
-        if (!ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
-            setFallbackCcActive(player, doc, win, 'whisper');
-        }
+        syncWhisperCcButtonVisual(player, doc, win, ctrl, false);
         if (d.kind === 'ack') {
             return;
         }
@@ -3249,7 +3294,16 @@ export function bindManualCaptionListeners(
 
     doc.addEventListener('click', ev => {
         if (!ev.isTrusted) return;
-        if (ev.target?.closest?.('.ytp-subtitles-button') || isShortsCaptionMenuClick(ev.target) || isDisabledCcClick(ev)) {
+        const clickedNormalCc =
+            (ev.target?.closest?.('.ytp-subtitles-button') && !ev.target?.closest?.(`#${IA_CC_BTN_ID}`)) ||
+            isDisabledCcClick(ev);
+        if (clickedNormalCc || isShortsCaptionMenuClick(ev.target)) {
+            if (clickedNormalCc) {
+                const ctrl = getFallbackCtrl(win);
+                if (ctrl.whisperVid || ctrl.manualOverlayActive) {
+                    clearFallbackCaptions(doc, win);
+                }
+            }
             clearAutoFlag();
         }
     }, true);
@@ -3317,6 +3371,13 @@ export async function applySmartSubtitles(player, deps = {}) {
     });
 
     const ctrl = getFallbackCtrl(win);
+    if (!deps.manualForce && targetVideoId && (
+        (ctrl.whisperVid === targetVideoId && ctrl.whisperManualForce) ||
+        (ctrl.manualOverlayActive && ctrl.activeVid === targetVideoId) ||
+        ctrl.manualForcePendingVid === targetVideoId
+    )) {
+        return false;
+    }
     if (targetVideoId && ctrl.sameLangVideos.has(targetVideoId) && !deps.manualForce) {
         return false;
     }

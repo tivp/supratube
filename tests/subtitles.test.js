@@ -1721,12 +1721,14 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
     assert.equal(iaBtn2, iaBtn);
     assert.equal(leftGroup.children.length, 2);
 
-    // Click IA button -> immediately starts forced Whisper session with backward-compatible '-es' & lights up icon
+    // Click IA button -> immediately starts forced Whisper session with backward-compatible '-es', lights up [IA], and keeps normal [CC] off
+    ccBtn.setAttribute('aria-pressed', 'true');
     iaBtn.click();
     assert.equal(iaBtn.getAttribute('data-active'), '1');
     assert.equal(iaBtn.getAttribute('aria-pressed'), 'true');
     assert.equal(iaBtn.querySelector('svg')?.getAttribute('data-ia-mode'), '1');
-    assert.equal(ccBtn.getAttribute('aria-pressed'), 'true');
+    assert.equal(ccBtn.getAttribute('aria-pressed'), 'false');
+    assert.equal(ccBtn.getAttribute('data-supratube-cc-active'), null);
     assert.ok(cmds.some(c => c.action === 'start' && c.videoId === 'fEt2anArPb4' && c.targetLang === '-es' && c.manualForce === true));
     assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Iniciando subtítulos IA...');
 
