@@ -74,7 +74,9 @@ export function filterWhisperText(raw, expectedLang = '') {
     return collapsed;
 }
 
-/** Remove overlapping seam words between consecutive sliding-window ASR chunks. */
+const SEAM_COMMON_SHORT_RE = /^(?:el|la|lo|le|un|de|en|es|se|si|no|ya|mi|tu|su|al|me|te|to|of|in|on|is|it|at|as|by|be|we|he|or|an|so|if|do|go|up|my)$/i;
+
+/** Remove overlapping seam words and heal mid-word edge truncations across ASR window boundaries. */
 export function stripCaptionOverlap(prevText, nextText) {
     const prev = String(prevText || '').trim();
     const next = String(nextText || '').trim();
@@ -98,6 +100,43 @@ export function stripCaptionOverlap(prevText, nextText) {
             return nextWords.slice(k).join(' ').trim();
         }
     }
+
+    for (let k = maxK; k >= 2; k--) {
+        const prevAnchor = normWord(prevWords[prevWords.length - k]);
+        const nextFirst = normWord(nextWords[0]);
+        if (nextFirst.length >= 2 && prevAnchor.length > nextFirst.length && prevAnchor.endsWith(nextFirst)) {
+            let tailMatch = true;
+            for (let j = 1; j < k; j++) {
+                const a = normWord(prevWords[prevWords.length - k + j]);
+                const b = normWord(nextWords[j]);
+                if (!a || a !== b) {
+                    tailMatch = false;
+                    break;
+                }
+            }
+            if (tailMatch) {
+                return nextWords.slice(k).join(' ').trim();
+            }
+        }
+    }
+
+    const prevLastRaw = prevWords[prevWords.length - 1].replace(/[.,!?;:…]+$/u, '');
+    const prevLast = normWord(prevLastRaw);
+    const nextFirstRaw = nextWords[0];
+    const nextFirst = normWord(nextFirstRaw);
+    if (
+        nextFirst.length >= 2 &&
+        !SEAM_COMMON_SHORT_RE.test(nextFirst) &&
+        prevLast.length >= nextFirst.length + 2 &&
+        prevLast.endsWith(nextFirst)
+    ) {
+        const leadPunct = nextFirstRaw.match(/^[¿¡"'(\[«]+/u)?.[0] || '';
+        const trailPunct = nextFirstRaw.match(/[.,!?;:…]+$/u)?.[0] || '';
+        const healedWords = nextWords.slice();
+        healedWords[0] = `${leadPunct}${prevLastRaw}${trailPunct}`;
+        return healedWords.join(' ').trim();
+    }
+
     return next;
 }
 
@@ -305,13 +344,79 @@ export function selectRealtimeAsrSpec(spokenLang = '', hasWebGpu = true, preferr
     };
 }
 
-/** Keep streaming Zipformer partial text readable in 1-2 lines without losing sentence endings. */
+/** Keep streaming Zipformer partial text readable in 1-2 lines without breaking words. */
 export function formatStreamingTailText(rawText = '', maxChars = 135) {
     const clean = String(rawText || '').replace(/\s+/g, ' ').trim();
     if (!clean || clean.length <= maxChars) return clean;
-    const tail = clean.slice(-maxChars);
+    const offset = clean.length - maxChars;
+    if (clean[offset - 1] === ' ') {
+        return clean.slice(offset).trim();
+    }
+    const tail = clean.slice(offset);
     const firstSpace = tail.indexOf(' ');
-    return (firstSpace > 0 && firstSpace < tail.length - 12 ? tail.slice(firstSpace + 1) : tail).trim();
+    return (firstSpace >= 0 ? tail.slice(firstSpace + 1) : tail).trim();
+}
+
+/** Withhold an incomplete trailing word while the speaker is still mid-word on an interim streaming buffer. */
+export function trimIncompleteStreamingText(rawText = '', isSpeakingNow = false) {
+    const clean = String(rawText || '').replace(/\s+/g, ' ').trim();
+    if (!clean || !isSpeakingNow) return clean;
+    if (/[.?!…]["')\]»]*$/u.test(clean)) return clean;
+    const words = clean.split(' ');
+    if (words.length >= 3 || (words.length === 2 && words[0].length >= 4)) {
+        return words.slice(0, -1).join(' ');
+    }
+    return clean;
+}
+
+/** Find the quietest inter-word silence valley in [searchFrom, searchTo] to avoid mid-word cuts. */
+export function findBestSilenceCutSample(chunks, searchFrom, searchTo, fallbackSample = searchTo) {
+    const from = Math.floor(Number(searchFrom) || 0);
+    const to = Math.floor(Number(searchTo) || 0);
+    if (!Array.isArray(chunks) || !chunks.length || to - from < 512) return fallbackSample;
+
+    const len = to - from;
+    const buf = new Float32Array(len);
+    let copiedAny = false;
+    for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i];
+        if (!c?.pcm || c.end <= from || c.start >= to) continue;
+        const a = Math.max(from, c.start);
+        const b = Math.min(to, c.end);
+        if (b > a) {
+            buf.set(c.pcm.subarray(a - c.start, b - c.start), a - from);
+            copiedAny = true;
+        }
+    }
+    if (!copiedAny) return fallbackSample;
+
+    const frameSize = 512;
+    const hop = 256;
+    const frameRms = [];
+    const frameCenter = [];
+    for (let off = 0; off + frameSize <= len; off += hop) {
+        let sum = 0;
+        for (let k = 0; k < frameSize; k++) {
+            const s = buf[off + k];
+            sum += s * s;
+        }
+        frameRms.push(Math.sqrt(sum / frameSize));
+        frameCenter.push(from + off + (frameSize >> 1));
+    }
+    if (!frameRms.length) return fallbackSample;
+
+    let bestSample = fallbackSample;
+    let bestEnergy = Infinity;
+    for (let i = 0; i < frameRms.length; i++) {
+        const smoothed = frameRms.length >= 3
+            ? 0.25 * frameRms[Math.max(0, i - 1)] + 0.5 * frameRms[i] + 0.25 * frameRms[Math.min(frameRms.length - 1, i + 1)]
+            : frameRms[i];
+        if (smoothed < bestEnergy) {
+            bestEnergy = smoothed;
+            bestSample = frameCenter[i];
+        }
+    }
+    return bestSample;
 }
 
 /** Adaptive noise-floor speech detector that separates voice from background music/ambience. */

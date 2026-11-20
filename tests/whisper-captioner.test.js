@@ -10,6 +10,8 @@ import {
     normalizeAiAudioLang,
     hasSherpaLanguageModel,
     formatStreamingTailText,
+    trimIncompleteStreamingText,
+    findBestSilenceCutSample,
     computeAdaptiveSpeechThreshold,
     gentleConditionPcm,
     SileroStreamingVadState
@@ -260,4 +262,37 @@ test('selectRealtimeAsrSpec routes turbo engine to Whisper Large-v3-Turbo WebGPU
 
     const turboNoF16 = selectRealtimeAsrSpec('en', true, 'turbo', false);
     assert.deepEqual(turboNoF16.candidates[0].dtype, { encoder_model: 'q4', decoder_model_merged: 'q4' });
+});
+
+test('stripCaptionOverlap heals split leading edge words across cuts and removes partial-word seam overlaps', () => {
+    assert.equal(
+        stripCaptionOverlap('Él decía', 'cía niño o niña.'),
+        'decía niño o niña.'
+    );
+    assert.equal(
+        stripCaptionOverlap('when you understand this', 'derstand this you can'),
+        'you can'
+    );
+    // Common short function words must NOT merge falsely into preceding words:
+    assert.equal(
+        stripCaptionOverlap('Hola', 'la mesa está lista'),
+        'la mesa está lista'
+    );
+});
+
+test('trimIncompleteStreamingText withholds partial trailing tokens while speaking and releases completed words', () => {
+    assert.equal(trimIncompleteStreamingText('Hola pepi', true), 'Hola');
+    assert.equal(trimIncompleteStreamingText('Hola pepito', false), 'Hola pepito');
+    assert.equal(trimIncompleteStreamingText('Hola pepito.', true), 'Hola pepito.');
+    assert.equal(trimIncompleteStreamingText('pepito', true), 'pepito');
+});
+
+test('findBestSilenceCutSample selects the quiet inter-word pause instead of active speech peaks', () => {
+    const pcm = new Float32Array(4096);
+    for (let i = 0; i < pcm.length; i++) {
+        // Active vowel energy in [0..1400) and [2600..4096); silence valley centered around sample 2000.
+        pcm[i] = (i >= 1400 && i < 2600) ? 0.0001 : 0.35 * Math.sin(i * 0.25);
+    }
+    const cut = findBestSilenceCutSample([{ start: 0, end: 4096, pcm }], 500, 3500, 3500);
+    assert.ok(cut >= 1500 && cut <= 2500, `expected cut in silence valley, got ${cut}`);
 });

@@ -126,7 +126,7 @@
     window.addEventListener('supratube-bridge-abort', onBridgeAbort);
 
     const captureByVideo = new WeakMap();
-    let whisperSession = { active: false, videoId: '', pendingVideoId: '', video: null, connected: false };
+    let whisperSession = { active: false, videoId: '', pendingVideoId: '', sig: '', video: null, connected: false };
     let whisperStartSeq = 0;
 
     function disconnectProc(entry) {
@@ -148,7 +148,7 @@
         if (videoId && curVid && videoId !== curVid) return;
         const vid = curVid;
         const vidEl = whisperSession.video;
-        whisperSession = { active: false, videoId: '', pendingVideoId: '', video: null, connected: false };
+        whisperSession = { active: false, videoId: '', pendingVideoId: '', sig: '', video: null, connected: false };
         if (vidEl) {
             disconnectProc(captureByVideo.get(vidEl));
         }
@@ -267,12 +267,23 @@
             document.querySelector('video');
         if (!vidEl) return;
 
+        const sig = `${videoId}:${targetLang}:${String(spokenLang || '')}:${String(asrEngine || 'sherpa')}:${String(aiAudioLang || 'auto')}:${Boolean(manualForce)}`;
+        if (
+            ((whisperSession.active && whisperSession.videoId === videoId) || whisperSession.pendingVideoId === videoId) &&
+            whisperSession.sig === sig &&
+            whisperSession.video === vidEl
+        ) {
+            return;
+        }
+
         const prevVid = whisperSession.videoId || whisperSession.pendingVideoId;
         if ((whisperSession.active || whisperSession.pendingVideoId) && prevVid !== videoId) {
             stopWhisperCapture(prevVid);
         }
         const token = ++whisperStartSeq;
         whisperSession.pendingVideoId = videoId;
+        whisperSession.video = vidEl;
+        whisperSession.sig = sig;
 
         const startRes = await new Promise(resolve => {
             try {
@@ -295,6 +306,7 @@
         if (token !== whisperStartSeq) return;
         if (!startRes?.ok) {
             whisperSession.pendingVideoId = '';
+            whisperSession.sig = '';
             window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
                 detail: { kind: 'error', videoId, error: startRes?.error || 'offscreen unavailable' }
             }));
@@ -388,7 +400,7 @@
         }
         if (token !== whisperStartSeq) return;
 
-        whisperSession = { active: true, videoId, pendingVideoId: '', video: vidEl, connected: true };
+        whisperSession = { active: true, videoId, pendingVideoId: '', sig, video: vidEl, connected: true };
         entry.zeroBatches = 0;
         let batch = [];
         let len = 0;

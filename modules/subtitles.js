@@ -1596,6 +1596,9 @@ export function startManualAiCaptions({
     ctrl.sameLangVideos.delete(videoId);
     ctrl.manualForcePendingVid = videoId;
     ctrl.activePlayer = player;
+    clearTimeout(ctrl.watchdogTimer);
+    ctrl.watchdogTimer = null;
+    getTtState(win).onFailureCallbacks.delete(videoId);
     ensureIaButtonStyle(doc);
     ensureShortsCaptionStyle(doc);
     player.setAttribute?.('data-supratube-ai-subs-active', '1');
@@ -2329,6 +2332,8 @@ function downsampleFloat32To16k(input, srcRate) {
 
 const aiLineTransCache = new Map();
 
+const INPAGE_COMMON_SHORT_RE = /^(?:el|la|lo|le|un|de|en|es|se|si|no|ya|mi|tu|su|al|me|te|to|of|in|on|is|it|at|as|by|be|we|he|or|an|so|if|do|go|up|my)$/i;
+
 function stripInPageOverlap(prevText, nextText) {
     const prev = String(prevText || '').trim();
     const next = String(nextText || '').trim();
@@ -2349,7 +2354,74 @@ function stripInPageOverlap(prevText, nextText) {
         }
         if (match) return nw.slice(k).join(' ').trim();
     }
+    for (let k = maxK; k >= 2; k--) {
+        const prevAnchor = norm(pw[pw.length - k]);
+        const nextFirst = norm(nw[0]);
+        if (nextFirst.length >= 2 && prevAnchor.length > nextFirst.length && prevAnchor.endsWith(nextFirst)) {
+            let tailMatch = true;
+            for (let j = 1; j < k; j++) {
+                const a = norm(pw[pw.length - k + j]);
+                const b = norm(nw[j]);
+                if (!a || a !== b) {
+                    tailMatch = false;
+                    break;
+                }
+            }
+            if (tailMatch) return nw.slice(k).join(' ').trim();
+        }
+    }
+    const prevLastRaw = pw[pw.length - 1].replace(/[.,!?;:…]+$/u, '');
+    const prevLast = norm(prevLastRaw);
+    const nextFirstRaw = nw[0];
+    const nextFirst = norm(nextFirstRaw);
+    if (
+        nextFirst.length >= 2 &&
+        !INPAGE_COMMON_SHORT_RE.test(nextFirst) &&
+        prevLast.length >= nextFirst.length + 2 &&
+        prevLast.endsWith(nextFirst)
+    ) {
+        const leadPunct = nextFirstRaw.match(/^[¿¡"'(\[«]+/u)?.[0] || '';
+        const trailPunct = nextFirstRaw.match(/[.,!?;:…]+$/u)?.[0] || '';
+        const healed = nw.slice();
+        healed[0] = `${leadPunct}${prevLastRaw}${trailPunct}`;
+        return healed.join(' ').trim();
+    }
     return next;
+}
+
+function findInPageSilenceCut(chunks, searchFrom, searchTo, fallbackSample) {
+    const from = Math.floor(Number(searchFrom) || 0);
+    const to = Math.floor(Number(searchTo) || 0);
+    if (!Array.isArray(chunks) || !chunks.length || to - from < 512) return fallbackSample;
+    const len = to - from;
+    const buf = new Float32Array(len);
+    let copied = false;
+    for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i];
+        if (!c?.pcm || c.end <= from || c.start >= to) continue;
+        const a = Math.max(from, c.start);
+        const b = Math.min(to, c.end);
+        if (b > a) {
+            buf.set(c.pcm.subarray(a - c.start, b - c.start), a - from);
+            copied = true;
+        }
+    }
+    if (!copied) return fallbackSample;
+    let bestSample = fallbackSample;
+    let bestRms = Infinity;
+    for (let off = 0; off + 512 <= len; off += 256) {
+        let sum = 0;
+        for (let k = 0; k < 512; k++) {
+            const s = buf[off + k];
+            sum += s * s;
+        }
+        const rms = Math.sqrt(sum / 512);
+        if (rms < bestRms) {
+            bestRms = rms;
+            bestSample = from + off + 256;
+        }
+    }
+    return bestSample;
 }
 
 const ES_HINT_WORDS_RE = /\b(?:el|la|los|las|de|del|en|con|para|por|una|uno|unos|unas|como|este|esta|esto|ese|esa|tu|tus|su|sus|todo|toda|todos|eres|soy|somos|son|que|pero|porque|cuando|donde|quien|siempre|nunca|favor|alma|vida|voz|escucha|historia|resumen|capitulo|explicacion|entrevista|completo|completa|gente|amigos|vamos|quiero|puedes|hacer|tener|saber|verdad|mejor|aqui|ahora|hoy|nuevo|nueva|español|espanol|subtitulos|consciencia|ejercicio|usalo)\b/gi;
@@ -2532,7 +2604,10 @@ function startInPageSttFallback({
 
     const flushWindow = async (fromSample, toSample, isCut) => {
         if (stopped || busy || ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
-        const winLen = toSample - fromSample;
+        const endSample = isCut
+            ? findInPageSilenceCut(buf, Math.max(fromSample + Math.round(SR * 1.0), toSample - Math.round(SR * 1.2)), toSample - Math.round(SR * 0.15), toSample)
+            : toSample;
+        const winLen = endSample - fromSample;
         if (winLen < MIN_SPEECH) return;
 
         busy = true;
@@ -2540,13 +2615,15 @@ function startInPageSttFallback({
             const merged = new Float32Array(winLen);
             for (let i = 0; i < buf.length; i++) {
                 const c = buf[i];
-                if (c.end <= fromSample || c.start >= toSample) continue;
+                if (c.end <= fromSample || c.start >= endSample) continue;
                 const a = Math.max(fromSample, c.start);
-                const b = Math.min(toSample, c.end);
+                const b = Math.min(endSample, c.end);
                 merged.set(c.pcm.subarray(a - c.start, b - c.start), a - fromSample);
             }
 
-            const newStart = isCut ? Math.max(0, toSample - OVERLAP) : toSample;
+            const newStart = isCut
+                ? findInPageSilenceCut(buf, Math.max(fromSample + Math.round(SR * 0.8), endSample - Math.round(SR * 0.6)), endSample, Math.max(0, endSample - OVERLAP))
+                : endSample;
             buf = buf.filter(c => c.end > newStart);
             winStartSample = isCut ? newStart : null;
             if (!isCut) speechEndSample = -1;
@@ -2777,11 +2854,13 @@ function startWhisperLiveFallback({
             ctrl.forceOverlay = true;
             deactivateNativeCcButtonVisual(player, doc, win);
             if (!wasForced) {
-                const msg =
-                    ctrl.lastWhisperPct > 0 && ctrl.lastWhisperPct < 100
-                        ? `Subtítulos IA (${ctrl.lastWhisperPct}%)...`
-                        : (initialMessage || 'Subtítulos IA escuchando...');
-                ctrl.showWhisperLine?.(msg, 0);
+                if (!ctrl.hasReceivedWhisperCaption && ctrl.lastWhisperPct < 100) {
+                    const msg =
+                        ctrl.lastWhisperPct > 0 && ctrl.lastWhisperPct < 100
+                            ? `Subtítulos IA (${ctrl.lastWhisperPct}%)...`
+                            : (initialMessage || 'Subtítulos IA escuchando...');
+                    ctrl.showWhisperLine?.(msg, 0);
+                }
                 dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, spokenLang, asrEngine: engine, aiAudioLang: prefAudioLang, manualForce: true });
                 syncAiSubtitleButtonState(doc, win);
             }
@@ -2796,6 +2875,10 @@ function startWhisperLiveFallback({
         try { ctrl.stopLoop(); } catch {}
         ctrl.stopLoop = null;
     }
+
+    clearTimeout(ctrl.watchdogTimer);
+    ctrl.watchdogTimer = null;
+    getTtState(win).onFailureCallbacks.delete(videoId);
 
     ctrl.activeVid = videoId;
     ctrl.whisperVid = videoId;
@@ -2818,6 +2901,7 @@ function startWhisperLiveFallback({
     let bridgeWatchdog = null;
     let waitingPlayBanner = false;
     let gotBridgeReply = false;
+    let modelReadyReached = false;
     let transSeq = 0;
     ctrl.stopInPageStt = null;
 
@@ -2937,6 +3021,10 @@ function startWhisperLiveFallback({
                 clearTimeout(bridgeWatchdog);
                 bridgeWatchdog = null;
             }
+            if (typeof ctrl.stopInPageStt === 'function') {
+                try { ctrl.stopInPageStt(); } catch {}
+                ctrl.stopInPageStt = null;
+            }
         }
 
         syncWhisperCcButtonVisual(player, doc, win, ctrl, false);
@@ -2949,6 +3037,7 @@ function startWhisperLiveFallback({
             return;
         }
         if (d.kind === 'progress') {
+            if (ctrl.hasReceivedWhisperCaption || modelReadyReached || ctrl.lastWhisperPct >= 100) return;
             ctrl.lastWhisperPct = Number(d.pct) || 0;
             if (d.pct > 0 && d.pct < 100) {
                 waitingPlayBanner = false;
@@ -2957,6 +3046,7 @@ function startWhisperLiveFallback({
             return;
         }
         if (d.kind === 'waiting_play') {
+            if (ctrl.hasReceivedWhisperCaption) return;
             if (ctrl.whisperManualForce) {
                 waitingPlayBanner = true;
                 showLine('Subtítulos IA listos (reproduce el video)', 0);
@@ -2966,8 +3056,10 @@ function startWhisperLiveFallback({
             return;
         }
         if (d.kind === 'ready') {
+            modelReadyReached = true;
             ctrl.lastWhisperPct = 100;
-            if (ctrl.whisperManualForce && !ctrl.hasReceivedWhisperCaption) {
+            if (ctrl.hasReceivedWhisperCaption) return;
+            if (ctrl.whisperManualForce) {
                 if (video?.paused) {
                     waitingPlayBanner = true;
                     showLine('Subtítulos IA listos (reproduce el video)', 0);
@@ -2979,13 +3071,16 @@ function startWhisperLiveFallback({
             return;
         }
         if (d.kind === 'lang_detected') {
-            if (ctrl.whisperManualForce && !ctrl.hasReceivedWhisperCaption) {
+            if (ctrl.hasReceivedWhisperCaption) return;
+            if (ctrl.whisperManualForce) {
                 const langLabel = d.lang === 'es' ? 'Español' : (d.lang === 'en' ? 'Inglés' : String(d.lang || '').toUpperCase());
                 showLine(`Voz detectada (${langLabel}) · activando motor rápido...`, 0);
             }
             return;
         }
         if (d.kind === 'caption') {
+            modelReadyReached = true;
+            ctrl.lastWhisperPct = 100;
             const rawTxt = String(d.raw || '').trim();
             const transTxt = String(d.translated || '').trim();
             const spokenBase = normalizeBaseLang(d.lang || d.locked);
@@ -3070,7 +3165,7 @@ function startWhisperLiveFallback({
             if (!gotBridgeReply && ctrl.whisperVid === videoId && ctrl.activeVid === videoId && !ctrl.hasReceivedWhisperCaption) {
                 activateInPageFallback();
             }
-        }, hasBridge ? 2000 : 600);
+        }, hasBridge ? 8000 : 600);
         if (typeof bridgeWatchdog?.unref === 'function') bridgeWatchdog.unref();
     }
 

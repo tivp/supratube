@@ -11,6 +11,8 @@ import {
     normalizeAiAudioLang,
     hasSherpaLanguageModel,
     formatStreamingTailText,
+    trimIncompleteStreamingText,
+    findBestSilenceCutSample,
     computeAdaptiveSpeechThreshold,
     gentleConditionPcm,
     SileroStreamingVadState
@@ -32,12 +34,13 @@ ort.env.wasm.numThreads = 1;
 
 const SR = 16000;
 const S = sec => Math.round(sec * SR);
-const MIN_FIRST_WINDOW = S(0.85);
-const MAX_WINDOW = S(3.8);
-const OVERLAP = S(0.55);
-const PAUSE_FINAL = S(0.38);
-const PRE_ROLL = S(0.28);
-const INTERIM_STEP = S(0.85);
+const MIN_FIRST_WINDOW = S(1.15);
+const SOFT_CUT_WINDOW = S(3.4);
+const MAX_WINDOW = S(5.6);
+const OVERLAP = S(0.45);
+const PAUSE_FINAL = S(0.40);
+const PRE_ROLL = S(0.38);
+const INTERIM_STEP = S(1.1);
 const SHERPA_DB_NAME = 'supratube-sherpa-models-v1';
 const SHERPA_STORE = 'files';
 const MYMEMORY_CONTACT = 'supratube.ext.translator@gmail.com';
@@ -115,11 +118,14 @@ let sileroInitPromise = null;
 let sileroState = new Float32Array(2 * 1 * 128);
 let sileroContext = new Float32Array(64);
 let sileroSr = null;
-const sileroVad = new SileroStreamingVadState({ onset: 0.45, offset: 0.30, minSpeechFrames: 8, minSilenceFrames: 13 });
+const sileroVad = new SileroStreamingVadState({ onset: 0.36, offset: 0.22, minSpeechFrames: 7, minSilenceFrames: 20 });
 let vadResidual = new Float32Array(0);
 let vadPreRoll = [];
 let utteranceConfirmedByVad = false;
 let pcmChain = Promise.resolve();
+let gpuInfoPromise = null;
+let hasEmittedReadyForVid = false;
+let hasEmittedCaptionForVid = false;
 
 let loadedKey = '';
 let loading = null;
@@ -404,58 +410,79 @@ function setBoundedTrans(key, val) {
     transCache.set(key, val);
 }
 
-async function initModel(spokenHint = '', enginePref = preferredEngine) {
-    let gpu = false;
-    let hasShaderF16 = false;
-    try {
-        const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
-        gpu = Boolean(adapter);
-        hasShaderF16 = Boolean(adapter?.features?.has?.('shader-f16'));
-    } catch {}
-    await ensureSileroSession();
-
-    const effectiveHint = requestedAiAudioLang !== 'auto' ? requestedAiAudioLang : spokenHint;
-    const spec = selectRealtimeAsrSpec(effectiveHint, gpu, enginePref, hasShaderF16);
-    const primaryId = spec.candidates[0]?.id || spec.primaryEngine;
-    const desiredKey = `${primaryId}:${spec.primaryEngine}:${gpu ? 'webgpu' : 'wasm'}:${spec.lang}:${spec.lidAutoPromote ? 'lid' : 'direct'}`;
-    if ((sherpaOnlineRec || model) && loadedKey === desiredKey) {
-        lidAutoPromotePending = Boolean(spec.lidAutoPromote);
-        if (activeEngine === 'sherpa' && !sherpaStream) {
-            recreateSherpaStream();
-        }
-        self.postMessage({
-            kind: 'ready',
-            videoId: activeVideoId,
-            engine: activeEngine,
-            lang: activeModelLang || (effectiveHint || 'auto'),
-            lid: lidAutoPromotePending,
-            model: loadedKey
-        });
-        return;
+function detectWebGpuCapabilities() {
+    if (!gpuInfoPromise) {
+        gpuInfoPromise = (async () => {
+            try {
+                const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+                return {
+                    gpu: Boolean(adapter),
+                    hasShaderF16: Boolean(adapter?.features?.has?.('shader-f16'))
+                };
+            } catch {
+                return { gpu: false, hasShaderF16: false };
+            }
+        })();
     }
+    return gpuInfoPromise;
+}
+
+async function initModel(spokenHint = '', enginePref = preferredEngine, { silent = false } = {}) {
     if (loading) {
-        if (loadingKey === desiredKey) return loading;
-        try { await loading; } catch {}
+        await loading.catch(() => {});
     }
 
-    loadingKey = desiredKey;
-    loading = (async () => {
+    const loadRun = (async () => {
+        const [{ gpu, hasShaderF16 }] = await Promise.all([
+            detectWebGpuCapabilities(),
+            ensureSileroSession()
+        ]);
+        if (stopped) return;
+
+        const effectiveHint = requestedAiAudioLang !== 'auto' ? requestedAiAudioLang : spokenHint;
+        const spec = selectRealtimeAsrSpec(effectiveHint, gpu, enginePref, hasShaderF16);
+        const primaryId = spec.candidates[0]?.id || spec.primaryEngine;
+        const desiredKey = `${primaryId}:${spec.primaryEngine}:${gpu ? 'webgpu' : 'wasm'}:${spec.lang}:${spec.lidAutoPromote ? 'lid' : 'direct'}`;
+        if ((sherpaOnlineRec || model) && loadedKey === desiredKey) {
+            lidAutoPromotePending = Boolean(spec.lidAutoPromote);
+            if (activeEngine === 'sherpa' && !sherpaStream) {
+                recreateSherpaStream();
+            }
+            if (!silent && !hasEmittedReadyForVid && !hasEmittedCaptionForVid) {
+                hasEmittedReadyForVid = true;
+                self.postMessage({
+                    kind: 'ready',
+                    videoId: activeVideoId,
+                    engine: activeEngine,
+                    lang: activeModelLang || (effectiveHint || 'auto'),
+                    lid: lidAutoPromotePending,
+                    model: loadedKey
+                });
+            }
+            return;
+        }
+
+        loadingKey = desiredKey;
         const t0 = performance.now();
         lidAutoPromotePending = Boolean(spec.lidAutoPromote);
-        disposeSherpaResources();
-        if (model) {
-            try { await model.dispose?.(); } catch {}
-            model = null;
-            processor = null;
-            tokenizer = null;
-        }
+        const suppressUiProgress = Boolean(silent || hasEmittedReadyForVid || hasEmittedCaptionForVid);
+
+        const releasePreviousModels = async () => {
+            disposeSherpaResources();
+            if (model) {
+                try { await model.dispose?.(); } catch {}
+                model = null;
+                processor = null;
+                tokenizer = null;
+            }
+        };
 
         let lastErr = null;
         for (const cand of spec.candidates) {
             let lastPct = -1;
             const files = new Map();
             const progress_callback = p => {
-                if (!p?.file) return;
+                if (suppressUiProgress || !p?.file) return;
                 if (p.status === 'progress') files.set(p.file, [p.loaded, p.total]);
                 else if (p.status === 'done') {
                     const f = files.get(p.file);
@@ -485,12 +512,17 @@ async function initModel(spokenHint = '', enginePref = preferredEngine) {
 
             try {
                 if (cand.engine === 'sherpa') {
-                    const mod = await getSherpaModule();
+                    const [mod, downloadedFiles] = await Promise.all([
+                        getSherpaModule(),
+                        Promise.all(cand.files.map(fname => fetchHfFileCached(cand.id, fname, progress_callback)))
+                    ]);
+                    await releasePreviousModels();
                     const prefix = `sherpa_${cand.lang || 'en'}`;
                     const vPaths = [];
                     try {
-                        for (const fname of cand.files) {
-                            const bytes = await fetchHfFileCached(cand.id, fname, progress_callback);
+                        for (let i = 0; i < cand.files.length; i++) {
+                            const fname = cand.files[i];
+                            const bytes = downloadedFiles[i];
                             const vPath = `/${prefix}_${fname}`;
                             try { mod.FS_unlink(vPath); } catch {}
                             mod.FS_createDataFile('/', `${prefix}_${fname}`, bytes, true, true, true);
@@ -531,6 +563,7 @@ async function initModel(spokenHint = '', enginePref = preferredEngine) {
                     activeModelLang = cand.lang || 'en';
                     loadedKey = desiredKey;
                 } else {
+                    await releasePreviousModels();
                     env.backends.onnx.wasm.wasmPaths = ASYNCIFY;
                     env.backends.onnx.wasm.numThreads = 1;
                     const m = await WhisperForConditionalGeneration.from_pretrained(cand.id, {
@@ -548,16 +581,19 @@ async function initModel(spokenHint = '', enginePref = preferredEngine) {
                     await inferSamples(new Float32Array(SR), null);
                 }
 
-                self.postMessage({
-                    kind: 'ready',
-                    videoId: activeVideoId,
-                    engine: activeEngine,
-                    lang: activeModelLang || 'auto',
-                    lid: lidAutoPromotePending,
-                    backend: cand.device,
-                    model: cand.id,
-                    loadMs: Math.round(performance.now() - t0)
-                });
+                if (!silent && !hasEmittedReadyForVid && !hasEmittedCaptionForVid) {
+                    hasEmittedReadyForVid = true;
+                    self.postMessage({
+                        kind: 'ready',
+                        videoId: activeVideoId,
+                        engine: activeEngine,
+                        lang: activeModelLang || 'auto',
+                        lid: lidAutoPromotePending,
+                        backend: cand.device,
+                        model: cand.id,
+                        loadMs: Math.round(performance.now() - t0)
+                    });
+                }
                 return;
             } catch (err) {
                 disposeSherpaResources();
@@ -565,12 +601,17 @@ async function initModel(spokenHint = '', enginePref = preferredEngine) {
             }
         }
         self.postMessage({ kind: 'error', videoId: activeVideoId, error: String(lastErr?.message || lastErr) });
-    })().finally(() => {
-        loading = null;
-        loadingKey = '';
-    });
+    })();
 
-    return loading;
+    const tracked = loadRun.finally(() => {
+        if (loading === tracked) {
+            loading = null;
+            loadingKey = '';
+        }
+    });
+    loading = tracked;
+
+    return tracked;
 }
 
 async function inferSamples(samples, forced) {
@@ -673,6 +714,8 @@ async function translateCached(text, from, to) {
     return clean;
 }
 
+let sessionToken = 0;
+
 async function flushSherpaCaptionQueue() {
     if (sherpaTranslating) return;
     sherpaTranslating = true;
@@ -683,6 +726,7 @@ async function flushSherpaCaptionQueue() {
             if (stopped || item.runVid !== activeVideoId || item.seq !== sherpaEmitSeq) continue;
             const translated = await translateCached(item.text, item.lang, targetLang);
             if (stopped || item.runVid !== activeVideoId || item.seq !== sherpaEmitSeq) continue;
+            hasEmittedCaptionForVid = true;
             self.postMessage({
                 kind: 'caption',
                 videoId: item.runVid,
@@ -704,7 +748,7 @@ async function flushSherpaCaptionQueue() {
     }
 }
 
-async function processSherpaChunk(pcm, videoTime, runVid) {
+async function processSherpaChunk(pcm, videoTime, runVid, { isPausedEnd = false } = {}) {
     if (stopped || activeEngine !== 'sherpa' || !sherpaOnlineRec || !sherpaStream || runVid !== activeVideoId) return;
     const t0 = performance.now();
     const conditioned = conditionSherpaChunk(pcm);
@@ -713,8 +757,10 @@ async function processSherpaChunk(pcm, videoTime, runVid) {
         sherpaOnlineRec.decode(sherpaStream);
     }
     const rawResult = filterWhisperText(sherpaOnlineRec.getResult(sherpaStream)?.text || '', activeModelLang || 'en');
-    const isEndpoint = sherpaOnlineRec.isEndpoint(sherpaStream);
-    const displaySrc = formatStreamingTailText(rawResult, 140);
+    const nativeEndpoint = sherpaOnlineRec.isEndpoint(sherpaStream);
+    const isEndpoint = Boolean(nativeEndpoint || isPausedEnd);
+    const stabilized = trimIncompleteStreamingText(rawResult, !isEndpoint);
+    const displaySrc = formatStreamingTailText(stabilized, 140);
     const inferMs = Math.round(performance.now() - t0);
 
     if (displaySrc && (displaySrc !== sherpaLastPartial || isEndpoint)) {
@@ -731,7 +777,7 @@ async function processSherpaChunk(pcm, videoTime, runVid) {
         void flushSherpaCaptionQueue();
     }
 
-    if (isEndpoint && sherpaOnlineRec.getResult(sherpaStream)?.text) {
+    if ((nativeEndpoint || (isPausedEnd && rawResult.length >= 180)) && sherpaOnlineRec.getResult(sherpaStream)?.text) {
         sherpaOnlineRec.reset(sherpaStream);
         sherpaLastPartial = '';
     }
@@ -741,18 +787,25 @@ async function promoteToDetectedSherpa(runVid, detectedBase) {
     if (promoting || stopped || runVid !== activeVideoId || preferredEngine !== 'sherpa') return;
     if (!hasSherpaLanguageModel(detectedBase)) return;
     promoting = true;
-    try {
-        requestedSpokenLang = detectedBase;
-        resetAudioState(false);
+    if (!hasEmittedCaptionForVid) {
         self.postMessage({ kind: 'lang_detected', videoId: runVid, lang: detectedBase, engine: 'sherpa' });
-        await initModel(detectedBase, 'sherpa');
-    } catch (err) {
-        if (!stopped && runVid === activeVideoId) {
-            self.postMessage({ kind: 'error', videoId: runVid, error: String(err?.message || err) });
-        }
-    } finally {
-        promoting = false;
     }
+    pcmChain = pcmChain.then(async () => {
+        if (stopped || runVid !== activeVideoId || preferredEngine !== 'sherpa') return;
+        try {
+            requestedSpokenLang = detectedBase;
+            await initModel(detectedBase, 'sherpa', { silent: true });
+            if (!stopped && runVid === activeVideoId) {
+                resetAudioState(false);
+            }
+        } catch (err) {
+            if (!stopped && runVid === activeVideoId) {
+                self.postMessage({ kind: 'error', videoId: runVid, error: String(err?.message || err) });
+            }
+        } finally {
+            promoting = false;
+        }
+    });
 }
 
 async function maybeInfer(videoTime, runVid) {
@@ -766,11 +819,23 @@ async function maybeInfer(videoTime, runVid) {
     let end = now;
     if (sinceSpeech >= PAUSE_FINAL && lastSpeechEnd > lastFinalEnd) {
         mode = 'final';
-        end = Math.min(now, lastSpeechEnd + S(0.3));
+        end = Math.min(now, lastSpeechEnd + S(0.32));
+    } else if (winLen >= SOFT_CUT_WINDOW && sinceSpeech >= S(0.16) && lastSpeechEnd > lastFinalEnd) {
+        mode = 'final';
+        end = Math.min(now, lastSpeechEnd + S(0.16));
     } else if (winLen >= MAX_WINDOW) {
         mode = 'cut';
+        end = findBestSilenceCutSample(chunks, now - S(1.8), now - S(0.25), now);
     } else if (sinceSpeech < PAUSE_FINAL && winLen >= MIN_FIRST_WINDOW && now - lastInferEnd >= INTERIM_STEP) {
         mode = 'interim';
+        if (sinceSpeech < S(0.14)) {
+            end = findBestSilenceCutSample(
+                chunks,
+                Math.max(utteranceStart + S(0.8), now - S(0.95)),
+                now - S(0.06),
+                now
+            );
+        }
     }
     if (!mode) return;
 
@@ -785,7 +850,7 @@ async function maybeInfer(videoTime, runVid) {
         if (stopped || runVid !== activeVideoId) return;
 
         const inferMs = Math.round(performance.now() - t0);
-        lastInferEnd = end;
+        lastInferEnd = now;
         const confident = (res.avgTokenProb ?? 1) >= 0.45;
         if (confident) {
             const silMs = ((utteranceStart - prevUtteranceEnd) / SR) * 1000;
@@ -809,11 +874,15 @@ async function maybeInfer(videoTime, runVid) {
 
         const expectedLang = res.lang || forced || requestedSpokenLang || '';
         const filtered = confident ? filterWhisperText(res.text, expectedLang) : '';
-        const clean = prevCommittedRaw ? (stripCaptionOverlap(prevCommittedRaw, filtered) || filtered) : filtered;
+        const stabilized = mode === 'interim'
+            ? trimIncompleteStreamingText(filtered, sinceSpeech < S(0.14))
+            : filtered;
+        const clean = prevCommittedRaw ? (stripCaptionOverlap(prevCommittedRaw, stabilized) || stabilized) : stabilized;
         const translated = clean ? await translateCached(clean, res.lang, targetLang) : '';
         if (stopped || runVid !== activeVideoId) return;
 
         if (translated) {
+            hasEmittedCaptionForVid = true;
             self.postMessage({
                 kind: 'caption',
                 videoId: runVid,
@@ -831,13 +900,18 @@ async function maybeInfer(videoTime, runVid) {
         if (mode === 'final') {
             lastFinalEnd = lastSpeechEnd;
             prevUtteranceEnd = lastSpeechEnd;
-            committed = end;
+            committed = Math.min(end, lastSpeechEnd + S(0.08));
             utteranceStart = null;
             utteranceConfirmedByVad = false;
-            prevCommittedRaw = clean;
+            if (clean) prevCommittedRaw = clean;
         } else if (mode === 'cut') {
-            prevCommittedRaw = clean;
-            committed = Math.max(committed, now - OVERLAP);
+            if (clean) prevCommittedRaw = clean;
+            committed = findBestSilenceCutSample(
+                chunks,
+                Math.max(utteranceStart + S(1.0), end - S(0.75)),
+                end,
+                Math.max(committed, end - OVERLAP)
+            );
             utteranceStart = committed;
         }
     } finally {
@@ -856,42 +930,59 @@ self.onmessage = async e => {
         const nextVid = String(m.videoId || '');
         const nextEngine = normalizeAsrEngine(m.asrEngine || preferredEngine);
         const nextAiAudioLang = normalizeAiAudioLang(m.aiAudioLang || 'auto');
-        const nextSpokenLang = String(m.spokenLang || '').trim().toLowerCase();
+        let nextSpokenLang = String(m.spokenLang || '').trim().toLowerCase();
+        if (!nextSpokenLang && activeVideoId === nextVid && requestedSpokenLang) {
+            nextSpokenLang = requestedSpokenLang;
+        }
         const engineChanged = nextEngine !== preferredEngine;
         const langChanged = nextAiAudioLang !== requestedAiAudioLang || nextSpokenLang !== requestedSpokenLang;
-        preferredEngine = nextEngine;
-        requestedAiAudioLang = nextAiAudioLang;
         const sameActiveVid =
             !stopped &&
             !engineChanged &&
             !langChanged &&
             Boolean(nextVid) &&
             activeVideoId === nextVid &&
-            (chunks.length > 0 || (activeEngine === 'sherpa' && Boolean(sherpaStream)));
+            (chunks.length > 0 || (activeEngine === 'sherpa' && Boolean(sherpaStream)) || Boolean(loading));
+
+        preferredEngine = nextEngine;
+        requestedAiAudioLang = nextAiAudioLang;
         activeVideoId = nextVid;
         targetLang = String(m.targetLang || 'es');
         requestedSpokenLang = nextSpokenLang;
         manualForce = Boolean(m.manualForce);
         stopped = false;
         if (!sameActiveVid) {
-            voter.reset();
-            resetAudioState(true);
+            hasEmittedReadyForVid = false;
+            hasEmittedCaptionForVid = false;
         }
-        await initModel(requestedSpokenLang, preferredEngine);
-        if (sameActiveVid && activeEngine === 'whisper' && model) {
-            maybeInfer(lastVideoTime, activeVideoId).catch(err => {
-                if (!stopped && activeVideoId === nextVid) {
-                    self.postMessage({ kind: 'error', videoId: nextVid, error: String(err?.message || err) });
-                }
+        const tok = ++sessionToken;
+        pcmChain = pcmChain.then(async () => {
+            if (stopped || sessionToken !== tok || activeVideoId !== nextVid) return;
+            if (!sameActiveVid) {
+                voter.reset();
+                resetAudioState(true);
+            }
+            await initModel(requestedSpokenLang, preferredEngine, {
+                silent: sameActiveVid && (hasEmittedReadyForVid || hasEmittedCaptionForVid)
             });
-        }
+            if (sameActiveVid && !stopped && sessionToken === tok && activeVideoId === nextVid && activeEngine === 'whisper' && model) {
+                await maybeInfer(lastVideoTime, activeVideoId);
+            }
+        }).catch(err => {
+            if (!stopped && activeVideoId === nextVid) {
+                self.postMessage({ kind: 'error', videoId: nextVid, error: String(err?.message || err) });
+            }
+        });
         return;
     }
 
     if (m.kind === 'RESET') {
-        if (!m.videoId || m.videoId === activeVideoId) {
-            resetAudioState(true);
-        }
+        const tok = sessionToken;
+        pcmChain = pcmChain.then(() => {
+            if (!stopped && sessionToken === tok && (!m.videoId || m.videoId === activeVideoId)) {
+                resetAudioState(true);
+            }
+        });
         return;
     }
 
@@ -899,8 +990,15 @@ self.onmessage = async e => {
         if (!m.videoId || m.videoId === activeVideoId) {
             stopped = true;
             activeVideoId = '';
-            voter.reset();
-            resetAudioState(true);
+            hasEmittedReadyForVid = false;
+            hasEmittedCaptionForVid = false;
+            const tok = ++sessionToken;
+            pcmChain = pcmChain.then(() => {
+                if (sessionToken === tok) {
+                    voter.reset();
+                    resetAudioState(true);
+                }
+            });
         }
         return;
     }
@@ -922,6 +1020,9 @@ self.onmessage = async e => {
                 combined.set(vadResidual, 0);
                 combined.set(pcm, vadResidual.length);
                 let off = 0;
+                const sherpaSpeechParts = [];
+                let sherpaPausedEnded = false;
+
                 while (off + 512 <= combined.length) {
                     if (stopped || runVid !== activeVideoId) return;
                     const frame512 = combined.subarray(off, off + 512);
@@ -933,36 +1034,18 @@ self.onmessage = async e => {
                     if (activeEngine === 'sherpa' && sherpaOnlineRec && sherpaStream) {
                         if (st.justStarted) {
                             for (const pre of vadPreRoll) {
-                                await processSherpaChunk(pre, videoTime, runVid);
+                                sherpaSpeechParts.push(pre);
                             }
                             vadPreRoll = [];
-                            await processSherpaChunk(frame512, videoTime, runVid);
+                            sherpaSpeechParts.push(new Float32Array(frame512));
                         } else if (st.isSpeech) {
-                            await processSherpaChunk(frame512, videoTime, runVid);
+                            sherpaSpeechParts.push(new Float32Array(frame512));
                         } else if (st.justEnded) {
-                            await processSherpaChunk(new Float32Array(8000), videoTime, runVid);
-                            if (sherpaOnlineRec && sherpaStream) {
-                                const remRaw = filterWhisperText(sherpaOnlineRec.getResult(sherpaStream)?.text || '', activeModelLang || 'en');
-                                const remDisplay = formatStreamingTailText(remRaw, 140);
-                                if (remDisplay && remDisplay !== sherpaLastPartial) {
-                                    sherpaLastPartial = remDisplay;
-                                    sherpaPendingEmit = {
-                                        seq: sherpaEmitSeq,
-                                        runVid,
-                                        mode: 'final',
-                                        text: remDisplay,
-                                        lang: activeModelLang || 'en',
-                                        inferMs: 0,
-                                        videoTime
-                                    };
-                                    void flushSherpaCaptionQueue();
-                                }
-                                sherpaOnlineRec.reset(sherpaStream);
-                                sherpaLastPartial = '';
-                            }
+                            sherpaSpeechParts.push(new Float32Array(4800));
+                            sherpaPausedEnded = true;
                         } else {
                             vadPreRoll.push(new Float32Array(frame512));
-                            if (vadPreRoll.length > 12) vadPreRoll.shift();
+                            if (vadPreRoll.length > 16) vadPreRoll.shift();
                         }
                     } else if (activeEngine === 'whisper') {
                         const start = total;
@@ -982,7 +1065,17 @@ self.onmessage = async e => {
                 }
                 vadResidual = combined.slice(off);
 
-                if (activeEngine === 'whisper' && model) {
+                if (activeEngine === 'sherpa' && sherpaOnlineRec && sherpaStream && sherpaSpeechParts.length) {
+                    let batchLen = 0;
+                    for (let i = 0; i < sherpaSpeechParts.length; i++) batchLen += sherpaSpeechParts[i].length;
+                    const batchPcm = new Float32Array(batchLen);
+                    let pos = 0;
+                    for (let i = 0; i < sherpaSpeechParts.length; i++) {
+                        batchPcm.set(sherpaSpeechParts[i], pos);
+                        pos += sherpaSpeechParts[i].length;
+                    }
+                    await processSherpaChunk(batchPcm, videoTime, runVid, { isPausedEnd: sherpaPausedEnded });
+                } else if (activeEngine === 'whisper' && model) {
                     const keepFrom = Math.min(committed, utteranceStart ?? committed) - S(2);
                     while (chunks.length && chunks[0].end < keepFrom) {
                         chunks.shift();

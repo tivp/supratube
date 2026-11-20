@@ -2609,3 +2609,130 @@ test('startManualAiCaptions honors aiAudioLang override and renders Spanish Sher
     assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'No preguntes si');
     clearFallbackCaptions(doc, win);
 });
+
+test('startWhisperLiveFallback stops concurrent in-page thread on offscreen reply and ignores post-caption loading banners', async () => {
+    const elements = new Map();
+    let capturedProc = null;
+    const videoEl = {
+        currentTime: 2,
+        paused: false,
+        ended: false,
+        muted: false,
+        volume: 1,
+        setAttribute() {},
+        removeAttribute() {},
+        addEventListener() {},
+        removeEventListener() {},
+        captureStream: () => ({ getAudioTracks: () => [{ kind: 'audio', readyState: 'live' }] })
+    };
+    const makeAttrs = (init = {}) => {
+        const map = { ...init };
+        return {
+            setAttribute(k, v) { map[k] = String(v); },
+            getAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null; },
+            hasAttribute(k) { return Object.prototype.hasOwnProperty.call(map, k); },
+            removeAttribute(k) { delete map[k]; }
+        };
+    };
+    const createNode = tag => ({
+        tagName: String(tag).toUpperCase(),
+        id: '',
+        className: '',
+        style: {},
+        children: [],
+        parentElement: null,
+        ...makeAttrs(),
+        appendChild(c) { c.parentElement = this; this.children.push(c); if (c.id) elements.set(c.id, c); return c; },
+        insertBefore(c) { return this.appendChild(c); },
+        replaceChildren() { this.children = []; },
+        remove() { if (this.id) elements.delete(this.id); },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        addEventListener() {},
+        removeEventListener() {}
+    });
+
+    const doc = {
+        head: createNode('head'),
+        documentElement: { ...makeAttrs(), dataset: { supratubeWhisperBridge: '1', maximusBridge: '1' } },
+        createElement: tag => createNode(tag),
+        getElementById: id => elements.get(id) || null,
+        querySelector: () => null,
+        querySelectorAll: () => []
+    };
+    const winListeners = {};
+    const sttBridgeReqs = [];
+    class FakeCustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } }
+    const win = {
+        location: { href: 'https://www.youtube.com/shorts/noOverlap99', pathname: '/shorts/noOverlap99' },
+        CustomEvent: FakeCustomEvent,
+        MediaStream: class { constructor(t) { this.tracks = t; } },
+        AudioContext: class {
+            constructor() { this.sampleRate = 16000; this.state = 'running'; this.destination = {}; }
+            createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+            createScriptProcessor() {
+                capturedProc = { connect() {}, disconnect() {}, onaudioprocess: null };
+                return capturedProc;
+            }
+            createGain() { return { gain: { value: 0 }, connect() {} }; }
+        },
+        addEventListener(ev, fn) { (winListeners[ev] ||= []).push(fn); },
+        removeEventListener(ev, fn) { winListeners[ev] = (winListeners[ev] || []).filter(f => f !== fn); },
+        dispatchEvent(ev) {
+            if (ev.type === 'maximus-bridge-stt' && ev.detail?.requestId) {
+                sttBridgeReqs.push(ev.detail);
+                win.dispatchEvent(new FakeCustomEvent(`maximus-bridge-stt-res-${ev.detail.requestId}`, {
+                    detail: { ok: true, text: 'Fallback one' }
+                }));
+            }
+            for (const fn of [...(winListeners[ev.type] || [])]) fn(ev);
+        }
+    };
+    const player = {
+        id: 'shorts-player',
+        clientWidth: 380,
+        ...makeAttrs(),
+        getVideoData: () => ({ video_id: 'noOverlap99' }),
+        querySelector: sel => (sel === 'video' ? videoEl : (sel === '#supratube-fallback-captions' ? (elements.get('supratube-fallback-captions') || null) : null)),
+        querySelectorAll: () => [],
+        appendChild: el => { if (el.id) elements.set(el.id, el); return el; }
+    };
+
+    const ok = startManualAiCaptions({
+        player,
+        videoId: 'noOverlap99',
+        userLang: 'es',
+        doc,
+        win,
+        requestFn: async () => ({ status: 200, text: JSON.stringify({ sentences: [{ trans: 'Respaldo uno' }] }) })
+    });
+    assert.equal(ok, true);
+
+    // 1. Transient error starts in-page STT thread.
+    win.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'error', videoId: 'noOverlap99', error: 'offscreen warm-up' }
+    }));
+    assert.ok(capturedProc && typeof capturedProc.onaudioprocess === 'function');
+
+    // 2. When offscreen worker starts replying, in-page STT thread is terminated immediately so both never coexist.
+    win.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'caption', videoId: 'noOverlap99', mode: 'final', engine: 'sherpa', lang: 'es', raw: 'Dijo pepito.', translated: 'Dijo pepito.' }
+    }));
+    assert.equal(capturedProc.onaudioprocess, null);
+    assert.equal(sttBridgeReqs.length, 0);
+    const box = elements.get('supratube-fallback-captions');
+    assert.equal(box?.children[0]?.textContent, 'Dijo pepito.');
+
+    // 3. Stale/duplicate loading progress, lang_detected, ready, or waiting_play events NEVER overwrite active captions.
+    for (const evt of [
+        { kind: 'progress', videoId: 'noOverlap99', pct: 35 },
+        { kind: 'lang_detected', videoId: 'noOverlap99', lang: 'en' },
+        { kind: 'waiting_play', videoId: 'noOverlap99' },
+        { kind: 'ready', videoId: 'noOverlap99' }
+    ]) {
+        win.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', { detail: evt }));
+        assert.equal(box?.children[0]?.textContent, 'Dijo pepito.', `must ignore ${evt.kind} after caption received`);
+    }
+
+    clearFallbackCaptions(doc, win);
+});
