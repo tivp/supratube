@@ -762,17 +762,17 @@ async function processSherpaChunk(pcm, videoTime, runVid, { isPausedEnd = false 
     const { leadPunct, rest: rawBody } = extractLeadingPunctuation(rawDecoded);
     const rawResult = filterWhisperText(rawBody, activeModelLang || 'en');
     const nativeEndpoint = sherpaOnlineRec.isEndpoint(sherpaStream);
-    const isEndpoint = Boolean(nativeEndpoint || isPausedEnd);
-    const stabilized = trimIncompleteStreamingText(rawResult, !isEndpoint);
+    const shouldReset = Boolean((nativeEndpoint || (isPausedEnd && rawResult.length >= 48)) && rawDecoded);
+    const stabilized = trimIncompleteStreamingText(rawResult, !shouldReset);
     const displaySrc = formatStreamingTailText(stabilized, 140);
     const inferMs = Math.round(performance.now() - t0);
 
-    if (displaySrc && (displaySrc !== sherpaLastPartial || isEndpoint)) {
+    if (displaySrc && (displaySrc !== sherpaLastPartial || shouldReset)) {
         sherpaLastPartial = displaySrc;
         sherpaPendingEmit = {
             seq: sherpaEmitSeq,
             runVid,
-            mode: isEndpoint ? 'final' : 'interim',
+            mode: shouldReset ? 'final' : 'interim',
             text: displaySrc,
             leadPunct: leadPunct || '',
             lang: activeModelLang || 'en',
@@ -782,7 +782,7 @@ async function processSherpaChunk(pcm, videoTime, runVid, { isPausedEnd = false 
         void flushSherpaCaptionQueue();
     }
 
-    if ((nativeEndpoint || (isPausedEnd && rawResult.length >= 84)) && rawDecoded) {
+    if (shouldReset) {
         sherpaOnlineRec.reset(sherpaStream);
         sherpaLastPartial = '';
     }

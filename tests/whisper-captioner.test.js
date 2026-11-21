@@ -344,6 +344,21 @@ test('createLiveTraditionalSegmenter stitches deferred leading dots, coalesces s
     assert.equal(esTrad[0].text, 'Me gustas tú pero vale, te digo que sí.');
     assert.ok(esTrad.every(c => !/^[.,;:!?…]/.test(c.text)));
 
+    // Long continuous 132-char Sherpa stream never exceeds 2 lines or maxLineChars per line:
+    const longUtterance = 'Sale de tu móvil junto a un identificador y el de la persona a la que estás escribiendo hacia los servidores. Entonces, saben incluso';
+    const twoLineWrapped = formatTraditionalTwoLines(longUtterance, 42);
+    const wrappedLines = twoLineWrapped.split('\n');
+    assert.ok(wrappedLines.length <= 2, `expected <= 2 lines, got ${wrappedLines.length}: ${twoLineWrapped}`);
+    assert.ok(wrappedLines.every(l => l.length <= 42), `line exceeded 42 chars: ${twoLineWrapped}`);
+
+    const streamSeg = createLiveTraditionalSegmenter({ maxCueChars: 76, maxLineChars: 42 });
+    for (const mode of ['interim', 'final']) {
+        const out = streamSeg.push(longUtterance, { mode, nowMs: 4000 });
+        const outLines = out.split('\n');
+        assert.ok(outLines.length <= 2, `expected <= 2 ${mode} lines, got ${outLines.length}: ${out}`);
+        assert.ok(outLines.every(l => l.length <= 42), `${mode} line exceeded 42 chars: ${out}`);
+    }
+
     // SileroStreamingVadState reports isActiveVoice=false during trailing silence hysteresis frames:
     const vad = new SileroStreamingVadState({ onset: 0.36, offset: 0.22, minSpeechFrames: 2, minSilenceFrames: 4 });
     assert.equal(vad.pushProb(0.8).isActiveVoice, true);

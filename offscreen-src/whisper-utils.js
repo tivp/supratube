@@ -99,17 +99,10 @@ function capitalizeSentenceStart(txt = '') {
     return clean.replace(/^([¿¡"'(\[«]*)([a-záéíóúüñ])/u, (_m, pfx, ch) => `${pfx}${ch.toUpperCase()}`);
 }
 
-/** Wrap a single YouTube cue into 1 or 2 visually balanced lines, keeping compound connectors intact. */
-export function formatTraditionalTwoLines(text = '', maxLineChars = 42) {
-    const clean = String(text ?? '')
-        .replace(/\r?\n/g, ' ')
-        .replace(/\s+/g, ' ')
-        .replace(/^[.,;:!?…\-–—]+\s*/, '')
-        .trim();
-    if (!clean || clean.length <= maxLineChars) return clean;
-
+function splitBalancedTwoLines(clean, maxLineChars) {
+    if (!clean || clean.length <= maxLineChars) return clean ? [clean] : [];
     const words = clean.split(' ');
-    if (words.length < 2) return clean;
+    if (words.length < 2) return [clean];
 
     const ideal = clean.length / 2;
     let bestIdx = -1;
@@ -120,7 +113,7 @@ export function formatTraditionalTwoLines(text = '', maxLineChars = 42) {
         leftLen += (w > 0 ? 1 : 0) + words[w].length;
         const rightLen = clean.length - leftLen - 1;
         if (leftLen < 6 || rightLen < 4) continue;
-        if (leftLen > maxLineChars + 6 || rightLen > maxLineChars + 6) continue;
+        if (leftLen > maxLineChars + 2 || rightLen > maxLineChars + 2) continue;
 
         let score = -Math.abs(leftLen - ideal) * 1.1;
         if (leftLen <= maxLineChars && rightLen <= maxLineChars) score += 25;
@@ -151,13 +144,92 @@ export function formatTraditionalTwoLines(text = '', maxLineChars = 42) {
         let cur = 0;
         for (let w = 0; w < words.length - 1; w++) {
             cur += (w > 0 ? 1 : 0) + words[w].length;
-            bestIdx = w;
-            if (cur >= Math.min(maxLineChars, Math.ceil(clean.length * 0.48))) break;
+            const rLen = clean.length - cur - 1;
+            if (cur <= maxLineChars + 2 && rLen <= maxLineChars + 2) {
+                bestIdx = w;
+                if (cur >= Math.ceil(clean.length * 0.48)) break;
+            }
         }
     }
 
-    if (bestIdx < 0 || bestIdx >= words.length - 1) return clean;
-    return `${words.slice(0, bestIdx + 1).join(' ')}\n${words.slice(bestIdx + 1).join(' ')}`;
+    if (bestIdx < 0 || bestIdx >= words.length - 1) return null;
+    return [words.slice(0, bestIdx + 1).join(' '), words.slice(bestIdx + 1).join(' ')];
+}
+
+/** Wrap a single YouTube cue into at most 2 visually balanced lines, keeping compound connectors intact. */
+export function formatTraditionalTwoLines(text = '', maxLineChars = 42) {
+    const clean = String(text ?? '')
+        .replace(/\r?\n/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^[.,;:!?…\-–—]+\s*/, '')
+        .trim();
+    if (!clean || clean.length <= maxLineChars) return clean;
+
+    const directPair = splitBalancedTwoLines(clean, maxLineChars);
+    if (directPair) return directPair.join('\n');
+
+    const words = clean.split(' ');
+    const lines = [];
+    let idx = 0;
+    const minPref = Math.max(8, Math.floor(maxLineChars * 0.45));
+
+    while (idx < words.length) {
+        const rem = words.slice(idx).join(' ');
+        const pair = splitBalancedTwoLines(rem, maxLineChars);
+        if (pair) {
+            lines.push(...pair);
+            break;
+        }
+
+        const remWords = words.length - idx;
+        let bestW = -1;
+        let bestScore = -Infinity;
+        let accLen = 0;
+
+        for (let w = 0; w < remWords - 1; w++) {
+            const word = words[idx + w];
+            accLen += (w > 0 ? 1 : 0) + word.length;
+            if (accLen > maxLineChars) break;
+            if (accLen < minPref) continue;
+
+            const wL = normWord(word);
+            const wR = normWord(words[idx + w + 1]);
+            const wPrev = w > 0 ? normWord(words[idx + w - 1]) : '';
+            const wNext = w + 2 < remWords ? normWord(words[idx + w + 2]) : '';
+
+            let bonus = 0;
+            if (/[.!?…]$/.test(word)) bonus += 32;
+            else if (/[,;:]$/.test(word)) bonus += 20;
+            else if (SPLIT_CONJ_RE.test(wR)) bonus += 12;
+
+            if (INSEPARABLE_PAIR_RE.test(`${wL} ${wR}`)) bonus -= 60;
+            if (wL === 'lo' && wR === 'que' && /^(?:con|de|a|por|en)$/i.test(wPrev)) bonus -= 60;
+            if (wR === 'lo' && wNext === 'que' && /^(?:con|de|a|por|en)$/i.test(wL)) bonus -= 60;
+            if (!/[.,;:!?…]$/.test(word) && ORPHAN_PREP_RE.test(wL)) bonus -= 18;
+
+            const score = accLen * 0.4 + bonus;
+            if (score > bestScore) {
+                bestScore = score;
+                bestW = w;
+            }
+        }
+
+        if (bestW === -1) {
+            let cur = 0;
+            for (let w = 0; w < remWords - 1; w++) {
+                cur += (w > 0 ? 1 : 0) + words[idx + w].length;
+                if (cur <= maxLineChars) bestW = w;
+                else break;
+            }
+            if (bestW === -1) bestW = 0;
+        }
+
+        lines.push(words.slice(idx, idx + bestW + 1).join(' '));
+        idx += bestW + 1;
+    }
+
+    const lastTwo = lines.length > 2 ? lines.slice(-2) : lines;
+    return lastTwo.join('\n');
 }
 
 /** Normalize raw ASR segments into natural YouTube-style cues (no leading dots, no tiny orphaned shards, balanced clause splits). */
@@ -315,6 +387,9 @@ export function createLiveTraditionalSegmenter({ maxCueChars = 76, maxLineChars 
         }
 
         let cleanRest = rest;
+        const isPrefix = Boolean(prevClause) && cleanRest.toLowerCase().startsWith(prevClause.toLowerCase());
+        if (isPrefix) prevClause = '';
+
         if (!leadPunct && prevClause && nowMs - prevTs <= 1800 && /\.{1,3}$/.test(prevClause)) {
             const firstWord = normWord(cleanRest.split(/\s+/)[0] || '');
             const startsLower = /^[a-záéíóúñü]/.test(cleanRest);
@@ -339,7 +414,9 @@ export function createLiveTraditionalSegmenter({ maxCueChars = 76, maxLineChars 
             const recent = Boolean(prevClause) && nowMs - prevTs <= 2600;
             const prevWc = prevClause ? prevClause.split(/\s+/).length : 0;
 
-            let activeText = pieces[pieces.length - 1];
+            let activeText = pieces.length >= 2
+                ? `${pieces[pieces.length - 2]} ${pieces[pieces.length - 1]}`
+                : pieces[pieces.length - 1];
             if (pieces.length === 1 && recent) {
                 const wholeCombined = `${prevClause} ${firstPiece}`;
                 if ((prevClause.length < 40 || prevWc <= 6) && wholeCombined.length <= effMaxCue) {
@@ -357,13 +434,14 @@ export function createLiveTraditionalSegmenter({ maxCueChars = 76, maxLineChars 
                 }
             }
 
-            prevClause = activeText;
+            const formatted = formatTraditionalTwoLines(activeText, effMaxLine);
+            prevClause = formatted.replace(/\n/g, ' ');
             prevTs = nowMs;
-            return formatTraditionalTwoLines(activeText, effMaxLine);
+            return formatted;
         }
 
         const recentInterim = Boolean(prevClause) && nowMs - prevTs <= 2000;
-        const previewText = (recentInterim && prevClause.length <= 36 && `${prevClause} ${cleanRest}`.length <= effMaxCue)
+        const previewText = (recentInterim && prevClause.length <= 36)
             ? `${prevClause} ${cleanRest}`
             : cleanRest;
         return formatTraditionalTwoLines(previewText, effMaxLine);

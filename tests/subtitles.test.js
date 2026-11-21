@@ -2019,6 +2019,10 @@ test('manual [IA] survives in-flight auto fallback, keeps paused readiness banne
     assert.equal(box?.style.left, '50%');
     assert.equal(box?.style.bottom, '9.5%');
     assert.equal(box?.style.transform, 'translateX(-50%)');
+    assert.equal(box?.style.textAlign, 'left');
+    assert.equal(box?.children[0]?.style.lineHeight, '1.25');
+    assert.equal(box?.children[0]?.style.padding, '0.11em 0.35em');
+    assert.equal(box?.children[0]?.style.borderRadius, '0px');
 
     clearFallbackCaptions(fakeDoc, fakeWin);
 });
@@ -2842,6 +2846,19 @@ test('AI mode purges stale v1 corner drag position, places corner notice top-lef
     assert.equal(box?.style.left, '50%');
     assert.equal(box?.style.bottom, '9.5%');
     assert.equal(box?.style.transform, 'translateX(-50%)');
+    assert.equal(box?.style.textAlign, 'left');
+    assert.equal(box?.children[0]?.style.lineHeight, '1.25');
+    assert.equal(box?.children[0]?.style.padding, '0.11em 0.35em');
+    assert.equal(box?.children[0]?.style.borderRadius, '0px');
+
+    const long132 = 'Sale de tu móvil junto a un identificador y el de la persona a la que estás escribiendo hacia los servidores. Entonces, saben incluso';
+    const longFormattedLines = formatTraditionalTwoLines(long132, 42).split('\n');
+    assert.ok(longFormattedLines.length <= 2 && longFormattedLines.every(l => l.length <= 42));
+    const liveSeg = createLiveTraditionalSegmenter({ maxCueChars: 76, maxLineChars: 42 });
+    for (const mode of ['interim', 'final']) {
+        const outLines = liveSeg.push(long132, { mode, nowMs: 5000 }).split('\n');
+        assert.ok(outLines.length <= 2 && outLines.every(l => l.length <= 42));
+    }
 
     // Live caption stream stitches deferred leading punctuation and keeps 2 traditional lines:
     const emitCap = (raw, translated) => win.dispatchEvent(new win.CustomEvent('supratube-whisper-evt', {
