@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     filterWhisperText,
+    extractLeadingPunctuation,
     stripCaptionOverlap,
     LanguageVoter,
     computeLangSoftmax,
@@ -10,6 +11,9 @@ import {
     normalizeAiAudioLang,
     hasSherpaLanguageModel,
     formatStreamingTailText,
+    formatTraditionalTwoLines,
+    segmentTraditionalYouTubeCues,
+    createLiveTraditionalSegmenter,
     trimIncompleteStreamingText,
     findBestSilenceCutSample,
     computeAdaptiveSpeechThreshold,
@@ -295,4 +299,56 @@ test('findBestSilenceCutSample selects the quiet inter-word pause instead of act
     }
     const cut = findBestSilenceCutSample([{ start: 0, end: 4096, pcm }], 500, 3500, 3500);
     assert.ok(cut >= 1500 && cut <= 2500, `expected cut in silence valley, got ${cut}`);
+});
+
+test('createLiveTraditionalSegmenter stitches deferred leading dots, coalesces short fragments, and wraps 2 balanced lines', () => {
+    const seg = createLiveTraditionalSegmenter({ maxCueChars: 76, maxLineChars: 42 });
+    const c1 = seg.push('pepito dijo', { mode: 'final', nowMs: 1000 });
+    assert.equal(c1, 'Pepito dijo');
+
+    const c2 = seg.push('. Lo mas importante', { mode: 'final', nowMs: 1800 });
+    assert.equal(c2, 'Pepito dijo. Lo mas importante');
+    assert.equal(/^[.,;:!?…]/.test(c2), false);
+
+    const c3 = seg.push('que piñas del monje', { mode: 'final', nowMs: 2600 });
+    assert.equal(c3, 'Pepito dijo. Lo mas importante\nque piñas del monje');
+
+    const c4 = seg.push('. entonces pepito dijo', { mode: 'final', nowMs: 3400 });
+    assert.equal(c4, 'que piñas del monje. Entonces pepito dijo');
+    assert.equal(/^[.,;:!?…]/.test(c4), false);
+
+    const { leadPunct, rest } = extractLeadingPunctuation('. entonces pepito');
+    assert.equal(leadPunct, '.');
+    assert.equal(rest, 'entonces pepito');
+    assert.equal(filterWhisperText('. entonces pepito', 'es'), 'entonces pepito');
+
+    // Never splits inseparable compound connectors like "con lo que" across lines:
+    const wrapped = formatTraditionalTwoLines('me basta con lo que siento yo y tú también', 32);
+    assert.ok(wrapped.includes('\n'));
+    assert.equal(/\bcon\s*\n\s*lo\b|\blo\s*\n\s*que\b/i.test(wrapped), false, `unexpected compound connector split: ${wrapped}`);
+
+    // Batch EN and ES cues match YouTube lengths with 0 leading dots:
+    const enTrad = segmentTraditionalYouTubeCues([
+        { startSec: 0, endSec: 2, text: 'All right.' },
+        { startSec: 2.2, endSec: 8.5, text: 'Now I have to say something when we start laughing it always feels slightly uncomfortable so to help us with that' }
+    ]);
+    assert.ok(enTrad.length >= 2);
+    assert.ok(enTrad.every(c => c.text.length <= 72 && !/^[.,;:!?…]/.test(c.text)));
+
+    const esTrad = segmentTraditionalYouTubeCues([
+        { startSec: 1.0, endSec: 2.0, text: 'Me gustas' },
+        { startSec: 2.1, endSec: 3.1, text: 'tú.' },
+        { startSec: 3.2, endSec: 4.5, text: '. Pero vale,' },
+        { startSec: 4.7, endSec: 7.0, text: 'te digo que sí.' }
+    ]);
+    assert.equal(esTrad[0].text, 'Me gustas tú pero vale, te digo que sí.');
+    assert.ok(esTrad.every(c => !/^[.,;:!?…]/.test(c.text)));
+
+    // SileroStreamingVadState reports isActiveVoice=false during trailing silence hysteresis frames:
+    const vad = new SileroStreamingVadState({ onset: 0.36, offset: 0.22, minSpeechFrames: 2, minSilenceFrames: 4 });
+    assert.equal(vad.pushProb(0.8).isActiveVoice, true);
+    assert.equal(vad.pushProb(0.8).isActiveVoice, true);
+    const silFrame = vad.pushProb(0.05);
+    assert.equal(silFrame.isSpeech, true);
+    assert.equal(silFrame.isActiveVoice, false);
 });

@@ -758,34 +758,239 @@ export function parseTranscriptPanelResponse(data) {
     return deduped;
 }
 
+const ST_INSEPARABLE_PAIR_RE = /^(?:(?:con|de|a|por|en)\s+lo|lo\s+que|con\s+que|de\s+que|a\s+que|para\s+que|por\s+que|sin\s+que|hasta\s+que|desde\s+que|antes\s+de|despu[eé]s\s+de|en\s+la|de\s+la|a\s+la|por\s+la|con\s+la|de\s+el|a\s+el|of\s+the|in\s+the|to\s+the|for\s+the|on\s+the|with\s+the|from\s+the|going\s+to|want\s+to|have\s+to)$/i;
+const ST_ORPHAN_PREP_RE = /^(?:el|la|los|las|lo|un|una|de|del|a|al|en|con|por|para|sin|sobre|entre|hasta|y|e|o|u|ni|que|the|an?|of|to|in|on|at|for|with|from|by|as|or|and)$/i;
+const ST_CONT_CONN_RE = /^(?:que|de|del|a|al|para|por|con|sin|como|cuando|porque|pero|sino|y|e|o|u|ni|donde|quien|cual|aunque|mientras|hasta|that|to|for|with|of|from|into|and|but|or|nor|because|when|where|while|who|which|as|if|than)$/i;
+const ST_SPLIT_CONJ_RE = /^(?:y|e|pero|porque|cuando|como|donde|para|que|aunque|mientras|o|and|but|because|when|where|while|so|that|which|who|or|if)$/i;
+
+function stNormWord(word) {
+    return String(word || '').toLowerCase().replace(/[\p{P}\p{S}]/gu, '');
+}
+
+function stExtractLeadingPunct(rawText = '') {
+    const t = String(rawText ?? '').replace(/\s+/g, ' ').trim();
+    if (!t) return { leadPunct: '', rest: '' };
+    const m = t.match(/^([.,;:!?…]+)\s*(.*)$/);
+    if (!m) return { leadPunct: '', rest: t.replace(/^[\-–—]+\s*/, '').trim() };
+    return {
+        leadPunct: m[1],
+        rest: m[2].replace(/^[.,;:!?…\-–—]+\s*/, '').trim()
+    };
+}
+
+function stCapitalizeStart(txt = '') {
+    const clean = String(txt || '').trim();
+    if (!clean) return '';
+    return clean.replace(/^([¿¡"'(\[«]*)([a-záéíóúüñ])/u, (_m, pfx, ch) => `${pfx}${ch.toUpperCase()}`);
+}
+
+/** Wrap a YouTube subtitle cue into 1 or 2 visually balanced lines, keeping compound connectors intact. */
+export function formatTraditionalTwoLines(text = '', maxLineChars = 42) {
+    const clean = String(text ?? '')
+        .replace(/\r?\n/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^[.,;:!?…\-–—]+\s*/, '')
+        .trim();
+    if (!clean || clean.length <= maxLineChars) return clean;
+
+    const words = clean.split(' ');
+    if (words.length < 2) return clean;
+
+    const ideal = clean.length / 2;
+    let bestIdx = -1;
+    let bestScore = -Infinity;
+    let leftLen = 0;
+
+    for (let w = 0; w < words.length - 1; w++) {
+        leftLen += (w > 0 ? 1 : 0) + words[w].length;
+        const rightLen = clean.length - leftLen - 1;
+        if (leftLen < 6 || rightLen < 4) continue;
+        if (leftLen > maxLineChars + 6 || rightLen > maxLineChars + 6) continue;
+
+        let score = -Math.abs(leftLen - ideal) * 1.1;
+        if (leftLen <= maxLineChars && rightLen <= maxLineChars) score += 25;
+        else score -= Math.max(0, Math.max(leftLen, rightLen) - maxLineChars) * 6;
+
+        const wL = stNormWord(words[w]);
+        const wR = stNormWord(words[w + 1]);
+        const wPrev = w > 0 ? stNormWord(words[w - 1]) : '';
+        const wNext = w + 2 < words.length ? stNormWord(words[w + 2]) : '';
+
+        const minBalancedForPunct = Math.round(maxLineChars * 0.42);
+        if (/[.!?…]$/.test(words[w])) score += leftLen >= minBalancedForPunct ? 32 : 6;
+        else if (/[,;:]$/.test(words[w])) score += leftLen >= minBalancedForPunct ? 20 : 4;
+        else if (ST_SPLIT_CONJ_RE.test(wR)) score += 12;
+
+        if (ST_INSEPARABLE_PAIR_RE.test(`${wL} ${wR}`)) score -= 60;
+        if (wL === 'lo' && wR === 'que' && /^(?:con|de|a|por|en)$/i.test(wPrev)) score -= 60;
+        if (wR === 'lo' && wNext === 'que' && /^(?:con|de|a|por|en)$/i.test(wL)) score -= 60;
+        if (!/[.,;:!?…]$/.test(words[w]) && ST_ORPHAN_PREP_RE.test(wL)) score -= 18;
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestIdx = w;
+        }
+    }
+
+    if (bestIdx === -1) {
+        let cur = 0;
+        for (let w = 0; w < words.length - 1; w++) {
+            cur += (w > 0 ? 1 : 0) + words[w].length;
+            bestIdx = w;
+            if (cur >= Math.min(maxLineChars, Math.ceil(clean.length * 0.48))) break;
+        }
+    }
+
+    if (bestIdx < 0 || bestIdx >= words.length - 1) return clean;
+    return `${words.slice(0, bestIdx + 1).join(' ')}\n${words.slice(bestIdx + 1).join(' ')}`;
+}
+
+function splitLongTextToClauseStrings(text, maxChars = 72) {
+    const clean = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!clean || clean.length <= maxChars) return clean ? [clean] : [];
+    const words = clean.split(' ');
+    const pieces = [];
+    let idx = 0;
+    while (idx < words.length) {
+        const rem = words.slice(idx).join(' ');
+        if (rem.length <= maxChars) {
+            pieces.push(rem);
+            break;
+        }
+        const remWords = words.length - idx;
+        const numPieces = Math.max(2, Math.ceil(rem.length / Math.round(maxChars * 0.78)));
+        const idealLen = rem.length / numPieces;
+        let bestW = -1;
+        let bestScore = -Infinity;
+        let accLen = 0;
+        for (let w = 0; w < remWords - 1; w++) {
+            const word = words[idx + w];
+            accLen += (w > 0 ? 1 : 0) + word.length;
+            if (accLen > maxChars) break;
+            if (accLen < Math.min(16, Math.floor(maxChars * 0.35))) continue;
+            const leftOver = rem.length - accLen - 1;
+            if (leftOver < 10) continue;
+            const wL = stNormWord(word);
+            const wR = stNormWord(words[idx + w + 1]);
+            const distPenalty = Math.abs(accLen - Math.min(maxChars - 6, idealLen)) * 0.8;
+            let bonus = 0;
+            if (/[.!?…]$/.test(word)) bonus = 48;
+            else if (/[,;:]$/.test(word)) bonus = 34;
+            else if (ST_SPLIT_CONJ_RE.test(wR)) bonus = 16;
+            if (ST_INSEPARABLE_PAIR_RE.test(`${wL} ${wR}`)) bonus -= 50;
+            const score = bonus - distPenalty;
+            if (score > bestScore) {
+                bestScore = score;
+                bestW = w;
+            }
+        }
+        if (bestW === -1) {
+            let cur = 0;
+            for (let w = 0; w < remWords - 1; w++) {
+                cur += (w > 0 ? 1 : 0) + words[idx + w].length;
+                if (cur <= maxChars) bestW = w;
+                else break;
+            }
+            if (bestW === -1) bestW = 0;
+        }
+        pieces.push(words.slice(idx, idx + bestW + 1).join(' '));
+        idx += bestW + 1;
+    }
+    return pieces;
+}
+
+/** Real-time streaming cue segmenter that stitches orphan punctuation, coalesces short fragments, and wraps into 2 traditional lines. */
+export function createLiveTraditionalSegmenter({ maxCueChars = 76, maxLineChars = 42 } = {}) {
+    let prevClause = '';
+    let prevTs = 0;
+
+    const reset = () => {
+        prevClause = '';
+        prevTs = 0;
+    };
+
+    const push = (rawText, { mode = 'final', leadPunct = '', nowMs = Date.now(), isShorts = false } = {}) => {
+        const effMaxCue = isShorts ? Math.min(58, maxCueChars) : maxCueChars;
+        const effMaxLine = isShorts ? Math.min(32, maxLineChars) : maxLineChars;
+        const parsed = stExtractLeadingPunct(rawText || '');
+        const mergedLeadPunct = String(leadPunct || parsed.leadPunct || '').trim();
+        const rest = parsed.rest;
+
+        if (mergedLeadPunct && prevClause && nowMs - prevTs <= 3500) {
+            if (!/[.,;:!?…]$/.test(prevClause)) {
+                prevClause += mergedLeadPunct[0];
+            }
+        }
+
+        if (!rest) {
+            return prevClause ? formatTraditionalTwoLines(prevClause, effMaxLine) : '';
+        }
+
+        let cleanRest = rest;
+        if (!mergedLeadPunct && prevClause && nowMs - prevTs <= 1800 && /\.{1,3}$/.test(prevClause)) {
+            const firstWord = stNormWord(cleanRest.split(/\s+/)[0] || '');
+            const startsLower = /^[a-záéíóúñü]/.test(cleanRest);
+            if (startsLower || (ST_CONT_CONN_RE.test(firstWord) && prevClause.length < 45)) {
+                prevClause = prevClause.replace(/\.{1,3}$/, '');
+                if (/^[A-ZÁÉÍÓÚÑÜ]/.test(cleanRest) && ST_CONT_CONN_RE.test(firstWord)) {
+                    cleanRest = cleanRest[0].toLowerCase() + cleanRest.slice(1);
+                }
+            }
+        }
+
+        if (!prevClause || /[.!?…]$/.test(prevClause)) {
+            cleanRest = stCapitalizeStart(cleanRest);
+        }
+
+        const isFinal = mode === 'final' || mode === 'cut';
+        if (isFinal) {
+            const pieces = cleanRest.length > effMaxCue ? splitLongTextToClauseStrings(cleanRest, effMaxCue) : [cleanRest];
+            const firstPiece = pieces[0] || cleanRest;
+            const recent = Boolean(prevClause) && nowMs - prevTs <= 2600;
+            const prevWc = prevClause ? prevClause.split(/\s+/).length : 0;
+
+            let activeText = pieces[pieces.length - 1];
+            if (pieces.length === 1 && recent) {
+                const wholeCombined = `${prevClause} ${firstPiece}`;
+                if ((prevClause.length < 40 || prevWc <= 6) && wholeCombined.length <= effMaxCue) {
+                    activeText = wholeCombined;
+                } else {
+                    const firstWc = firstPiece.split(/\s+/).length;
+                    if (firstPiece.length < 42 || firstWc <= 6) {
+                        const twoLines = formatTraditionalTwoLines(prevClause, effMaxLine).split('\n');
+                        const prevTail = twoLines[twoLines.length - 1] || '';
+                        const tailCombined = prevTail ? `${prevTail} ${firstPiece}` : firstPiece;
+                        if (prevTail && tailCombined.length <= effMaxCue && tailCombined.length <= effMaxLine * 2 + 2) {
+                            activeText = tailCombined;
+                        }
+                    }
+                }
+            }
+
+            prevClause = activeText;
+            prevTs = nowMs;
+            return formatTraditionalTwoLines(activeText, effMaxLine);
+        }
+
+        const recentInterim = Boolean(prevClause) && nowMs - prevTs <= 2000;
+        const previewText = (recentInterim && prevClause.length <= 36 && `${prevClause} ${cleanRest}`.length <= effMaxCue)
+            ? `${prevClause} ${cleanRest}`
+            : cleanRest;
+        return formatTraditionalTwoLines(previewText, effMaxLine);
+    };
+
+    return { push, reset };
+}
+
 /** Break a long translated block into natural <= maxChars subtitle chunks proportional in time. */
-export function splitTranslatedTextIntoTimedChunks(start, end, text, maxChars = 84) {
+export function splitTranslatedTextIntoTimedChunks(start, end, text, maxChars = 76) {
     const clean = String(text || '').replace(/\s+/g, ' ').trim();
     if (!clean) return [];
     const safeEnd = end > start ? end : start + 4;
-    if (clean.length <= maxChars) {
-        return [{ start, end: safeEnd, text: clean }];
+    const pieces = splitLongTextToClauseStrings(clean, maxChars);
+    if (pieces.length <= 1) {
+        return [{ start, end: safeEnd, text: pieces[0] || clean }];
     }
-
-    const words = clean.split(' ');
-    const pieces = [];
-    let current = '';
-    const minBreakLen = Math.floor(maxChars * 0.45);
-    for (let i = 0; i < words.length; i++) {
-        const w = words[i];
-        const next = current ? `${current} ${w}` : w;
-        if (current && next.length > maxChars) {
-            pieces.push(current);
-            current = w;
-            continue;
-        }
-        current = next;
-        if (current.length >= minBreakLen && /[.!?…]$/.test(w) && i < words.length - 1) {
-            pieces.push(current);
-            current = '';
-        }
-    }
-    if (current) pieces.push(current);
 
     const totalWeight = pieces.reduce((acc, p) => acc + Math.max(1, p.length), 0);
     const totalDur = safeEnd - start;
@@ -1033,7 +1238,104 @@ function hasVisibleNativeCaptions(player) {
     return false;
 }
 
-const CAPTION_POS_STORAGE_KEY = 'supratube_caption_pos_v1';
+const CAPTION_POS_STORAGE_KEY = 'supratube_caption_pos_v2';
+const LEGACY_CAPTION_POS_KEY = 'supratube_caption_pos_v1';
+const CORNER_BOX_ID = 'supratube-ai-corner-box';
+
+const AI_LANG_LABELS = Object.freeze({
+    es: 'Español',
+    en: 'Inglés',
+    fr: 'Francés',
+    de: 'Alemán',
+    pt: 'Portugués',
+    it: 'Italiano',
+    ja: 'Japonés',
+    ko: 'Coreano'
+});
+
+function formatAiCornerLangLabel(wantBase) {
+    const base = normalizeBaseLang(wantBase) || 'es';
+    const name = AI_LANG_LABELS[base] || base.toUpperCase();
+    return `${name} (generado automáticamente)`;
+}
+
+function purgeLegacyCaptionPos(win) {
+    try { win?.localStorage?.removeItem?.(LEGACY_CAPTION_POS_KEY); } catch {}
+}
+
+function ensureAiCornerBox(player, doc, win) {
+    if (!player || !doc) return null;
+    let box = player.querySelector?.(`#${CORNER_BOX_ID}`) || doc.getElementById?.(CORNER_BOX_ID);
+    if (!box) {
+        box = doc.createElement('div');
+        box.id = CORNER_BOX_ID;
+        box.setAttribute('data-supratube-corner-banner', '1');
+        const span = doc.createElement('span');
+        span.className = 'supratube-corner-segment';
+        box.appendChild(span);
+        player.appendChild?.(box);
+    } else if (
+        (box.parentElement && box.parentElement !== player) ||
+        (box.parentNode && box.parentNode !== player)
+    ) {
+        player.appendChild?.(box);
+    }
+    const isShorts = Boolean(player.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
+    const cw = Number(player.clientWidth) || (isShorts ? 380 : 900);
+    const fontPx = Math.round(Math.max(isShorts ? 14 : 13, Math.min(isShorts ? 18 : 22, cw * (isShorts ? 0.042 : 0.019))));
+    Object.assign(box.style, {
+        position: 'absolute',
+        left: isShorts ? '5%' : '5.5%',
+        top: isShorts ? '11%' : '7.5%',
+        right: 'auto',
+        bottom: 'auto',
+        maxWidth: isShorts ? '86%' : '72%',
+        zIndex: '201',
+        pointerEvents: 'none',
+        userSelect: 'none',
+        textAlign: 'left'
+    });
+    const segEl = box.children?.[0];
+    if (segEl?.style) {
+        Object.assign(segEl.style, {
+            display: 'inline',
+            background: 'rgba(8, 8, 8, 0.75)',
+            color: '#ffffff',
+            fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
+            fontSize: `${fontPx}px`,
+            fontWeight: '500',
+            lineHeight: isShorts ? '1.35' : '1.45',
+            padding: '3px 8px',
+            borderRadius: '2px',
+            textShadow: '0 1px 2px rgba(0, 0, 0, 0.9)',
+            whiteSpace: 'pre-line',
+            boxDecorationBreak: 'clone',
+            WebkitBoxDecorationBreak: 'clone'
+        });
+    }
+    return box;
+}
+
+function showAiCornerBanner(player, doc, win, { langLabel, subLine = 'Haz clic en ⚙ para acceder a la configuración.', autoFadeMs = 4200 } = {}) {
+    const ctrl = getFallbackCtrl(win);
+    const box = ensureAiCornerBox(player, doc, win);
+    if (!box) return null;
+    const span = box.children?.[0];
+    const line1 = String(langLabel || 'Español (generado automáticamente)').trim();
+    const line2 = String(subLine || '').trim();
+    if (span) span.textContent = line2 ? `${line1}\n${line2}` : line1;
+    box.style.display = 'block';
+    clearTimeout(ctrl.cornerTimer);
+    ctrl.cornerTimer = null;
+    if (autoFadeMs > 0) {
+        ctrl.cornerTimer = setTimeout(() => {
+            const el = doc?.getElementById?.(CORNER_BOX_ID);
+            if (el?.style) el.style.display = 'none';
+        }, autoFadeMs);
+        if (typeof ctrl.cornerTimer?.unref === 'function') ctrl.cornerTimer.unref();
+    }
+    return box;
+}
 
 function resolveAsrEngineChoice(raw) {
     const clean = String(raw || '').trim().toLowerCase();
@@ -1064,6 +1366,7 @@ function readPreferredAiAudioLang(doc) {
 }
 
 function loadSavedCaptionPos(win, isShorts) {
+    purgeLegacyCaptionPos(win);
     try {
         const raw = win?.localStorage?.getItem?.(CAPTION_POS_STORAGE_KEY);
         if (!raw) return null;
@@ -1122,7 +1425,7 @@ function applyBoxPositionStyle(box, player, isShorts, savedPos) {
     }
     box.style.left = '50%';
     box.style.top = 'auto';
-    box.style.bottom = isShorts ? '19%' : '11%';
+    box.style.bottom = isShorts ? '18%' : '9.5%';
     box.style.transform = 'translateX(-50%)';
     box.removeAttribute?.('data-supratube-custom-pos');
 }
@@ -1318,17 +1621,19 @@ function ensureFallbackBox(player, doc, win) {
     const segEl = box.children?.[0];
     if (segEl?.style) {
         Object.assign(segEl.style, {
-            display: 'inline-block',
-            background: 'rgba(8, 8, 8, 0.78)',
+            display: 'inline',
+            background: 'rgba(8, 8, 8, 0.75)',
             color: '#ffffff',
             fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
             fontSize: `${fontPx}px`,
             fontWeight: isShorts ? '600' : '500',
-            lineHeight: isShorts ? '1.28' : '1.35',
-            padding: isShorts ? '5px 10px' : '4px 10px',
-            borderRadius: '4px',
+            lineHeight: isShorts ? '1.35' : '1.45',
+            padding: isShorts ? '3px 9px' : '3px 8px',
+            borderRadius: '2px',
             textShadow: '0 1px 2px rgba(0, 0, 0, 0.9)',
-            whiteSpace: 'pre-wrap'
+            whiteSpace: 'pre-line',
+            boxDecorationBreak: 'clone',
+            WebkitBoxDecorationBreak: 'clone'
         });
     }
     return box;
@@ -1614,7 +1919,7 @@ export function startManualAiCaptions({
     try { player.unloadModule?.('captions'); } catch {}
     deactivateNativeCcButtonVisual(player, doc, win);
 
-    const initialMsg = video?.paused ? 'Subtítulos IA listos (reproduce el video)' : 'Iniciando subtítulos IA...';
+    const initialMsg = video?.paused ? 'Subtítulos IA listos (reproduce el video)' : 'Haz clic en ⚙ para acceder a la configuración.';
     const ok = startWhisperLiveFallback({
         player,
         video,
@@ -1978,6 +2283,12 @@ export function clearFallbackCaptions(doc = typeof document !== 'undefined' ? do
             flagged[i]?.removeAttribute?.('data-supratube-ai-subs-active');
         }
     } catch {}
+    clearTimeout(ctrl.cornerTimer);
+    ctrl.cornerTimer = null;
+    const cornerBox = doc?.getElementById?.(CORNER_BOX_ID);
+    if (cornerBox) {
+        try { cornerBox.remove(); } catch {}
+    }
     const existing = doc?.getElementById?.(FALLBACK_BOX_ID);
     if (existing) {
         try { existing.remove(); } catch {}
@@ -2034,8 +2345,9 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
         }
         const t = Number(video?.currentTime) || 0;
         const txt = findActiveChunkText(getChunks(), t);
+        const isShorts = Boolean(player?.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
         const segEl = box.children?.[0];
-        if (segEl) segEl.textContent = txt;
+        if (segEl) segEl.textContent = txt ? formatTraditionalTwoLines(txt, isShorts ? 32 : 42) : '';
         box.style.display = txt ? 'block' : 'none';
         if (txt) reclampFallbackBoxPosition(box, player, doc, win);
     };
@@ -2667,7 +2979,7 @@ function startInPageSttFallback({
 
             ctrl.hasReceivedWhisperCaption = true;
             syncAiSubtitleButtonState(doc, win);
-            showLine(finalLine || spokenForLine, 5000);
+            showLine(finalLine || spokenForLine, 5000, { mode: isCut ? 'cut' : 'final' });
         } finally {
             busy = false;
         }
@@ -2858,8 +3170,8 @@ function startWhisperLiveFallback({
                     const msg =
                         ctrl.lastWhisperPct > 0 && ctrl.lastWhisperPct < 100
                             ? `Subtítulos IA (${ctrl.lastWhisperPct}%)...`
-                            : (initialMessage || 'Subtítulos IA escuchando...');
-                    ctrl.showWhisperLine?.(msg, 0);
+                            : (initialMessage || 'Haz clic en ⚙ para acceder a la configuración.');
+                    ctrl.showCornerBanner?.(msg, video?.paused ? 0 : 4200);
                 }
                 dispatchWhisperCmd(win, { action: 'start', videoId, targetLang: effectiveTargetLang, spokenLang, asrEngine: engine, aiAudioLang: prefAudioLang, manualForce: true });
                 syncAiSubtitleButtonState(doc, win);
@@ -2897,28 +3209,60 @@ function startWhisperLiveFallback({
     syncWhisperCcButtonVisual(player, doc, win, ctrl, true);
     syncAiSubtitleButtonState(doc, win);
 
+    const isShortsPlayer = Boolean(player?.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
+    const liveSegmenter = createLiveTraditionalSegmenter({
+        maxCueChars: isShortsPlayer ? 58 : 76,
+        maxLineChars: isShortsPlayer ? 32 : 42
+    });
+    const cornerLangLabel = formatAiCornerLangLabel(wantBase);
     let fadeTimer = null;
     let bridgeWatchdog = null;
     let waitingPlayBanner = false;
     let gotBridgeReply = false;
     let modelReadyReached = false;
+    let cornerConfigShown = false;
     let transSeq = 0;
     ctrl.stopInPageStt = null;
 
-    const showLine = (text, autoFadeMs = 0) => {
+    const mountPrebox = ensureFallbackBox(player, doc, win);
+    if (mountPrebox && !ctrl.hasReceivedWhisperCaption) {
+        mountPrebox.style.display = 'none';
+    }
+
+    const showCornerBanner = (subLine, autoFadeMs = 4200) => {
         if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
         if (!isVideoStillActive(player, win, videoId) || (!ctrl.whisperManualForce && hasVisibleNativeCaptions(player))) {
             clearFallbackCaptions(doc, win);
             return;
         }
+        showAiCornerBanner(player, doc, win, { langLabel: cornerLangLabel, subLine, autoFadeMs });
+    };
+    ctrl.showCornerBanner = showCornerBanner;
+
+    const showLine = (text, autoFadeMs = 0, segMeta = null) => {
+        if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
+        if (!isVideoStillActive(player, win, videoId) || (!ctrl.whisperManualForce && hasVisibleNativeCaptions(player))) {
+            clearFallbackCaptions(doc, win);
+            return;
+        }
+        const formatted = text
+            ? (segMeta
+                ? liveSegmenter.push(text, { mode: segMeta.mode || 'final', leadPunct: segMeta.leadPunct || '', isShorts: isShortsPlayer })
+                : formatTraditionalTwoLines(text, isShortsPlayer ? 32 : 42))
+            : '';
+        if (!formatted) return;
+        if (!cornerConfigShown) {
+            cornerConfigShown = true;
+            showCornerBanner('Haz clic en ⚙ para acceder a la configuración.', 4200);
+        }
         const box = ensureFallbackBox(player, doc, win);
         if (!box) return;
         const segEl = box.children?.[0];
-        if (segEl) segEl.textContent = text;
-        box.style.display = text ? 'block' : 'none';
-        if (text) reclampFallbackBoxPosition(box, player, doc, win);
+        if (segEl) segEl.textContent = formatted;
+        box.style.display = formatted ? 'block' : 'none';
+        if (formatted) reclampFallbackBoxPosition(box, player, doc, win);
         clearTimeout(fadeTimer);
-        if (text && autoFadeMs > 0) {
+        if (formatted && autoFadeMs > 0) {
             fadeTimer = setTimeout(() => {
                 if (ctrl.whisperVid === videoId) {
                     const el = doc?.getElementById?.(FALLBACK_BOX_ID);
@@ -2987,25 +3331,25 @@ function startWhisperLiveFallback({
         if (ctrl.whisperManualForce && !ctrl.hasReceivedWhisperCaption) {
             if (video.paused) {
                 waitingPlayBanner = true;
-                showLine('Subtítulos IA listos (reproduce el video)', 0);
+                showCornerBanner('Subtítulos IA listos (reproduce el video)', 0);
             } else {
                 waitingPlayBanner = false;
-                showLine('Subtítulos IA escuchando...', 2500);
+                showCornerBanner('Haz clic en ⚙ para acceder a la configuración.', 4200);
             }
         }
         return true;
     };
 
-    if (initialMessage) {
+    if (initialMessage || manualForce) {
         waitingPlayBanner = Boolean(video?.paused);
-        showLine(initialMessage, 0);
+        showCornerBanner(initialMessage || 'Haz clic en ⚙ para acceder a la configuración.', waitingPlayBanner ? 0 : 4200);
     }
 
     const onVideoPlay = () => {
         if (ctrl.whisperVid !== videoId || !ctrl.whisperManualForce) return;
         if (waitingPlayBanner && !ctrl.hasReceivedWhisperCaption) {
             waitingPlayBanner = false;
-            showLine('Subtítulos IA escuchando...', 2500);
+            showCornerBanner('Haz clic en ⚙ para acceder a la configuración.', 4200);
         }
     };
     video?.addEventListener?.('play', onVideoPlay, { passive: true });
@@ -3041,7 +3385,7 @@ function startWhisperLiveFallback({
             ctrl.lastWhisperPct = Number(d.pct) || 0;
             if (d.pct > 0 && d.pct < 100) {
                 waitingPlayBanner = false;
-                showLine(`Subtítulos IA (${d.pct}%)...`, 0);
+                showCornerBanner(`Subtítulos IA (${d.pct}%)...`, 0);
             }
             return;
         }
@@ -3049,9 +3393,10 @@ function startWhisperLiveFallback({
             if (ctrl.hasReceivedWhisperCaption) return;
             if (ctrl.whisperManualForce) {
                 waitingPlayBanner = true;
-                showLine('Subtítulos IA listos (reproduce el video)', 0);
+                showCornerBanner('Subtítulos IA listos (reproduce el video)', 0);
             } else {
-                showLine('', 0);
+                const cBox = doc?.getElementById?.(CORNER_BOX_ID);
+                if (cBox?.style) cBox.style.display = 'none';
             }
             return;
         }
@@ -3062,10 +3407,10 @@ function startWhisperLiveFallback({
             if (ctrl.whisperManualForce) {
                 if (video?.paused) {
                     waitingPlayBanner = true;
-                    showLine('Subtítulos IA listos (reproduce el video)', 0);
+                    showCornerBanner('Subtítulos IA listos (reproduce el video)', 0);
                 } else {
                     waitingPlayBanner = false;
-                    showLine('Subtítulos IA escuchando...', 2500);
+                    showCornerBanner('Haz clic en ⚙ para acceder a la configuración.', 4200);
                 }
             }
             return;
@@ -3074,7 +3419,7 @@ function startWhisperLiveFallback({
             if (ctrl.hasReceivedWhisperCaption) return;
             if (ctrl.whisperManualForce) {
                 const langLabel = d.lang === 'es' ? 'Español' : (d.lang === 'en' ? 'Inglés' : String(d.lang || '').toUpperCase());
-                showLine(`Voz detectada (${langLabel}) · activando motor rápido...`, 0);
+                showCornerBanner(`Voz detectada (${langLabel}) · activando motor rápido...`, 0);
             }
             return;
         }
@@ -3084,7 +3429,8 @@ function startWhisperLiveFallback({
             const rawTxt = String(d.raw || '').trim();
             const transTxt = String(d.translated || '').trim();
             const spokenBase = normalizeBaseLang(d.lang || d.locked);
-            if (!rawTxt && !transTxt) return;
+            const segMeta = { mode: d.mode || 'final', leadPunct: d.leadPunct || '' };
+            if (!rawTxt && !transTxt && !segMeta.leadPunct) return;
 
             const alreadyTranslated = Boolean(transTxt && (!rawTxt || transTxt !== rawTxt));
             const foreignBleedInEs = wantBase === 'es' && (rawTxt.match(/\b(?:the|and|that|this|with|for|you|are|was|were|have|has|what|not|but|they|your|can|will)\b/gi) || []).length >= 2;
@@ -3096,7 +3442,7 @@ function startWhisperLiveFallback({
                 ctrl.hasReceivedWhisperCaption = true;
                 waitingPlayBanner = false;
                 syncAiSubtitleButtonState(doc, win);
-                showLine(alreadyTranslated ? transTxt : rawTxt, 5000);
+                showLine(alreadyTranslated ? transTxt : rawTxt, 5000, segMeta);
                 return;
             }
 
@@ -3113,7 +3459,7 @@ function startWhisperLiveFallback({
                 ctrl.hasReceivedWhisperCaption = true;
                 waitingPlayBanner = false;
                 syncAiSubtitleButtonState(doc, win);
-                showLine(finalLine || srcLine, 4500);
+                showLine(finalLine || srcLine, 5000, segMeta);
             }).catch(() => {
                 if (
                     mySeq === transSeq &&
@@ -3123,7 +3469,7 @@ function startWhisperLiveFallback({
                     ctrl.hasReceivedWhisperCaption = true;
                     waitingPlayBanner = false;
                     syncAiSubtitleButtonState(doc, win);
-                    showLine(srcLine, 4500);
+                    showLine(srcLine, 5000, segMeta);
                 }
             });
             return;

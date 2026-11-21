@@ -21,7 +21,9 @@ import {
     ensureAiSubtitleButton,
     removeAiSubtitleButtons,
     startManualAiCaptions,
-    detectTextLanguageHint
+    detectTextLanguageHint,
+    formatTraditionalTwoLines,
+    createLiveTraditionalSegmenter
 } from '../modules/subtitles.js';
 
 test('detectVideoAudioLang inspects active dubbed audio track first, then default audio, then asr caption', () => {
@@ -1730,7 +1732,7 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
     assert.equal(ccBtn.getAttribute('aria-pressed'), 'false');
     assert.equal(ccBtn.getAttribute('data-supratube-cc-active'), null);
     assert.ok(cmds.some(c => c.action === 'start' && c.videoId === 'fEt2anArPb4' && c.targetLang === '-es' && c.manualForce === true));
-    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Iniciando subtítulos IA...');
+    assert.equal(elements.get('supratube-ai-corner-box')?.children[0]?.textContent, 'Español (generado automáticamente)\nHaz clic en ⚙ para acceder a la configuración.');
 
     // same_language event MUST NOT kill manual forced Whisper session
     fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
@@ -1767,7 +1769,7 @@ test('IA caption button mounts beside native CC button, toggles manual forced Wh
     assert.equal(iaBtn.getAttribute('data-active'), '1');
     assert.ok(cmds.some(c => c.action === 'start' && c.targetLang === '-es' && c.manualForce === true));
     assert.equal(cmds.some(c => c.action === 'stop'), false);
-    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Iniciando subtítulos IA...');
+    assert.equal(elements.get('supratube-ai-corner-box')?.children[0]?.textContent, 'Español (generado automáticamente)\nHaz clic en ⚙ para acceder a la configuración.');
 
     // Displaced background tab preempted event turns off [IA] button cleanly
     fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
@@ -1973,15 +1975,19 @@ test('manual [IA] survives in-flight auto fallback, keeps paused readiness banne
     // User clicks [IA] while paused and while auto obtainRawSegmentsForVideo is still in flight
     iaBtn.click();
     const box = elements.get('supratube-fallback-captions');
-    assert.equal(box?.children[0]?.textContent, 'Subtítulos IA listos (reproduce el video)');
-    assert.equal(box?.style.display, 'block');
+    const cornerBox = elements.get('supratube-ai-corner-box');
+    assert.equal(cornerBox?.style.top, '7.5%');
+    assert.equal(cornerBox?.style.left, '5.5%');
+    assert.equal(cornerBox?.children[0]?.textContent, 'Español (generado automáticamente)\nSubtítulos IA listos (reproduce el video)');
+    assert.equal(cornerBox?.style.display, 'block');
+    assert.equal(box?.style.display, 'none');
 
-    // waiting_play keeps banner visible in manual mode
+    // waiting_play keeps corner banner visible in manual mode
     fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
         detail: { kind: 'waiting_play', videoId: 'fEt2anArPb4' }
     }));
-    assert.equal(box?.children[0]?.textContent, 'Subtítulos IA listos (reproduce el video)');
-    assert.equal(box?.style.display, 'block');
+    assert.equal(cornerBox?.children[0]?.textContent, 'Español (generado automáticamente)\nSubtítulos IA listos (reproduce el video)');
+    assert.equal(cornerBox?.style.display, 'block');
 
     // Resolve delayed Innertube call returning audioLanguage='es' & no captions -> MUST NOT kill manual [IA]!
     releaseInnertube?.();
@@ -1997,10 +2003,10 @@ test('manual [IA] survives in-flight auto fallback, keeps paused readiness banne
     legacyVoter.observe({ lang: 'es', conf: 0.9, ts: 2 });
     assert.equal(legacyVoter.shouldAbortForSameLanguage(startCmd.targetLang), false);
 
-    // Pressing play transitions readiness banner to listening
+    // Pressing play transitions corner banner to settings hint just like traditional YouTube captions
     videoEl.paused = false;
     for (const fn of (vidListeners.play || [])) fn();
-    assert.equal(box?.children[0]?.textContent, 'Subtítulos IA escuchando...');
+    assert.equal(cornerBox?.children[0]?.textContent, 'Español (generado automáticamente)\nHaz clic en ⚙ para acceder a la configuración.');
 
     // Legacy v1.0.9 worker failing to translate foreign speech ('en' -> same raw text) translates immediately BEFORE rendering:
     fakeWin.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
@@ -2010,6 +2016,9 @@ test('manual [IA] survives in-flight auto fallback, keeps paused readiness banne
     await new Promise(r => setTimeout(r, 30));
     assert.ok(translateRequests.some(u => u.includes('translate.googleapis.com')));
     assert.equal(box?.children[0]?.textContent, 'Soy Iron Man.');
+    assert.equal(box?.style.left, '50%');
+    assert.equal(box?.style.bottom, '9.5%');
+    assert.equal(box?.style.transform, 'translateX(-50%)');
 
     clearFallbackCaptions(fakeDoc, fakeWin);
 });
@@ -2140,9 +2149,10 @@ test('manual [IA] recovers automatically from offscreen unavailable via in-page 
     }));
 
     const box = elements.get('supratube-fallback-captions');
+    const cornerBox = elements.get('supratube-ai-corner-box');
     assert.equal(iaBtn.getAttribute('data-active'), '1');
     assert.notEqual(box?.children[0]?.textContent, 'Subtítulos IA: offscreen unavailable');
-    assert.equal(box?.children[0]?.textContent, 'Subtítulos IA escuchando...');
+    assert.equal(cornerBox?.children[0]?.textContent, 'Español (generado automáticamente)\nHaz clic en ⚙ para acceder a la configuración.');
     assert.ok(capturedProc && typeof capturedProc.onaudioprocess === 'function');
 
     // Feed 2s of speech samples (8 x 4096) followed by 0.6s of silence (3 x 4096) to flush utterance:
@@ -2735,4 +2745,119 @@ test('startWhisperLiveFallback stops concurrent in-page thread on offscreen repl
     }
 
     clearFallbackCaptions(doc, win);
+});
+
+test('AI mode purges stale v1 corner drag position, places corner notice top-left, bottom-center 2-line captions, and stitches leading dots live', () => {
+    const store = new Map([
+        ['supratube_caption_pos_v1', JSON.stringify({ watch: { leftPct: 0.05, topPct: 0.65 } })]
+    ]);
+    const elements = new Map();
+    const listeners = new Map();
+    const mk = tag => ({
+        tagName: String(tag || 'div').toUpperCase(),
+        id: '',
+        className: '',
+        textContent: '',
+        children: [],
+        style: {},
+        appendChild: ch => { elAdd(ch); return ch; },
+        setAttribute() {},
+        getAttribute: () => null,
+        removeAttribute() {},
+        addEventListener() {},
+        removeEventListener() {}
+    });
+    const elAdd = () => {};
+    const createNode = tag => {
+        const node = {
+            tagName: String(tag || 'div').toUpperCase(),
+            id: '',
+            className: '',
+            textContent: '',
+            children: [],
+            style: {},
+            appendChild(c) { c.parentElement = this; this.children.push(c); if (c.id) elements.set(c.id, c); return c; },
+            remove() { if (this.id) elements.delete(this.id); },
+            setAttribute() {},
+            getAttribute: () => null,
+            removeAttribute() {},
+            addEventListener() {},
+            removeEventListener() {}
+        };
+        return node;
+    };
+    const videoEl = createNode('video');
+    videoEl.paused = false;
+    const player = createNode('div');
+    player.id = 'movie_player';
+    player.clientWidth = 960;
+    player.clientHeight = 540;
+    player.getVideoData = () => ({ video_id: 'tradUiVid01' });
+    player.querySelector = sel => {
+        if (sel === 'video') return videoEl;
+        if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+        if (sel === '#supratube-ai-corner-box') return elements.get('supratube-ai-corner-box') || null;
+        return null;
+    };
+    player.querySelectorAll = () => [];
+    const doc = {
+        documentElement: { dataset: { supratubeWhisperBridge: '1' }, setAttribute() {}, removeAttribute() {} },
+        head: createNode('head'),
+        createElement: tag => createNode(tag),
+        getElementById: id => elements.get(id) || null,
+        querySelector: sel => (sel === 'video' ? videoEl : null),
+        querySelectorAll: () => []
+    };
+    const win = {
+        location: { href: 'https://www.youtube.com/watch?v=tradUiVid01', pathname: '/watch' },
+        localStorage: {
+            getItem: k => (store.has(k) ? store.get(k) : null),
+            setItem: (k, v) => store.set(k, String(v)),
+            removeItem: k => store.delete(k)
+        },
+        CustomEvent: class { constructor(t, i) { this.type = t; this.detail = i?.detail; } },
+        addEventListener(ev, fn) { if (!listeners.has(ev)) listeners.set(ev, new Set()); listeners.get(ev).add(fn); },
+        removeEventListener(ev, fn) { listeners.get(ev)?.delete(fn); },
+        dispatchEvent(ev) { for (const fn of [...(listeners.get(ev?.type) || [])]) fn(ev); },
+        setTimeout,
+        clearTimeout
+    };
+
+    const ok = startManualAiCaptions({
+        player,
+        videoId: 'tradUiVid01',
+        userLang: 'es',
+        doc,
+        win,
+        requestFn: async () => ({ status: 200, text: '' })
+    });
+    assert.equal(ok, true);
+    // Stale v1 bottom-left position purged -> box centered at bottom-center, corner notice top-left:
+    assert.equal(store.has('supratube_caption_pos_v1'), false);
+    const box = elements.get('supratube-fallback-captions');
+    const cornerBox = elements.get('supratube-ai-corner-box');
+    assert.equal(cornerBox?.style.left, '5.5%');
+    assert.equal(cornerBox?.style.top, '7.5%');
+    assert.equal(cornerBox?.children[0]?.textContent, 'Español (generado automáticamente)\nHaz clic en ⚙ para acceder a la configuración.');
+    assert.equal(box?.style.left, '50%');
+    assert.equal(box?.style.bottom, '9.5%');
+    assert.equal(box?.style.transform, 'translateX(-50%)');
+
+    // Live caption stream stitches deferred leading punctuation and keeps 2 traditional lines:
+    const emitCap = (raw, translated) => win.dispatchEvent(new win.CustomEvent('supratube-whisper-evt', {
+        detail: { kind: 'caption', videoId: 'tradUiVid01', mode: 'final', engine: 'sherpa', lang: 'es', raw, translated }
+    }));
+    emitCap('pepito dijo', 'pepito dijo');
+    assert.equal(box?.children[0]?.textContent, 'Pepito dijo');
+    emitCap('. Lo mas importante', '. Lo mas importante');
+    assert.equal(box?.children[0]?.textContent, 'Pepito dijo. Lo mas importante');
+    emitCap('que piñas del monje', 'que piñas del monje');
+    assert.equal(box?.children[0]?.textContent, 'Pepito dijo. Lo mas importante\nque piñas del monje');
+    emitCap('. entonces pepito dijo', '. entonces pepito dijo');
+    assert.equal(box?.children[0]?.textContent, 'que piñas del monje. Entonces pepito dijo');
+    assert.equal(formatTraditionalTwoLines('la pueden utilizar. No se sabe para qué. Otro caso de no se sabe', 38).includes('\n'), true);
+    assert.equal(typeof createLiveTraditionalSegmenter, 'function');
+
+    clearFallbackCaptions(doc, win);
+    assert.equal(elements.get('supratube-ai-corner-box'), undefined);
 });

@@ -3,6 +3,7 @@ import { env, WhisperForConditionalGeneration, AutoProcessor, AutoTokenizer, Log
 import { initASRModule, createOnlineRecognizer, OnlineRecognizerTypes } from '@sherpaw/asr';
 import {
     filterWhisperText,
+    extractLeadingPunctuation,
     stripCaptionOverlap,
     LanguageVoter,
     computeLangSoftmax,
@@ -34,13 +35,13 @@ ort.env.wasm.numThreads = 1;
 
 const SR = 16000;
 const S = sec => Math.round(sec * SR);
-const MIN_FIRST_WINDOW = S(1.15);
-const SOFT_CUT_WINDOW = S(3.4);
-const MAX_WINDOW = S(5.6);
+const MIN_FIRST_WINDOW = S(1.30);
+const SOFT_CUT_WINDOW = S(2.8);
+const MAX_WINDOW = S(4.8);
 const OVERLAP = S(0.45);
-const PAUSE_FINAL = S(0.40);
+const PAUSE_FINAL = S(0.44);
 const PRE_ROLL = S(0.38);
-const INTERIM_STEP = S(1.1);
+const INTERIM_STEP = S(1.15);
 const SHERPA_DB_NAME = 'supratube-sherpa-models-v1';
 const SHERPA_STORE = 'files';
 const MYMEMORY_CONTACT = 'supratube.ext.translator@gmail.com';
@@ -549,8 +550,8 @@ async function initModel(spokenHint = '', enginePref = preferredEngine, { silent
                             maxActivePaths: 4,
                             enableEndpoint: 1,
                             rule1MinTrailingSilence: 1.4,
-                            rule2MinTrailingSilence: 0.7,
-                            rule3MinUtteranceLength: 9
+                            rule2MinTrailingSilence: 1.0,
+                            rule3MinUtteranceLength: 14
                         };
                         sherpaOnlineRec = createOnlineRecognizer(mod, cfg);
                     } finally {
@@ -733,6 +734,7 @@ async function flushSherpaCaptionQueue() {
                 mode: item.mode,
                 engine: 'sherpa',
                 raw: item.text,
+                leadPunct: item.leadPunct || '',
                 lang: item.lang,
                 locked: item.lang,
                 translated: translated || item.text,
@@ -756,7 +758,9 @@ async function processSherpaChunk(pcm, videoTime, runVid, { isPausedEnd = false 
     while (sherpaOnlineRec.isReady(sherpaStream)) {
         sherpaOnlineRec.decode(sherpaStream);
     }
-    const rawResult = filterWhisperText(sherpaOnlineRec.getResult(sherpaStream)?.text || '', activeModelLang || 'en');
+    const rawDecoded = sherpaOnlineRec.getResult(sherpaStream)?.text || '';
+    const { leadPunct, rest: rawBody } = extractLeadingPunctuation(rawDecoded);
+    const rawResult = filterWhisperText(rawBody, activeModelLang || 'en');
     const nativeEndpoint = sherpaOnlineRec.isEndpoint(sherpaStream);
     const isEndpoint = Boolean(nativeEndpoint || isPausedEnd);
     const stabilized = trimIncompleteStreamingText(rawResult, !isEndpoint);
@@ -770,6 +774,7 @@ async function processSherpaChunk(pcm, videoTime, runVid, { isPausedEnd = false 
             runVid,
             mode: isEndpoint ? 'final' : 'interim',
             text: displaySrc,
+            leadPunct: leadPunct || '',
             lang: activeModelLang || 'en',
             inferMs,
             videoTime
@@ -777,7 +782,7 @@ async function processSherpaChunk(pcm, videoTime, runVid, { isPausedEnd = false 
         void flushSherpaCaptionQueue();
     }
 
-    if ((nativeEndpoint || (isPausedEnd && rawResult.length >= 180)) && sherpaOnlineRec.getResult(sherpaStream)?.text) {
+    if ((nativeEndpoint || (isPausedEnd && rawResult.length >= 84)) && rawDecoded) {
         sherpaOnlineRec.reset(sherpaStream);
         sherpaLastPartial = '';
     }
@@ -1055,7 +1060,7 @@ self.onmessage = async e => {
 
                         if (st.isSpeech) {
                             if (utteranceStart === null) utteranceStart = Math.max(committed, start - PRE_ROLL);
-                            lastSpeechEnd = end;
+                            if (st.isActiveVoice !== false) lastSpeechEnd = end;
                             if (st.speechConfirmed) utteranceConfirmedByVad = true;
                         } else if (st.justEnded && utteranceStart !== null && !utteranceConfirmedByVad) {
                             utteranceStart = null;
