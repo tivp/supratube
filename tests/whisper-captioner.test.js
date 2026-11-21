@@ -18,7 +18,9 @@ import {
     findBestSilenceCutSample,
     computeAdaptiveSpeechThreshold,
     gentleConditionPcm,
-    SileroStreamingVadState
+    SileroStreamingVadState,
+    decodePcm16Base64ToFloat32,
+    extractSpeechSpansFromProbs
 } from '../offscreen-src/whisper-utils.js';
 
 test('filterWhisperText suppresses instrumental single stopwords, hallucinations, and n-gram loops', () => {
@@ -366,4 +368,34 @@ test('createLiveTraditionalSegmenter stitches deferred leading dots, coalesces s
     const silFrame = vad.pushProb(0.05);
     assert.equal(silFrame.isSpeech, true);
     assert.equal(silFrame.isActiveVoice, false);
+});
+
+test('decodePcm16Base64ToFloat32 and extractSpeechSpansFromProbs decode PCM16 cleanly and split long speech at silence valleys', () => {
+    const srcPcm16 = new Int16Array([0, 16384, -16384, 32767, -32768]);
+    const b64 = Buffer.from(srcPcm16.buffer, srcPcm16.byteOffset, srcPcm16.byteLength).toString('base64');
+    const decoded = decodePcm16Base64ToFloat32(b64);
+    assert.equal(decoded.length, 5);
+    assert.ok(Math.abs(decoded[1] - 0.5) < 0.001);
+    assert.ok(Math.abs(decoded[2] + 0.5) < 0.001);
+
+    // 10s audio at 16kHz -> ~312 frames of 512 samples; silent around 5s (frame ~156), silence 0..0.3s and 9.4..10s:
+    const sr = 16000;
+    const frameSize = 512;
+    const pcm = new Float32Array(sr * 10);
+    const probs = new Float32Array(Math.floor(pcm.length / frameSize));
+    for (let f = 0; f < probs.length; f++) {
+        const sec = (f * frameSize) / sr;
+        const isSil = sec < 0.4 || (sec >= 4.7 && sec <= 5.3) || sec > 9.3;
+        probs[f] = isSil ? 0.02 : 0.85;
+        for (let j = 0; j < frameSize; j++) {
+            pcm[f * frameSize + j] = isSil ? 0.0001 : 0.25 * Math.sin((f * frameSize + j) * 0.2);
+        }
+    }
+
+    const spans = extractSpeechSpansFromProbs(probs, pcm, { sampleRate: sr, frameSize, maxSpanSec: 6.5 });
+    assert.ok(spans.length >= 2, `expected long speech split into >= 2 spans, got ${spans.length}`);
+    for (const sp of spans) {
+        const durSec = (sp.endSample - sp.startSample) / sr;
+        assert.ok(durSec <= 6.6 && durSec >= 0.5, `unexpected span duration ${durSec}`);
+    }
 });

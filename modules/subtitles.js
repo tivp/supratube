@@ -346,11 +346,14 @@ function getFallbackCtrl(win) {
             showWhisperLine: null,
             stopWhisper: null,
             stopInPageStt: null,
+            stopPretranscribe: null,
+            tickFallbackLoop: null,
             ccUi: null,
             sameLangVideos: new Set(),
             stopLoop: null,
             watchdogTimer: null,
-            cache: new Map()
+            cache: new Map(),
+            aiSrtByVid: new Map()
         };
     }
     return host.__supratubeFallbackCtrl;
@@ -1341,6 +1344,113 @@ function purgeLegacyCaptionPos(win) {
     try { win?.localStorage?.removeItem?.(LEGACY_CAPTION_POS_KEY); } catch {}
 }
 
+function configureSegWrapperStyle(segEl, { isShorts = false, fontPx = 20, fontWeight = '500', align = 'left' } = {}) {
+    if (!segEl) return;
+    segEl.__supratubeLineStyle = { isShorts, fontPx, fontWeight: String(fontWeight), align };
+    if (!segEl.style) return;
+    Object.assign(segEl.style, {
+        display: 'inline-flex',
+        flexDirection: 'column',
+        alignItems: align === 'center' ? 'center' : 'flex-start',
+        gap: '0px',
+        background: 'transparent',
+        color: '#ffffff',
+        fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
+        fontSize: `${fontPx}px`,
+        fontWeight: String(fontWeight),
+        lineHeight: '1.24',
+        padding: '0px',
+        borderRadius: '0px',
+        textShadow: 'none',
+        whiteSpace: 'normal',
+        boxDecorationBreak: '',
+        WebkitBoxDecorationBreak: ''
+    });
+}
+
+/** Render multiline caption text as flush stacked <span> rows with YouTube-style rounded outer corners and zero overlap. */
+export function renderOverlayCaptionLines(segEl, text, doc, opts = {}) {
+    if (!segEl) return segEl;
+    const prev = segEl.__supratubeLineStyle || {};
+    const cfg = {
+        isShorts: opts.isShorts ?? prev.isShorts ?? false,
+        fontPx: opts.fontPx ?? prev.fontPx ?? 20,
+        fontWeight: String(opts.fontWeight ?? prev.fontWeight ?? '500'),
+        align: opts.align ?? prev.align ?? (opts.isShorts ? 'center' : 'left')
+    };
+    configureSegWrapperStyle(segEl, cfg);
+
+    while (segEl.firstChild && typeof segEl.removeChild === 'function') {
+        segEl.removeChild(segEl.firstChild);
+    }
+    if (Array.isArray(segEl.children)) segEl.children.length = 0;
+
+    const lines = String(text ?? '')
+        .split(/\r?\n/)
+        .map(s => s.trim())
+        .filter(Boolean);
+    if (!lines.length) {
+        if (segEl.nodeType !== 1) segEl.textContent = '';
+        return segEl;
+    }
+
+    const createEl = typeof doc?.createElement === 'function' ? tag => doc.createElement(tag) : null;
+    for (let i = 0; i < lines.length; i++) {
+        const lineText = lines[i];
+        let radius = '4px';
+        if (lines.length > 1) {
+            if (cfg.align === 'center') {
+                if (i === 0) {
+                    radius = lineText.length > lines[1].length ? '4px 4px 4px 4px' : '4px 4px 0px 0px';
+                } else if (i === lines.length - 1) {
+                    radius = lineText.length > lines[i - 1].length ? '4px 4px 4px 4px' : '0px 0px 4px 4px';
+                } else {
+                    radius = '0px';
+                }
+            } else {
+                if (i === 0) {
+                    radius = `4px 4px ${lineText.length > lines[1].length ? '4px' : '0px'} 0px`;
+                } else if (i === lines.length - 1) {
+                    radius = `0px ${lineText.length > lines[i - 1].length ? '4px' : '0px'} 4px 4px`;
+                } else {
+                    radius = '0px';
+                }
+            }
+        }
+
+        if (createEl) {
+            const lineSpan = createEl('span');
+            lineSpan.className = 'supratube-caption-line';
+            if (lineSpan.style) {
+                Object.assign(lineSpan.style, {
+                    display: 'inline-block',
+                    background: 'rgba(8, 8, 8, 0.75)',
+                    color: '#ffffff',
+                    fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
+                    fontSize: `${cfg.fontPx}px`,
+                    fontWeight: cfg.fontWeight,
+                    lineHeight: '1.24',
+                    padding: '0.09em 0.34em',
+                    margin: '0px',
+                    borderRadius: radius,
+                    textShadow: '0 1px 2px rgba(0, 0, 0, 0.9)',
+                    whiteSpace: 'pre-wrap'
+                });
+            }
+            lineSpan.textContent = lineText;
+            if (i > 0 && typeof doc?.createTextNode === 'function') {
+                segEl.appendChild?.(doc.createTextNode('\n'));
+            }
+            segEl.appendChild?.(lineSpan);
+        }
+    }
+
+    if (segEl.nodeType !== 1) {
+        segEl.textContent = lines.join('\n');
+    }
+    return segEl;
+}
+
 function ensureAiCornerBox(player, doc, win) {
     if (!player || !doc) return null;
     let box = player.querySelector?.(`#${CORNER_BOX_ID}`) || doc.getElementById?.(CORNER_BOX_ID);
@@ -1374,22 +1484,8 @@ function ensureAiCornerBox(player, doc, win) {
         textAlign: 'left'
     });
     const segEl = box.children?.[0];
-    if (segEl?.style) {
-        Object.assign(segEl.style, {
-            display: 'inline',
-            background: 'rgba(8, 8, 8, 0.75)',
-            color: '#ffffff',
-            fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
-            fontSize: `${fontPx}px`,
-            fontWeight: '500',
-            lineHeight: '1.25',
-            padding: '0.11em 0.35em',
-            borderRadius: '0px',
-            textShadow: '0 1px 2px rgba(0, 0, 0, 0.9)',
-            whiteSpace: 'pre-line',
-            boxDecorationBreak: 'clone',
-            WebkitBoxDecorationBreak: 'clone'
-        });
+    if (segEl) {
+        configureSegWrapperStyle(segEl, { isShorts, fontPx, fontWeight: '500', align: 'left' });
     }
     return box;
 }
@@ -1401,7 +1497,8 @@ function showAiCornerBanner(player, doc, win, { langLabel, subLine = 'Haz clic e
     const span = box.children?.[0];
     const line1 = String(langLabel || 'Español (generado automáticamente)').trim();
     const line2 = String(subLine || '').trim();
-    if (span) span.textContent = line2 ? `${line1}\n${line2}` : line1;
+    const text = line2 ? `${line1}\n${line2}` : line1;
+    if (span) renderOverlayCaptionLines(span, text, doc, { align: 'left' });
     box.style.display = 'block';
     clearTimeout(ctrl.cornerTimer);
     ctrl.cornerTimer = null;
@@ -1697,21 +1794,12 @@ function ensureFallbackBox(player, doc, win) {
     }
     bindFallbackBoxDrag(box, player, doc, win);
     const segEl = box.children?.[0];
-    if (segEl?.style) {
-        Object.assign(segEl.style, {
-            display: 'inline',
-            background: 'rgba(8, 8, 8, 0.75)',
-            color: '#ffffff',
-            fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
-            fontSize: `${fontPx}px`,
+    if (segEl) {
+        configureSegWrapperStyle(segEl, {
+            isShorts,
+            fontPx,
             fontWeight: isShorts ? '600' : '500',
-            lineHeight: '1.25',
-            padding: '0.11em 0.35em',
-            borderRadius: '0px',
-            textShadow: '0 1px 2px rgba(0, 0, 0, 0.9)',
-            whiteSpace: 'pre-line',
-            boxDecorationBreak: 'clone',
-            WebkitBoxDecorationBreak: 'clone'
+            align: isShorts ? 'center' : 'left'
         });
     }
     return box;
@@ -1998,19 +2086,35 @@ export function startManualAiCaptions({
     deactivateNativeCcButtonVisual(player, doc, win);
 
     const initialMsg = video?.paused ? 'Subtítulos IA listos (reproduce el video)' : 'Haz clic en ⚙ para acceder a la configuración.';
-    const ok = startWhisperLiveFallback({
-        player,
-        video,
-        videoId,
-        userLang: baseUser,
-        asrEngine: engine,
-        aiAudioLang: audioLang,
-        doc,
-        win,
-        requestFn,
-        manualForce: true,
-        initialMessage: initialMsg
-    });
+    const tap = win.__supratubeAudioTap;
+    const hasBridge = doc?.documentElement?.dataset?.supratubeWhisperBridge === '1';
+    const srtKey = `${videoId}:${baseUser}:${engine}:${audioLang}`;
+    const ok = (hasBridge && tap?.installed && typeof tap.getSegments === 'function')
+        ? startAiPretranscribeFallback({
+            player,
+            video,
+            videoId,
+            userLang: baseUser,
+            asrEngine: engine,
+            aiAudioLang: audioLang,
+            srtKey,
+            doc,
+            win,
+            requestFn
+        })
+        : startWhisperLiveFallback({
+            player,
+            video,
+            videoId,
+            userLang: baseUser,
+            asrEngine: engine,
+            aiAudioLang: audioLang,
+            doc,
+            win,
+            requestFn,
+            manualForce: true,
+            initialMessage: initialMsg
+        });
     if (!ok) {
         player.removeAttribute?.('data-supratube-ai-subs-active');
         doc.documentElement?.removeAttribute?.('data-supratube-ai-subs-active');
@@ -2344,6 +2448,11 @@ export function clearFallbackCaptions(doc = typeof document !== 'undefined' ? do
         try { ctrl.stopInPageStt(); } catch {}
         ctrl.stopInPageStt = null;
     }
+    if (typeof ctrl.stopPretranscribe === 'function') {
+        try { ctrl.stopPretranscribe(); } catch {}
+        ctrl.stopPretranscribe = null;
+    }
+    ctrl.tickFallbackLoop = null;
     ctrl.whisperVid = null;
     ctrl.whisperManualForce = false;
     if (typeof ctrl.stopLoop === 'function') {
@@ -2400,6 +2509,8 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
         setFallbackCcActive(player, doc, win, 'layer1');
     }
 
+    let lastRenderedTxt = null;
+    let lastRenderedFont = 0;
     const renderTick = () => {
         if (ctrl.activeVid !== videoId) return;
         if (!isVideoStillActive(player, win, videoId)) {
@@ -2410,14 +2521,16 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
             clearFallbackCaptions(doc, win);
             return;
         }
-        if (ctrl.manualOverlayActive) {
+        if (ctrl.manualOverlayActive && !ctrl.whisperVid) {
+            deactivateNativeCcButtonVisual(player, doc, win);
+        } else if (hasDedicatedIaButton(doc, ctrl)) {
             deactivateNativeCcButtonVisual(player, doc, win);
         } else if (!ctrl.ccUi || ctrl.ccUi.ccBtn?.isConnected === false) {
             setFallbackCcActive(player, doc, win, 'layer1');
         }
         const box = ensureFallbackBox(player, doc, win);
         if (!box) return;
-        if (hasVisibleNativeCaptions(player)) {
+        if (!ctrl.whisperManualForce && hasVisibleNativeCaptions(player)) {
             box.style.display = 'none';
             return;
         }
@@ -2425,11 +2538,18 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
         const txt = findActiveChunkText(getChunks(), t);
         const isShorts = Boolean(player?.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
         const segEl = box.children?.[0];
-        if (segEl) segEl.textContent = txt ? formatTraditionalTwoLines(txt, isShorts ? 32 : 42) : '';
-        box.style.display = txt ? 'block' : 'none';
-        if (txt) reclampFallbackBoxPosition(box, player, doc, win);
+        const formatted = txt ? formatTraditionalTwoLines(txt, isShorts ? 32 : 42) : '';
+        const curFont = segEl?.__supratubeLineStyle?.fontPx || 0;
+        if (segEl && (formatted !== lastRenderedTxt || curFont !== lastRenderedFont || (formatted && !segEl.children?.length))) {
+            lastRenderedTxt = formatted;
+            lastRenderedFont = curFont;
+            renderOverlayCaptionLines(segEl, formatted, doc, { isShorts, align: isShorts ? 'center' : 'left' });
+        }
+        box.style.display = formatted ? 'block' : 'none';
+        if (formatted) reclampFallbackBoxPosition(box, player, doc, win);
     };
 
+    ctrl.tickFallbackLoop = renderTick;
     const onTime = () => renderTick();
     video.addEventListener?.('timeupdate', onTime, { passive: true });
     video.addEventListener?.('seeked', onTime, { passive: true });
@@ -2439,6 +2559,7 @@ function startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks }) 
     if (timer && typeof timer.unref === 'function') timer.unref();
 
     ctrl.stopLoop = () => {
+        if (ctrl.tickFallbackLoop === renderTick) ctrl.tickFallbackLoop = null;
         video.removeEventListener?.('timeupdate', onTime);
         video.removeEventListener?.('seeked', onTime);
         if (timer !== null) clearInterval(timer);
@@ -3215,6 +3336,905 @@ function startInPageSttFallback({
     };
 }
 
+function stReadU32(u8, off) {
+    return (((u8[off] << 24) >>> 0) + ((u8[off + 1] << 16) >>> 0) + (u8[off + 2] << 8) + u8[off + 3]) >>> 0;
+}
+
+function stScanMp4Boxes(u8, start, end, onBox) {
+    let off = start;
+    while (off + 8 <= end) {
+        let sz = stReadU32(u8, off);
+        const tag = String.fromCharCode(u8[off + 4], u8[off + 5], u8[off + 6], u8[off + 7]);
+        let hdr = 8;
+        if (sz === 1) {
+            if (off + 16 > end) break;
+            sz = stReadU32(u8, off + 8) * 4294967296 + stReadU32(u8, off + 12);
+            hdr = 16;
+        } else if (sz === 0) {
+            sz = end - off;
+        }
+        if (sz < hdr || off + sz > end) break;
+        if (onBox(tag, off, off + hdr, off + sz) === true) return true;
+        off += sz;
+    }
+    return false;
+}
+
+/** Parse media timescale from an fMP4 init segment (moov -> trak -> mdia -> mdhd). */
+export function parseMp4Timescale(u8) {
+    const buf = u8 instanceof Uint8Array ? u8 : new Uint8Array(u8 || 0);
+    if (buf.length < 24) return 0;
+    let found = 0;
+    const walk = (s, e) => {
+        stScanMp4Boxes(buf, s, e, (tag, _bs, ps, pe) => {
+            if (tag === 'mdhd' && ps + 16 <= pe) {
+                const ver = buf[ps];
+                const tsOff = ver === 1 ? ps + 20 : ps + 12;
+                if (tsOff + 4 <= pe) {
+                    const ts = stReadU32(buf, tsOff);
+                    if (ts > 0) {
+                        found = ts;
+                        return true;
+                    }
+                }
+            } else if (tag === 'moov' || tag === 'trak' || tag === 'mdia') {
+                walk(ps, pe);
+                if (found > 0) return true;
+            }
+            return false;
+        });
+    };
+    walk(0, buf.length);
+    return found;
+}
+
+/** Parse baseMediaDecodeTime in seconds from an fMP4 media segment (moof -> traf -> tfdt). */
+export function parseMp4TfdtSec(u8, timescale = 48000) {
+    const buf = u8 instanceof Uint8Array ? u8 : new Uint8Array(u8 || 0);
+    if (buf.length < 24 || !timescale) return null;
+    let found = null;
+    const walk = (s, e) => {
+        stScanMp4Boxes(buf, s, e, (tag, _bs, ps, pe) => {
+            if (tag === 'tfdt' && ps + 8 <= pe) {
+                const ver = buf[ps];
+                const val = ver === 1 && ps + 12 <= pe
+                    ? stReadU32(buf, ps + 4) * 4294967296 + stReadU32(buf, ps + 8)
+                    : stReadU32(buf, ps + 4);
+                found = +(val / timescale).toFixed(3);
+                return true;
+            } else if (tag === 'moof' || tag === 'traf') {
+                walk(ps, pe);
+                if (found !== null) return true;
+            }
+            return false;
+        });
+    };
+    walk(0, buf.length);
+    return found;
+}
+
+function stSplitMp4InitAndMedia(u8) {
+    if (!u8 || u8.length < 16) return null;
+    let sawMoov = false;
+    let hasInitTag = false;
+    let initEnd = 0;
+    stScanMp4Boxes(u8, 0, u8.length, (tag, bs, _ps, pe) => {
+        if (tag === 'ftyp' || tag === 'moov') {
+            hasInitTag = true;
+            if (tag === 'moov') sawMoov = true;
+            initEnd = pe;
+            return false;
+        }
+        if (hasInitTag && (tag === 'styp' || tag === 'sidx' || tag === 'moof' || tag === 'mdat' || tag === 'emsg')) {
+            if (initEnd === 0) initEnd = bs;
+            return true;
+        }
+        return true;
+    });
+    if (!sawMoov || initEnd <= 0) return null;
+    return { init: u8.slice(0, initEnd), media: initEnd < u8.length ? u8.slice(initEnd) : null };
+}
+
+function stReadEbmlVint(u8, off) {
+    if (off >= u8.length) return null;
+    const first = u8[off];
+    if (!first) return null;
+    let len = 1;
+    let mask = 0x80;
+    while (len <= 8 && (first & mask) === 0) {
+        mask >>= 1;
+        len++;
+    }
+    if (len > 8 || off + len > u8.length) return null;
+    let val = first & (mask - 1);
+    let allOnes = (first & (mask - 1)) === (mask - 1);
+    for (let i = 1; i < len; i++) {
+        val = val * 256 + u8[off + i];
+        if (u8[off + i] !== 0xff) allOnes = false;
+    }
+    return { len, value: allOnes ? -1 : val };
+}
+
+function stReadEbmlId(u8, off) {
+    if (off >= u8.length) return null;
+    const first = u8[off];
+    if (!first) return null;
+    let len = 1;
+    let mask = 0x80;
+    while (len <= 4 && (first & mask) === 0) {
+        mask >>= 1;
+        len++;
+    }
+    if (len > 4 || off + len > u8.length) return null;
+    let id = 0;
+    for (let i = 0; i < len; i++) id = id * 256 + u8[off + i];
+    return { len, id };
+}
+
+function stReadUintBE(u8, off, len) {
+    let v = 0;
+    for (let i = 0; i < len; i++) v = v * 256 + u8[off + i];
+    return v;
+}
+
+/** Parse EBML TimecodeScale (ns per tick) from a WebM init segment (default 1,000,000 ns = 1 ms). */
+export function parseWebmTimecodeScale(u8) {
+    const buf = u8 instanceof Uint8Array ? u8 : new Uint8Array(u8 || 0);
+    if (buf.length < 8) return 1000000;
+    const limit = Math.min(buf.length, 4096);
+    for (let i = 0; i + 4 < limit; i++) {
+        if (buf[i] === 0x2a && buf[i + 1] === 0xd7 && buf[i + 2] === 0xb1) {
+            const sz = stReadEbmlVint(buf, i + 3);
+            if (sz && sz.value >= 1 && sz.value <= 8 && i + 3 + sz.len + sz.value <= buf.length) {
+                const val = stReadUintBE(buf, i + 3 + sz.len, sz.value);
+                if (val > 0) return val;
+            }
+        }
+    }
+    return 1000000;
+}
+
+function stFindWebmClusterOffset(u8) {
+    if (!u8 || u8.length < 4) return -1;
+    for (let i = 0; i + 4 <= u8.length; i++) {
+        if (u8[i] === 0x1f && u8[i + 1] === 0x43 && u8[i + 2] === 0xb6 && u8[i + 3] === 0x75) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/** Parse Cluster Timecode in seconds from a WebM media segment. */
+export function parseWebmClusterStartSec(u8, tcScale = 1000000) {
+    const buf = u8 instanceof Uint8Array ? u8 : new Uint8Array(u8 || 0);
+    const cOff = stFindWebmClusterOffset(buf);
+    if (cOff < 0) return null;
+    const cSz = stReadEbmlVint(buf, cOff + 4);
+    if (!cSz) return null;
+    let p = cOff + 4 + cSz.len;
+    const limit = Math.min(buf.length, p + 64);
+    while (p + 2 < limit) {
+        const eid = stReadEbmlId(buf, p);
+        if (!eid) break;
+        const esz = stReadEbmlVint(buf, p + eid.len);
+        if (!esz || esz.value < 0) break;
+        const dataStart = p + eid.len + esz.len;
+        if (eid.id === 0xe7 && esz.value <= 8 && dataStart + esz.value <= buf.length) {
+            const rawTc = stReadUintBE(buf, dataStart, esz.value);
+            return +((rawTc * tcScale) / 1e9).toFixed(3);
+        }
+        p = dataStart + esz.value;
+    }
+    return null;
+}
+
+/** Ensure WebM Segment size encompasses appended Clusters so AudioContext.decodeAudioData reads the full buffer. */
+export function normalizeWebmSegmentSize(u8) {
+    const buf = u8 instanceof Uint8Array ? u8 : new Uint8Array(u8 || 0);
+    const limit = Math.min(buf.length - 4, 256);
+    for (let i = 0; i <= limit; i++) {
+        if (buf[i] === 0x18 && buf[i + 1] === 0x53 && buf[i + 2] === 0x80 && buf[i + 3] === 0x67) {
+            const v = stReadEbmlVint(buf, i + 4);
+            if (!v || v.value === -1) return buf;
+            const dataStart = i + 4 + v.len;
+            if (v.value < buf.length - dataStart) {
+                const copy = buf.slice();
+                const leadMask = 1 << (8 - v.len);
+                copy[i + 4] = leadMask | (leadMask - 1);
+                for (let k = 1; k < v.len; k++) copy[i + 4 + k] = 0xff;
+                return copy;
+            }
+            return buf;
+        }
+    }
+    return buf;
+}
+
+/** Merge newly decoded timed cues for [validStartSec, validEndSec] cleanly into an existing sorted SRT cue array. */
+export function mergeSrtSegmentCues(existingCues = [], validStartSec = 0, validEndSec = 0, newCues = []) {
+    const kept = [];
+    for (let i = 0; i < existingCues.length; i++) {
+        const c = existingCues[i];
+        if (!c || !String(c.text || '').trim()) continue;
+        const mid = (Number(c.start) + Number(c.end)) / 2;
+        if (mid < validStartSec - 0.05 || mid > validEndSec + 0.05) {
+            kept.push({
+                start: +Math.max(0, Number(c.start) || 0).toFixed(2),
+                end: +Math.max(0.05, Number(c.end) || 0.05).toFixed(2),
+                text: String(c.text).trim()
+            });
+        }
+    }
+    for (let i = 0; i < newCues.length; i++) {
+        const c = newCues[i];
+        const txt = String(c?.text || '').trim();
+        if (!txt) continue;
+        const start = +Math.max(0, Number(c.start ?? c.startSec) || 0).toFixed(2);
+        const rawEnd = Number(c.end ?? c.endSec);
+        const end = +(rawEnd > start ? rawEnd : start + 1.5).toFixed(2);
+        kept.push({ start, end, text: txt });
+    }
+    kept.sort((a, b) => a.start - b.start || a.end - b.end);
+    for (let i = 0; i < kept.length - 1; i++) {
+        if (kept[i].end > kept[i + 1].start && kept[i + 1].start > kept[i].start) {
+            kept[i].end = kept[i + 1].start;
+        }
+    }
+    return kept;
+}
+
+/** Pick the highest-priority untranscribed MSE segment: current playhead first, otherwise earliest ahead. */
+export function selectNextPretranscribeSegment(segments = [], doneRanges = [], currentTimeSec = 0) {
+    if (!Array.isArray(segments) || !segments.length) return null;
+    const isCovered = seg => {
+        const s = Number(seg.startSec) || 0;
+        const e = Number(seg.endSec) || 0;
+        if (e - s <= 0.1) return true;
+        for (let i = 0; i < doneRanges.length; i++) {
+            const r = doneRanges[i];
+            if (r.start <= s + 0.25 && r.end >= e - 0.25) return true;
+        }
+        return false;
+    };
+
+    const cur = Number(currentTimeSec) || 0;
+    const uncovered = segments.filter(s => s && !isCovered(s)).sort((a, b) => a.startSec - b.startSec);
+    if (!uncovered.length) return null;
+
+    const currentSeg = uncovered.find(s => s.startSec <= cur + 0.35 && s.endSec > cur);
+    if (currentSeg) return currentSeg;
+    const aheadSeg = uncovered.find(s => s.endSec > cur);
+    return aheadSeg || null;
+}
+
+/** Format seconds into standard SubRip timestamp HH:MM:SS,mmm. */
+export function formatSrtTimestamp(sec = 0) {
+    const msTotal = Math.max(0, Math.round((Number(sec) || 0) * 1000));
+    const hrs = Math.floor(msTotal / 3600000);
+    const mins = Math.floor((msTotal % 3600000) / 60000);
+    const secs = Math.floor((msTotal % 60000) / 1000);
+    const ms = msTotal % 1000;
+    const p2 = n => String(n).padStart(2, '0');
+    return `${p2(hrs)}:${p2(mins)}:${p2(secs)},${String(ms).padStart(3, '0')}`;
+}
+
+/** Serialize timed cues into a standard SubRip (.srt) string. */
+export function buildSrtTextFromCues(cues = []) {
+    const out = [];
+    for (let i = 0; i < cues.length; i++) {
+        const c = cues[i];
+        const txt = String(c?.text || '').trim();
+        if (!txt) continue;
+        out.push(`${out.length + 1}\n${formatSrtTimestamp(c.start)} --> ${formatSrtTimestamp(c.end)}\n${txt}`);
+    }
+    return out.join('\n\n');
+}
+
+/** Idempotent fallback MSE audio tap installer when page-hook.js has not already installed __supratubeAudioTap. */
+export function installAudioBufferTap(win = typeof window !== 'undefined' ? window : null) {
+    if (!win || win.__supratubeAudioTap) return win?.__supratubeAudioTap || null;
+    const MS = win.MediaSource;
+    const SB = win.SourceBuffer;
+    if (typeof MS !== 'function' || typeof SB !== 'function') return null;
+
+    const MAX_TAP_BYTES = 14 * 1024 * 1024;
+    const entries = [];
+    const sbMap = new WeakMap();
+    let entrySeq = 0;
+    let segSeq = 0;
+    let totalTapBytes = 0;
+
+    const snapshotBuffered = tr => {
+        const out = [];
+        try {
+            const len = Number(tr?.length) || 0;
+            for (let i = 0; i < len; i++) out.push([Number(tr.start(i)) || 0, Number(tr.end(i)) || 0]);
+        } catch {}
+        return out;
+    };
+
+    const diffBuffered = (before, after) => {
+        let best = null;
+        for (let i = 0; i < after.length; i++) {
+            let chunks = [[after[i][0], after[i][1]]];
+            for (let j = 0; j < before.length; j++) {
+                const [bs, be] = before[j];
+                const next = [];
+                for (let k = 0; k < chunks.length; k++) {
+                    const [cs, ce] = chunks[k];
+                    if (be <= cs || bs >= ce) next.push([cs, ce]);
+                    else {
+                        if (bs > cs) next.push([cs, Math.min(bs, ce)]);
+                        if (be < ce) next.push([Math.max(be, cs), ce]);
+                    }
+                }
+                chunks = next;
+            }
+            for (let k = 0; k < chunks.length; k++) {
+                const [cs, ce] = chunks[k];
+                if (ce - cs >= 0.35 && (!best || ce - cs > best.end - best.start)) {
+                    best = { start: +cs.toFixed(3), end: +ce.toFixed(3) };
+                }
+            }
+        }
+        return best;
+    };
+
+    const concatU8 = list => {
+        let tot = 0;
+        for (let i = 0; i < list.length; i++) tot += list[i].byteLength;
+        const out = new Uint8Array(tot);
+        let off = 0;
+        for (let i = 0; i < list.length; i++) {
+            out.set(list[i], off);
+            off += list[i].byteLength;
+        }
+        return out;
+    };
+
+    const origAddSb = MS.prototype.addSourceBuffer;
+    const origAppend = SB.prototype.appendBuffer;
+    if (typeof origAddSb !== 'function' || typeof origAppend !== 'function') return null;
+
+    MS.prototype.addSourceBuffer = function (mimeType) {
+        const sb = origAddSb.apply(this, arguments);
+        if (sb && /^audio\//i.test(String(mimeType || ''))) {
+            const entry = {
+                id: ++entrySeq,
+                sb,
+                mimeType: String(mimeType || ''),
+                isMp4: /mp4/i.test(String(mimeType || '')),
+                isWebm: /webm/i.test(String(mimeType || '')),
+                timescale: 48000,
+                timecodeScale: 1000000,
+                initSeg: null,
+                pendingChunks: [],
+                pendingBytes: 0,
+                lastBefore: [],
+                lastAppendTs: 0,
+                videoId: getVideoId(win?.location?.href || ''),
+                segments: [],
+                boundEnd: false
+            };
+            entries.push(entry);
+            sbMap.set(sb, entry);
+        }
+        return sb;
+    };
+
+    SB.prototype.appendBuffer = function (data) {
+        const entry = sbMap.get(this);
+        if (entry && data && (data instanceof ArrayBuffer || ArrayBuffer.isView(data))) {
+            try {
+                const copy = data instanceof ArrayBuffer
+                    ? new Uint8Array(data.slice(0))
+                    : new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+                if (!entry.pendingChunks.length) entry.lastBefore = snapshotBuffered(this.buffered);
+                entry.videoId = getVideoId(win?.location?.href || '') || entry.videoId;
+                entry.lastAppendTs = Date.now();
+                let mediaPart = copy;
+                if (entry.isMp4 && copy.length >= 16) {
+                    const split = stSplitMp4InitAndMedia(copy);
+                    if (split) {
+                        entry.initSeg = split.init;
+                        const ts = parseMp4Timescale(split.init);
+                        if (ts > 0) entry.timescale = ts;
+                        mediaPart = split.media;
+                    }
+                } else if (entry.isWebm && copy.length >= 8 && copy[0] === 0x1a && copy[1] === 0x45 && copy[2] === 0xdf && copy[3] === 0xa3) {
+                    const cOff = stFindWebmClusterOffset(copy);
+                    const initSlice = cOff > 0 ? copy.slice(0, cOff) : copy;
+                    entry.initSeg = initSlice;
+                    entry.timecodeScale = parseWebmTimecodeScale(initSlice);
+                    mediaPart = cOff > 0 ? copy.slice(cOff) : null;
+                }
+                if (mediaPart && mediaPart.byteLength > 0) {
+                    entry.pendingChunks.push(mediaPart);
+                    entry.pendingBytes += mediaPart.byteLength;
+                }
+                if (!entry.boundEnd && typeof this.addEventListener === 'function') {
+                    entry.boundEnd = true;
+                    this.addEventListener('updateend', () => {
+                        try {
+                            if (!entry.pendingChunks.length) return;
+                            const after = snapshotBuffered(entry.sb.buffered);
+                            const added = diffBuffered(entry.lastBefore || [], after);
+                            const merged = concatU8(entry.pendingChunks);
+                            let sSec = added?.start ?? null;
+                            let eSec = added?.end ?? null;
+                            if (sSec === null && entry.pendingBytes >= 24576) {
+                                const cStart = entry.isMp4
+                                    ? parseMp4TfdtSec(merged, entry.timescale)
+                                    : (entry.isWebm ? parseWebmClusterStartSec(merged, entry.timecodeScale) : null);
+                                if (cStart !== null) {
+                                    sSec = cStart;
+                                    eSec = +(cStart + 10).toFixed(3);
+                                }
+                            }
+                            if (sSec !== null && eSec !== null && eSec - sSec >= 0.35 && entry.initSeg) {
+                                const seg = {
+                                    seq: ++segSeq,
+                                    videoId: entry.videoId || getVideoId(win?.location?.href || ''),
+                                    startSec: sSec,
+                                    endSec: eSec,
+                                    bytes: merged,
+                                    initSeg: entry.initSeg,
+                                    mimeType: entry.mimeType
+                                };
+                                entry.pendingChunks = [];
+                                entry.pendingBytes = 0;
+                                entry.lastBefore = after;
+                                entry.segments.push(seg);
+                                totalTapBytes += merged.byteLength;
+                                while (totalTapBytes > MAX_TAP_BYTES && entries.some(e => e.segments.length)) {
+                                    const ent = entries.find(e => e.segments.length);
+                                    const dropped = ent?.segments.shift();
+                                    if (dropped?.bytes) totalTapBytes -= dropped.bytes.byteLength;
+                                }
+                                const Ev = typeof win.CustomEvent === 'function' ? win.CustomEvent : CustomEvent;
+                                win.dispatchEvent?.(new Ev('supratube-audio-segment', {
+                                    detail: { videoId: seg.videoId, seq: seg.seq, startSec: seg.startSec, endSec: seg.endSec }
+                                }));
+                            }
+                        } catch {}
+                    }, { passive: true });
+                }
+            } catch {}
+        }
+        return origAppend.apply(this, arguments);
+    };
+
+    win.__supratubeAudioTap = {
+        installed: true,
+        getSegments(videoId, videoEl) {
+            const targetVid = String(videoId || '');
+            const out = [];
+            for (let i = 0; i < entries.length; i++) {
+                for (let j = 0; j < entries[i].segments.length; j++) {
+                    const seg = entries[i].segments[j];
+                    if (seg.initSeg && seg.bytes?.byteLength && (!targetVid || seg.videoId === targetVid)) {
+                        out.push(seg);
+                    }
+                }
+            }
+            if (!out.length && targetVid && entries.length) {
+                const vLen = Number(videoEl?.buffered?.length) || 0;
+                for (let i = entries.length - 1; i >= 0; i--) {
+                    if (!entries[i].segments.length) continue;
+                    if (vLen > 0 || Date.now() - entries[i].lastAppendTs <= 15000) {
+                        for (let j = 0; j < entries[i].segments.length; j++) {
+                            const seg = entries[i].segments[j];
+                            if (seg.initSeg && seg.bytes?.byteLength) out.push(seg);
+                        }
+                        if (out.length) break;
+                    }
+                }
+            }
+            return out.sort((a, b) => a.startSec - b.startSec);
+        },
+        clearVideo(videoId) {
+            const targetVid = String(videoId || '');
+            for (let i = 0; i < entries.length; i++) {
+                entries[i].segments = entries[i].segments.filter(seg => {
+                    if (!targetVid || seg.videoId === targetVid) {
+                        totalTapBytes -= seg.bytes?.byteLength || 0;
+                        return false;
+                    }
+                    return true;
+                });
+            }
+        },
+        getStats() {
+            return { totalTapBytes, entryCount: entries.length };
+        }
+    };
+    return win.__supratubeAudioTap;
+}
+
+function startAiPretranscribeFallback({
+    player,
+    video,
+    videoId,
+    userLang = 'es',
+    asrEngine = '',
+    aiAudioLang = '',
+    srtKey,
+    doc,
+    win,
+    requestFn = gmRequest
+}) {
+    const ctrl = getFallbackCtrl(win);
+    if (typeof ctrl.stopWhisper === 'function') {
+        try { ctrl.stopWhisper(); } catch {}
+        ctrl.stopWhisper = null;
+    }
+    if (typeof ctrl.stopLoop === 'function') {
+        try { ctrl.stopLoop(); } catch {}
+        ctrl.stopLoop = null;
+    }
+    if (typeof ctrl.stopInPageStt === 'function') {
+        try { ctrl.stopInPageStt(); } catch {}
+        ctrl.stopInPageStt = null;
+    }
+    if (typeof ctrl.stopPretranscribe === 'function') {
+        try { ctrl.stopPretranscribe(); } catch {}
+        ctrl.stopPretranscribe = null;
+    }
+
+    const wantBase = normalizeBaseLang(userLang) || 'es';
+    const effectiveTargetLang = `-${wantBase}`;
+    const prefAudioLang = (aiAudioLang || readPreferredAiAudioLang(doc) || 'auto');
+    const spokenLang = inferVideoSpokenLang(player, doc, win, '', prefAudioLang);
+    const engine = resolveAsrEngineChoice(asrEngine || readPreferredAsrEngine(doc));
+    const tap = win.__supratubeAudioTap;
+
+    let track = ctrl.aiSrtByVid.get(srtKey);
+    if (!track) {
+        track = { cues: [], doneRanges: [] };
+        setBoundedCache(ctrl.aiSrtByVid, srtKey, track, 10);
+    }
+
+    ctrl.activeVid = videoId;
+    ctrl.whisperVid = videoId;
+    ctrl.whisperManualForce = true;
+    ctrl.manualOverlayActive = true;
+    ctrl.forceOverlay = true;
+    ctrl.hasReceivedWhisperCaption = track.cues.length > 0;
+    ctrl.lastWhisperPct = track.cues.length > 0 ? 100 : 0;
+
+    video?.setAttribute?.('data-supratube-whisper-target', videoId);
+    deactivateNativeCcButtonVisual(player, doc, win);
+    syncAiSubtitleButtonState(doc, win);
+    startFallbackSyncLoop({ player, video, videoId, doc, win, getChunks: () => track.cues });
+
+    const cornerLangLabel = formatAiCornerLangLabel(wantBase);
+    let stopped = false;
+    let bridgeReady = false;
+    let modelReady = track.cues.length > 0;
+    let pumping = false;
+    let inflightSeg = null;
+    let decodeFailCount = 0;
+    let cornerConfigShown = false;
+    let prevTail = null;
+    let decodeCtx = null;
+    const pendingSubWindows = [];
+    let ackTimer = null;
+    let mseEmptyTimer = null;
+
+    const showCorner = (subLine, autoFadeMs = 4200) => {
+        if (stopped || ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
+        showAiCornerBanner(player, doc, win, { langLabel: cornerLangLabel, subLine, autoFadeMs });
+    };
+
+    const isTimeCovered = sec => {
+        for (let i = 0; i < track.doneRanges.length; i++) {
+            if (track.doneRanges[i].start <= sec && track.doneRanges[i].end >= sec) return true;
+        }
+        return Boolean(findActiveChunkText(track.cues, sec));
+    };
+
+    const curSecInit = Number(video?.currentTime) || 0;
+    if (isTimeCovered(curSecInit)) {
+        cornerConfigShown = true;
+        showCorner(video?.paused ? 'Subtítulos IA listos (reproduce el video)' : 'Haz clic en ⚙ para acceder a la configuración.', video?.paused ? 0 : 4200);
+    } else {
+        showCorner('Pre-transcribiendo subtítulos IA...', 0);
+    }
+
+    const cleanupLocalOnly = () => {
+        if (stopped) return;
+        stopped = true;
+        clearTimeout(ackTimer);
+        clearTimeout(mseEmptyTimer);
+        ackTimer = null;
+        mseEmptyTimer = null;
+        win?.removeEventListener?.('supratube-whisper-evt', onEvt);
+        win?.removeEventListener?.('supratube-audio-segment', onAudioSeg);
+        video?.removeEventListener?.('seeked', onSeek);
+        video?.removeEventListener?.('play', onPlay);
+        if (decodeCtx && typeof decodeCtx.close === 'function') {
+            try { decodeCtx.close(); } catch {}
+            decodeCtx = null;
+        }
+    };
+
+    const fallbackToLiveStreaming = () => {
+        if (stopped) return;
+        cleanupLocalOnly();
+        if (ctrl.stopPretranscribe) ctrl.stopPretranscribe = null;
+        if (typeof ctrl.stopLoop === 'function') {
+            try { ctrl.stopLoop(); } catch {}
+            ctrl.stopLoop = null;
+        }
+        ctrl.whisperVid = null;
+        ctrl.manualOverlayActive = false;
+        startWhisperLiveFallback({
+            player,
+            video,
+            videoId,
+            userLang: wantBase,
+            asrEngine: engine,
+            aiAudioLang: prefAudioLang,
+            doc,
+            win,
+            requestFn,
+            manualForce: true,
+            initialMessage: video?.paused ? 'Subtítulos IA listos (reproduce el video)' : 'Haz clic en ⚙ para acceder a la configuración.'
+        });
+        syncAiSubtitleButtonState(doc, win);
+    };
+
+    const decodeSegmentToPcm = async seg => {
+        const Ctx = win?.AudioContext || win?.webkitAudioContext || win?.OfflineAudioContext;
+        if (typeof Ctx !== 'function') throw new Error('no AudioContext');
+        if (!decodeCtx || decodeCtx.state === 'closed') {
+            decodeCtx = Ctx === win?.OfflineAudioContext
+                ? new Ctx(1, 16000, 16000)
+                : new Ctx();
+        }
+        const initU8 = seg.initSeg instanceof Uint8Array ? seg.initSeg : new Uint8Array(seg.initSeg);
+        const bodyU8 = seg.bytes instanceof Uint8Array ? seg.bytes : new Uint8Array(seg.bytes);
+        const joined = new Uint8Array(initU8.byteLength + bodyU8.byteLength);
+        joined.set(initU8, 0);
+        joined.set(bodyU8, initU8.byteLength);
+        const rawBuf = /webm/i.test(String(seg.mimeType || ''))
+            ? normalizeWebmSegmentSize(joined).buffer
+            : joined.buffer;
+
+        const audioBuf = await new Promise((resolve, reject) => {
+            try {
+                const res = decodeCtx.decodeAudioData(rawBuf, resolve, reject);
+                if (res && typeof res.then === 'function') res.then(resolve, reject);
+            } catch (err) {
+                reject(err);
+            }
+        });
+        const nCh = Math.max(1, Number(audioBuf?.numberOfChannels) || 1);
+        const rawLen = Number(audioBuf?.length) || 0;
+        if (rawLen <= 0) return new Float32Array(0);
+        let monoSrc = audioBuf.getChannelData(0);
+        if (nCh > 1) {
+            monoSrc = new Float32Array(rawLen);
+            for (let c = 0; c < nCh; c++) {
+                const ch = audioBuf.getChannelData(c);
+                for (let i = 0; i < rawLen; i++) monoSrc[i] += ch[i] / nCh;
+            }
+        }
+        return downsampleFloat32To16k(monoSrc, audioBuf.sampleRate || 16000);
+    };
+
+    const pumpNextSegment = async () => {
+        if (stopped || !bridgeReady || pumping || inflightSeg) return;
+        if (ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
+
+        if (pendingSubWindows.length > 0) {
+            const winJob = pendingSubWindows.shift();
+            inflightSeg = winJob;
+            dispatchWhisperCmd(win, { action: 'transcribe_segment', videoId, ...winJob });
+            return;
+        }
+
+        const segs = tap?.getSegments?.(videoId, video) || [];
+        const curSec = Number(video?.currentTime) || 0;
+        const nextSeg = selectNextPretranscribeSegment(segs, track.doneRanges, curSec);
+        if (!nextSeg) return;
+
+        pumping = true;
+        try {
+            const mono16k = await decodeSegmentToPcm(nextSeg);
+            if (stopped || ctrl.whisperVid !== videoId || ctrl.activeVid !== videoId) return;
+            decodeFailCount = 0;
+
+            const durSec = mono16k.length / 16000;
+            if (mono16k.length < 256 || durSec <= 0.05) {
+                track.doneRanges.push({ start: nextSeg.startSec, end: nextSeg.endSec });
+                return;
+            }
+            const decodedEndSec = +(nextSeg.startSec + durSec).toFixed(3);
+            const segValidEndSec = Math.min(nextSeg.endSec > nextSeg.startSec ? nextSeg.endSec : decodedEndSec, decodedEndSec);
+
+            let fullPcm = mono16k;
+            let fullStartSec = nextSeg.startSec;
+            if (prevTail && Math.abs(nextSeg.startSec - prevTail.endSec) <= 0.35 && prevTail.pcm?.length) {
+                const stitched = new Float32Array(prevTail.pcm.length + mono16k.length);
+                stitched.set(prevTail.pcm, 0);
+                stitched.set(mono16k, prevTail.pcm.length);
+                fullPcm = stitched;
+                fullStartSec = Math.max(0, +(nextSeg.startSec - prevTail.pcm.length / 16000).toFixed(3));
+            }
+            prevTail = mono16k.length >= 3200
+                ? { endSec: decodedEndSec, pcm: mono16k.slice(Math.max(0, mono16k.length - 14400)) }
+                : null;
+
+            const MAX_WIN_SEC = 10;
+            const OVERLAP_SEC = 0.8;
+            let vCursor = nextSeg.startSec;
+            while (vCursor < segValidEndSec - 0.15) {
+                const vEnd = Math.min(segValidEndSec, +(vCursor + MAX_WIN_SEC).toFixed(3));
+                const isLastWin = vEnd >= segValidEndSec - 0.05;
+                const markEnd = isLastWin ? Math.max(nextSeg.endSec, vEnd) : vEnd;
+                const wStart = Math.max(fullStartSec, +(vCursor - OVERLAP_SEC).toFixed(3));
+                const sOff = Math.max(0, Math.round((wStart - fullStartSec) * 16000));
+                const eOff = Math.min(fullPcm.length, Math.round((vEnd - fullStartSec) * 16000));
+                const slice = fullPcm.subarray(sOff, eOff);
+                if (slice.length >= 256) {
+                    pendingSubWindows.push({
+                        segId: `${nextSeg.seq}:${vCursor.toFixed(2)}`,
+                        startSec: +wStart.toFixed(3),
+                        endSec: +vEnd.toFixed(3),
+                        validStartSec: +vCursor.toFixed(3),
+                        validEndSec: +markEnd.toFixed(3),
+                        pcm16B64: pcm16ToBase64(float32ToPcm16(slice))
+                    });
+                }
+                vCursor = vEnd;
+            }
+        } catch {
+            decodeFailCount++;
+            track.doneRanges.push({ start: nextSeg.startSec, end: nextSeg.endSec });
+            if (decodeFailCount >= 2 && !track.cues.length) {
+                fallbackToLiveStreaming();
+                return;
+            }
+        } finally {
+            pumping = false;
+        }
+
+        if (!stopped && pendingSubWindows.length > 0 && !inflightSeg) {
+            const winJob = pendingSubWindows.shift();
+            inflightSeg = winJob;
+            dispatchWhisperCmd(win, { action: 'transcribe_segment', videoId, ...winJob });
+        } else if (!stopped && !inflightSeg) {
+            void pumpNextSegment();
+        }
+    };
+
+    const armMseEmptyWatchdog = () => {
+        if (mseEmptyTimer || stopped || video?.paused || track.cues.length > 0) return;
+        const existingSegs = tap?.getSegments?.(videoId, video) || [];
+        if (existingSegs.length > 0) return;
+        mseEmptyTimer = setTimeout(() => {
+            mseEmptyTimer = null;
+            if (stopped || ctrl.whisperVid !== videoId || track.cues.length > 0 || inflightSeg) return;
+            const nowSegs = tap?.getSegments?.(videoId, video) || [];
+            if (!nowSegs.length && !video?.paused) {
+                fallbackToLiveStreaming();
+            }
+        }, 1400);
+        if (typeof mseEmptyTimer?.unref === 'function') mseEmptyTimer.unref();
+    };
+
+    const onAudioSeg = ev => {
+        if (stopped) return;
+        const dVid = ev?.detail?.videoId;
+        if (dVid && dVid !== videoId) return;
+        clearTimeout(mseEmptyTimer);
+        mseEmptyTimer = null;
+        void pumpNextSegment();
+    };
+    const onSeek = () => {
+        if (!stopped) void pumpNextSegment();
+    };
+    const onPlay = () => {
+        if (stopped) return;
+        armMseEmptyWatchdog();
+        void pumpNextSegment();
+    };
+
+    const onEvt = ev => {
+        const d = ev?.detail;
+        if (!d || typeof d !== 'object') return;
+        if (d.videoId && d.videoId !== videoId) return;
+        if (stopped || ctrl.whisperVid !== videoId) return;
+
+        if (d.kind === 'ack' || d.kind === 'ready' || d.kind === 'lang_detected') {
+            clearTimeout(ackTimer);
+            ackTimer = null;
+            bridgeReady = true;
+            if (d.kind === 'ready') {
+                modelReady = true;
+                ctrl.lastWhisperPct = 100;
+            }
+            if (d.kind === 'lang_detected' && !ctrl.hasReceivedWhisperCaption) {
+                const langLabel = d.lang === 'es' ? 'Español' : (d.lang === 'en' ? 'Inglés' : String(d.lang || '').toUpperCase());
+                showCorner(`Voz detectada (${langLabel}) · pre-transcribiendo...`, 0);
+            }
+            void pumpNextSegment();
+            return;
+        }
+        if (d.kind === 'progress') {
+            if (ctrl.hasReceivedWhisperCaption || modelReady || ctrl.lastWhisperPct >= 100) return;
+            ctrl.lastWhisperPct = Number(d.pct) || 0;
+            if (d.pct > 0 && d.pct < 100) showCorner(`Subtítulos IA (${d.pct}%)...`, 0);
+            return;
+        }
+        if (d.kind === 'srt_segment') {
+            clearTimeout(ackTimer);
+            clearTimeout(mseEmptyTimer);
+            ackTimer = null;
+            mseEmptyTimer = null;
+            modelReady = true;
+            ctrl.lastWhisperPct = 100;
+
+            const vStart = Number(d.validStartSec ?? d.startSec) || 0;
+            const vEnd = Number(d.validEndSec ?? d.endSec) || vStart;
+            track.cues = mergeSrtSegmentCues(track.cues, vStart, vEnd, d.cues || []);
+            if (vEnd > vStart) track.doneRanges.push({ start: vStart, end: vEnd });
+
+            inflightSeg = null;
+            ctrl.hasReceivedWhisperCaption = track.cues.length > 0;
+            const nowSec = Number(video?.currentTime) || 0;
+            if (!cornerConfigShown && (isTimeCovered(nowSec) || track.cues.length > 0)) {
+                cornerConfigShown = true;
+                showCorner(video?.paused ? 'Subtítulos IA listos (reproduce el video)' : 'Haz clic en ⚙ para acceder a la configuración.', video?.paused ? 0 : 4200);
+            }
+            ctrl.tickFallbackLoop?.();
+            syncAiSubtitleButtonState(doc, win);
+            void pumpNextSegment();
+            return;
+        }
+        if (d.kind === 'preempted') {
+            clearFallbackCaptions(doc, win);
+            return;
+        }
+        if (d.kind === 'error') {
+            fallbackToLiveStreaming();
+        }
+    };
+
+    win?.addEventListener?.('supratube-whisper-evt', onEvt);
+    win?.addEventListener?.('supratube-audio-segment', onAudioSeg);
+    video?.addEventListener?.('seeked', onSeek, { passive: true });
+    video?.addEventListener?.('play', onPlay, { passive: true });
+
+    ctrl.stopPretranscribe = () => {
+        cleanupLocalOnly();
+        video?.removeAttribute?.('data-supratube-whisper-target');
+        dispatchWhisperCmd(win, { action: 'stop', videoId });
+    };
+
+    ackTimer = setTimeout(() => {
+        ackTimer = null;
+        if (!stopped && !bridgeReady && ctrl.whisperVid === videoId) {
+            fallbackToLiveStreaming();
+        }
+    }, 1800);
+    if (typeof ackTimer?.unref === 'function') ackTimer.unref();
+
+    armMseEmptyWatchdog();
+    dispatchWhisperCmd(win, {
+        action: 'start',
+        videoId,
+        targetLang: effectiveTargetLang,
+        spokenLang,
+        asrEngine: engine,
+        aiAudioLang: prefAudioLang,
+        manualForce: true,
+        pretranscribeOnly: true
+    });
+    return true;
+}
+
 function startWhisperLiveFallback({
     player,
     video,
@@ -3336,7 +4356,7 @@ function startWhisperLiveFallback({
         const box = ensureFallbackBox(player, doc, win);
         if (!box) return;
         const segEl = box.children?.[0];
-        if (segEl) segEl.textContent = formatted;
+        if (segEl) renderOverlayCaptionLines(segEl, formatted, doc, { isShorts: isShortsPlayer, align: isShortsPlayer ? 'center' : 'left' });
         box.style.display = formatted ? 'block' : 'none';
         if (formatted) reclampFallbackBoxPosition(box, player, doc, win);
         clearTimeout(fadeTimer);
@@ -3358,7 +4378,8 @@ function startWhisperLiveFallback({
             const box = ensureFallbackBox(player, doc, win);
             if (box) {
                 const segEl = box.children?.[0];
-                if (segEl) segEl.textContent = `Subtítulos IA: ${msg}`;
+                const isShorts = Boolean(player.id === 'shorts-player' || isShortsUrl(win?.location?.pathname || ''));
+                if (segEl) renderOverlayCaptionLines(segEl, `Subtítulos IA: ${msg}`, doc, { isShorts, align: isShorts ? 'center' : 'left' });
                 box.style.display = 'block';
                 const clearErrTimer = setTimeout(() => {
                     if (!getFallbackCtrl(win).activeVid) {
@@ -3915,6 +4936,9 @@ export async function applySmartSubtitles(player, deps = {}) {
     if (!deps.enabled || !player) return false;
     const doc = deps.doc || (typeof document !== 'undefined' ? document : null);
     const win = deps.win || (typeof window !== 'undefined' ? window : null);
+    if (win && !win.__supratubeAudioTap && typeof win.MediaSource === 'function') {
+        installAudioBufferTap(win);
+    }
     const storage = getStorageSafe(deps.storage);
     const scheduleFn = deps.scheduleFn || (fn => setTimeout(fn, 120));
     const requestFn = deps.gmRequestFn || gmRequest;

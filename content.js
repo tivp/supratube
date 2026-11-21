@@ -257,7 +257,7 @@
         return out;
     }
 
-    async function startWhisperCapture({ videoId, targetLang = 'es', spokenLang = '', asrEngine = 'sherpa', aiAudioLang = 'auto', manualForce = false }) {
+    async function startWhisperCapture({ videoId, targetLang = 'es', spokenLang = '', asrEngine = 'sherpa', aiAudioLang = 'auto', manualForce = false, pretranscribeOnly = false }) {
         if (!videoId) return;
         const vidEl =
             document.querySelector(`video[data-supratube-whisper-target="${videoId}"]`) ||
@@ -267,7 +267,7 @@
             document.querySelector('video');
         if (!vidEl) return;
 
-        const sig = `${videoId}:${targetLang}:${String(spokenLang || '')}:${String(asrEngine || 'sherpa')}:${String(aiAudioLang || 'auto')}:${Boolean(manualForce)}`;
+        const sig = `${videoId}:${targetLang}:${String(spokenLang || '')}:${String(asrEngine || 'sherpa')}:${String(aiAudioLang || 'auto')}:${Boolean(manualForce)}:${Boolean(pretranscribeOnly)}`;
         if (
             ((whisperSession.active && whisperSession.videoId === videoId) || whisperSession.pendingVideoId === videoId) &&
             whisperSession.sig === sig &&
@@ -315,6 +315,12 @@
         window.dispatchEvent(new CustomEvent('supratube-whisper-evt', {
             detail: { kind: 'ack', videoId }
         }));
+
+        if (pretranscribeOnly) {
+            disconnectProc(captureByVideo.get(vidEl));
+            whisperSession = { active: true, videoId, pendingVideoId: '', sig, video: vidEl, connected: false };
+            return;
+        }
 
         let entry = captureByVideo.get(vidEl);
         if (entry && (entry.ctx?.state === 'closed' || (!entry.usedMediaElement && entry.tracks?.some(t => t?.readyState === 'ended')))) {
@@ -465,6 +471,19 @@
             void startWhisperCapture(d);
         } else if (d.action === 'stop') {
             stopWhisperCapture(d.videoId || '');
+        } else if (d.action === 'transcribe_segment' && d.videoId && d.pcm16B64) {
+            try {
+                chrome.runtime.sendMessage({
+                    action: 'SUPRATUBE_WHISPER_SEGMENT',
+                    videoId: d.videoId,
+                    segId: d.segId || '',
+                    startSec: Number(d.startSec) || 0,
+                    endSec: Number(d.endSec) || 0,
+                    validStartSec: d.validStartSec,
+                    validEndSec: d.validEndSec,
+                    pcm16B64: d.pcm16B64
+                }).catch(() => {});
+            } catch {}
         } else if (d.action === 'reset' && d.videoId && whisperSession.videoId === d.videoId) {
             try {
                 chrome.runtime.sendMessage({ action: 'SUPRATUBE_WHISPER_RESET', videoId: d.videoId }).catch(() => {});

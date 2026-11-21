@@ -41,6 +41,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: true });
         return true;
     }
+    if (msg.type === 'TRANSCRIBE_SEGMENT') {
+        w.postMessage({
+            kind: 'TRANSCRIBE_SEGMENT',
+            videoId: msg.videoId || '',
+            segId: msg.segId || '',
+            startSec: Number(msg.startSec) || 0,
+            endSec: Number(msg.endSec) || 0,
+            validStartSec: msg.validStartSec,
+            validEndSec: msg.validEndSec,
+            pcm16B64: msg.pcm16B64 || ''
+        });
+        sendResponse({ ok: true });
+        return true;
+    }
     if (msg.type === 'PCM') {
         const f32 = new Float32Array(msg.samples || []);
         w.postMessage(

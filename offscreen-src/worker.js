@@ -16,7 +16,10 @@ import {
     findBestSilenceCutSample,
     computeAdaptiveSpeechThreshold,
     gentleConditionPcm,
-    SileroStreamingVadState
+    SileroStreamingVadState,
+    segmentTraditionalYouTubeCues,
+    decodePcm16Base64ToFloat32,
+    extractSpeechSpansFromProbs
 } from './whisper-utils.js';
 
 const VENDOR = new URL('./vendor/', self.location.href).href;
@@ -717,6 +720,186 @@ async function translateCached(text, from, to) {
 
 let sessionToken = 0;
 
+async function translateCueListCached(cues, fromLang, toLang) {
+    const cleanCues = Array.isArray(cues) ? cues.filter(c => String(c?.text || '').trim()) : [];
+    if (!cleanCues.length) return [];
+    const baseFrom = String(fromLang || '').replace(/^[-_]+/, '').split('-')[0].toLowerCase();
+    const baseTo = String(toLang || 'es').replace(/^[-_]+/, '').split('-')[0].toLowerCase();
+    if (!baseTo || baseTo === 'und' || baseTo === 'auto' || (baseFrom && baseFrom === baseTo)) {
+        return cleanCues;
+    }
+    if (cleanCues.length === 1) {
+        const tr = await translateCached(cleanCues[0].text, baseFrom, baseTo);
+        return [{ ...cleanCues[0], text: tr || cleanCues[0].text }];
+    }
+    const joined = cleanCues.map(c => String(c.text || '').replace(/\r?\n/g, ' ').trim()).join('\n');
+    const translatedJoined = await translateCached(joined, baseFrom, baseTo);
+    const lines = String(translatedJoined || '').split(/\r?\n/);
+    if (lines.length === cleanCues.length && lines.every(l => l.trim().length > 0)) {
+        return cleanCues.map((c, idx) => ({ ...c, text: lines[idx].trim() || c.text }));
+    }
+    const out = [];
+    for (let i = 0; i < cleanCues.length; i++) {
+        const c = cleanCues[i];
+        const tr = await translateCached(c.text, baseFrom, baseTo);
+        out.push({ ...c, text: tr || c.text });
+    }
+    return out;
+}
+
+async function runIsolatedSileroVadOnSegment(pcm) {
+    if (!pcm?.length) return [];
+    await ensureSileroSession();
+    const probs = [];
+    if (sileroSession) {
+        let state = new Float32Array(2 * 1 * 128);
+        const ctx = new Float32Array(64);
+        const win = new Float32Array(64 + 512);
+        for (let off = 0; off + 512 <= pcm.length; off += 512) {
+            if (stopped) return [];
+            const frame = pcm.subarray(off, off + 512);
+            win.set(ctx, 0);
+            win.set(frame, 64);
+            ctx.set(frame.subarray(512 - 64));
+            const out = await sileroSession.run({
+                input: new ort.Tensor('float32', win, [1, 576]),
+                state: new ort.Tensor('float32', state, [2, 1, 128]),
+                sr: sileroSr
+            });
+            state = new Float32Array(out.stateN.data);
+            probs.push(Number(out.output.data[0]) || 0);
+        }
+    } else {
+        for (let off = 0; off + 512 <= pcm.length; off += 512) {
+            let sum = 0;
+            const end = off + 512;
+            for (let j = off; j < end; j++) sum += pcm[j] * pcm[j];
+            const rms = Math.sqrt(sum / 512);
+            probs.push(rms > 0.0035 ? 0.8 : 0.05);
+        }
+    }
+    return extractSpeechSpansFromProbs(probs, pcm);
+}
+
+async function transcribeAudioSegment(msg) {
+    const runVid = String(msg.videoId || '');
+    if (loading) await loading.catch(() => {});
+    if (stopped || !runVid || runVid !== activeVideoId || (!sherpaOnlineRec && !model)) return;
+
+    const pcm = msg.pcm instanceof Float32Array ? msg.pcm : decodePcm16Base64ToFloat32(msg.pcm16B64 || '');
+    const segStartSec = Number(msg.startSec) || 0;
+    const segEndSec = Number(msg.endSec) || +(segStartSec + pcm.length / SR).toFixed(2);
+    const validStartSec = Number.isFinite(Number(msg.validStartSec)) ? Number(msg.validStartSec) : segStartSec;
+    const validEndSec = Number.isFinite(Number(msg.validEndSec)) ? Number(msg.validEndSec) : segEndSec;
+
+    const spans = pcm.length >= 512 ? await runIsolatedSileroVadOnSegment(pcm) : [];
+    if (stopped || runVid !== activeVideoId) return;
+
+    const rawSpans = [];
+    let pendingPromoteLang = '';
+    let detectedLang = activeEngine === 'sherpa'
+        ? (activeModelLang || requestedSpokenLang || 'en')
+        : (voter.locked || (requestedAiAudioLang !== 'auto' ? requestedAiAudioLang : requestedSpokenLang) || 'en');
+
+    for (let i = 0; i < spans.length; i++) {
+        if (stopped || runVid !== activeVideoId) return;
+        const { startSample, endSample } = spans[i];
+        const spanPcm = gentleConditionPcm(pcm.subarray(startSample, endSample));
+        const absStartSec = +(segStartSec + startSample / SR).toFixed(2);
+        const absEndSec = +(segStartSec + endSample / SR).toFixed(2);
+
+        if (activeEngine === 'sherpa' && sherpaOnlineRec) {
+            let rawDecoded = '';
+            const tmp = sherpaOnlineRec.createStream();
+            try {
+                tmp.acceptWaveform(SR, spanPcm);
+                tmp.acceptWaveform(SR, new Float32Array(S(0.45)));
+                while (sherpaOnlineRec.isReady(tmp)) {
+                    sherpaOnlineRec.decode(tmp);
+                }
+                rawDecoded = sherpaOnlineRec.getResult(tmp)?.text || '';
+            } finally {
+                try { tmp.free?.(); } catch {}
+            }
+            const { leadPunct, rest } = extractLeadingPunctuation(rawDecoded);
+            const clean = filterWhisperText(rest, activeModelLang || 'en');
+            if (clean) {
+                rawSpans.push({
+                    startSec: absStartSec,
+                    endSec: absEndSec,
+                    text: leadPunct ? `${leadPunct} ${clean}` : clean
+                });
+            }
+        } else if (activeEngine === 'whisper' && model) {
+            const forced = requestedAiAudioLang !== 'auto'
+                ? requestedAiAudioLang
+                : voter.forcedLanguage();
+            const res = await inferSamples(spanPcm, forced);
+            if (stopped || runVid !== activeVideoId) return;
+
+            const confident = (res.avgTokenProb ?? 1) >= 0.42;
+            if (confident) {
+                voter.observe({
+                    lang: res.detected,
+                    conf: res.conf,
+                    lockedConf: res.lockedConf,
+                    ts: Date.now(),
+                    silenceMs: 600
+                });
+                if (res.lang) detectedLang = res.lang;
+            }
+            if (voter.shouldAbortForSameLanguage(targetLang, manualForce)) {
+                stopped = true;
+                resetAudioState(true);
+                self.postMessage({ kind: 'same_language', videoId: runVid, lang: voter.locked, manualForce });
+                return;
+            }
+            if (!pendingPromoteLang && lidAutoPromotePending && voter.locked && preferredEngine === 'sherpa') {
+                const lockedBase = String(voter.locked || '').split(/[-_]/)[0].toLowerCase();
+                lidAutoPromotePending = false;
+                if (hasSherpaLanguageModel(lockedBase)) pendingPromoteLang = lockedBase;
+            }
+            const clean = confident ? filterWhisperText(res.text, res.lang || forced || requestedSpokenLang || '') : '';
+            if (clean) {
+                rawSpans.push({ startSec: absStartSec, endSec: absEndSec, text: clean });
+            }
+        }
+    }
+
+    const cues = segmentTraditionalYouTubeCues(rawSpans, { maxCueChars: 74, maxLineChars: 42 });
+    const keptCues = cues
+        .filter(c => {
+            const mid = (c.startSec + c.endSec) / 2;
+            return mid >= validStartSec - 0.15 && mid <= validEndSec + 0.35;
+        })
+        .map(c => ({
+            ...c,
+            startSec: +Math.max(0, c.startSec).toFixed(2),
+            endSec: +Math.max(0.05, c.endSec).toFixed(2)
+        }));
+
+    const translatedCues = keptCues.length ? await translateCueListCached(keptCues, detectedLang, targetLang) : [];
+    if (stopped || runVid !== activeVideoId) return;
+
+    hasEmittedCaptionForVid = true;
+    self.postMessage({
+        kind: 'srt_segment',
+        videoId: runVid,
+        segId: String(msg.segId || ''),
+        startSec: segStartSec,
+        endSec: segEndSec,
+        validStartSec,
+        validEndSec,
+        lang: voter.locked || detectedLang,
+        engine: activeEngine,
+        cues: translatedCues.map(c => ({ start: c.startSec, end: c.endSec, text: c.text }))
+    });
+
+    if (pendingPromoteLang && !stopped && runVid === activeVideoId) {
+        void promoteToDetectedSherpa(runVid, pendingPromoteLang);
+    }
+}
+
 async function flushSherpaCaptionQueue() {
     if (sherpaTranslating) return;
     sherpaTranslating = true;
@@ -1005,6 +1188,20 @@ self.onmessage = async e => {
                 }
             });
         }
+        return;
+    }
+
+    if (m.kind === 'TRANSCRIBE_SEGMENT') {
+        const tok = sessionToken;
+        pcmChain = pcmChain.then(async () => {
+            if (!stopped && sessionToken === tok) {
+                await transcribeAudioSegment(m);
+            }
+        }).catch(err => {
+            if (!stopped && m.videoId === activeVideoId) {
+                self.postMessage({ kind: 'error', videoId: m.videoId, error: String(err?.message || err) });
+            }
+        });
         return;
     }
 

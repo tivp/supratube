@@ -23,7 +23,17 @@ import {
     startManualAiCaptions,
     detectTextLanguageHint,
     formatTraditionalTwoLines,
-    createLiveTraditionalSegmenter
+    createLiveTraditionalSegmenter,
+    renderOverlayCaptionLines,
+    parseMp4Timescale,
+    parseMp4TfdtSec,
+    parseWebmTimecodeScale,
+    parseWebmClusterStartSec,
+    normalizeWebmSegmentSize,
+    mergeSrtSegmentCues,
+    selectNextPretranscribeSegment,
+    formatSrtTimestamp,
+    buildSrtTextFromCues
 } from '../modules/subtitles.js';
 
 test('detectVideoAudioLang inspects active dubbed audio track first, then default audio, then asr caption', () => {
@@ -2020,9 +2030,13 @@ test('manual [IA] survives in-flight auto fallback, keeps paused readiness banne
     assert.equal(box?.style.bottom, '9.5%');
     assert.equal(box?.style.transform, 'translateX(-50%)');
     assert.equal(box?.style.textAlign, 'left');
-    assert.equal(box?.children[0]?.style.lineHeight, '1.25');
-    assert.equal(box?.children[0]?.style.padding, '0.11em 0.35em');
-    assert.equal(box?.children[0]?.style.borderRadius, '0px');
+    assert.equal(box?.children[0]?.style.display, 'inline-flex');
+    assert.equal(box?.children[0]?.style.flexDirection, 'column');
+    assert.equal(box?.children[0]?.style.gap, '0px');
+    assert.equal(box?.children[0]?.children?.[0]?.style.display, 'inline-block');
+    assert.equal(box?.children[0]?.children?.[0]?.style.lineHeight, '1.24');
+    assert.equal(box?.children[0]?.children?.[0]?.style.padding, '0.09em 0.34em');
+    assert.equal(box?.children[0]?.children?.[0]?.style.borderRadius, '4px');
 
     clearFallbackCaptions(fakeDoc, fakeWin);
 });
@@ -2847,9 +2861,9 @@ test('AI mode purges stale v1 corner drag position, places corner notice top-lef
     assert.equal(box?.style.bottom, '9.5%');
     assert.equal(box?.style.transform, 'translateX(-50%)');
     assert.equal(box?.style.textAlign, 'left');
-    assert.equal(box?.children[0]?.style.lineHeight, '1.25');
-    assert.equal(box?.children[0]?.style.padding, '0.11em 0.35em');
-    assert.equal(box?.children[0]?.style.borderRadius, '0px');
+    assert.equal(box?.children[0]?.style.display, 'inline-flex');
+    assert.equal(box?.children[0]?.style.flexDirection, 'column');
+    assert.equal(box?.children[0]?.style.gap, '0px');
 
     const long132 = 'Sale de tu móvil junto a un identificador y el de la persona a la que estás escribiendo hacia los servidores. Entonces, saben incluso';
     const longFormattedLines = formatTraditionalTwoLines(long132, 42).split('\n');
@@ -2866,6 +2880,10 @@ test('AI mode purges stale v1 corner drag position, places corner notice top-lef
     }));
     emitCap('pepito dijo', 'pepito dijo');
     assert.equal(box?.children[0]?.textContent, 'Pepito dijo');
+    assert.equal(box?.children[0]?.children?.[0]?.style.display, 'inline-block');
+    assert.equal(box?.children[0]?.children?.[0]?.style.lineHeight, '1.24');
+    assert.equal(box?.children[0]?.children?.[0]?.style.padding, '0.09em 0.34em');
+    assert.equal(box?.children[0]?.children?.[0]?.style.borderRadius, '4px');
     emitCap('. Lo mas importante', '. Lo mas importante');
     assert.equal(box?.children[0]?.textContent, 'Pepito dijo. Lo mas importante');
     emitCap('que piñas del monje', 'que piñas del monje');
@@ -2877,4 +2895,235 @@ test('AI mode purges stale v1 corner drag position, places corner notice top-lef
 
     clearFallbackCaptions(doc, win);
     assert.equal(elements.get('supratube-ai-corner-box'), undefined);
+});
+
+test('renderOverlayCaptionLines creates stacked non-overlapping rounded caption lines for Watch and Shorts', () => {
+    const createNode = tag => ({
+        tagName: String(tag).toUpperCase(),
+        className: '',
+        textContent: '',
+        style: {},
+        children: [],
+        appendChild(c) { if (c && typeof c === 'object' && !c.isText) this.children.push(c); return c; }
+    });
+    const fakeDoc = {
+        createElement: tag => createNode(tag),
+        createTextNode: txt => ({ isText: true, textContent: txt })
+    };
+
+    const seg1 = createNode('span');
+    renderOverlayCaptionLines(seg1, 'Una línea corta', fakeDoc, { isShorts: false, fontPx: 22, align: 'left' });
+    assert.equal(seg1.style.display, 'inline-flex');
+    assert.equal(seg1.style.flexDirection, 'column');
+    assert.equal(seg1.style.gap, '0px');
+    assert.equal(seg1.children.length, 1);
+    assert.equal(seg1.children[0].style.borderRadius, '4px');
+    assert.equal(seg1.children[0].style.lineHeight, '1.24');
+    assert.equal(seg1.children[0].style.padding, '0.09em 0.34em');
+
+    const seg2 = createNode('span');
+    renderOverlayCaptionLines(seg2, 'En cuanto te encuentres mejor, les llamaré\nteléfono. Mejor', fakeDoc, { isShorts: false, fontPx: 22, align: 'left' });
+    assert.equal(seg2.children.length, 2);
+    assert.equal(seg2.children[0].style.borderRadius, '4px 4px 4px 0px');
+    assert.equal(seg2.children[1].style.borderRadius, '0px 0px 4px 4px');
+
+    const segShorts = createNode('span');
+    renderOverlayCaptionLines(segShorts, 'Línea corta\nSegunda línea mucho más larga', fakeDoc, { isShorts: true, fontPx: 22, align: 'center' });
+    assert.equal(segShorts.style.alignItems, 'center');
+    assert.equal(segShorts.children[0].style.borderRadius, '4px 4px 0px 0px');
+    assert.equal(segShorts.children[1].style.borderRadius, '4px 4px 4px 4px');
+});
+
+test('MP4/WebM container timestamp parsers, SRT cue merger, and priority segment selector work cleanly', () => {
+    const mkMp4Box = (tag, payload) => {
+        const out = new Uint8Array(8 + payload.length);
+        const dv = new DataView(out.buffer);
+        dv.setUint32(0, out.length, false);
+        for (let i = 0; i < 4; i++) out[4 + i] = tag.charCodeAt(i);
+        out.set(payload, 8);
+        return out;
+    };
+    const mdhdPayload = new Uint8Array(24);
+    new DataView(mdhdPayload.buffer).setUint32(12, 48000, false);
+    const moov = mkMp4Box('moov', mkMp4Box('trak', mkMp4Box('mdia', mkMp4Box('mdhd', mdhdPayload))));
+    assert.equal(parseMp4Timescale(moov), 48000);
+
+    const tfdtPayload = new Uint8Array(8);
+    new DataView(tfdtPayload.buffer).setUint32(4, 240000, false);
+    const moof = mkMp4Box('moof', mkMp4Box('traf', mkMp4Box('tfdt', tfdtPayload)));
+    assert.equal(parseMp4TfdtSec(moof, 48000), 5);
+
+    const webmInit = new Uint8Array([
+        0x1a, 0x45, 0xdf, 0xa3, 0x84, 0x42, 0x86, 0x81, 0x01,
+        0x18, 0x53, 0x80, 0x67, 0x88, // Segment VINT size = 8 bytes (finite, too small!)
+        0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40, 0x00 // TimecodeScale = 1,000,000
+    ]);
+    assert.equal(parseWebmTimecodeScale(webmInit), 1000000);
+    const patchedWebm = normalizeWebmSegmentSize(new Uint8Array([...webmInit, 0x1f, 0x43, 0xb6, 0x75, 0x86, 0xe7, 0x82, 0x0f, 0xa0, 0xaa, 0xbb]));
+    assert.equal(patchedWebm[13], 0xff); // patched to EBML unknown size
+
+    const webmCluster = new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 0x84, 0xe7, 0x82, 0x13, 0x88]); // Timecode = 5000 ticks -> 5s
+    assert.equal(parseWebmClusterStartSec(webmCluster, 1000000), 5);
+
+    const merged = mergeSrtSegmentCues(
+        [{ start: 0, end: 5, text: 'Primera vieja' }, { start: 10, end: 15, text: 'Tercera' }],
+        5,
+        10,
+        [{ start: 4.8, end: 9.8, text: 'Segunda nueva' }]
+    );
+    assert.equal(merged.length, 3);
+    assert.equal(merged[0].end, 4.8);
+    assert.equal(merged[1].text, 'Segunda nueva');
+    assert.match(buildSrtTextFromCues(merged), /1\n00:00:00,000 --> 00:00:04,800\nPrimera vieja/);
+    assert.equal(formatSrtTimestamp(65.125), '00:01:05,125');
+
+    const segs = [
+        { seq: 1, startSec: 0, endSec: 10 },
+        { seq: 2, startSec: 10, endSec: 20 },
+        { seq: 3, startSec: 20, endSec: 30 }
+    ];
+    const pickedNow = selectNextPretranscribeSegment(segs, [{ start: 0, end: 10 }], 22);
+    assert.equal(pickedNow?.seq, 3); // currentTime 22s takes priority over seq 2 ahead of 0
+    const pickedAhead = selectNextPretranscribeSegment(segs, [{ start: 0, end: 10 }, { start: 20, end: 30 }], 8);
+    assert.equal(pickedAhead?.seq, 2);
+});
+
+test('startManualAiCaptions pre-transcribes buffered MSE segments into timed SRT cues and supports seek backward/forward', async () => {
+    const store = new Map();
+    const elements = new Map();
+    const cmds = [];
+    const listeners = new Map();
+    const createNode = tag => ({
+        tagName: String(tag).toUpperCase(),
+        id: '',
+        className: '',
+        textContent: '',
+        children: [],
+        style: {},
+        appendChild(c) { c.parentElement = this; this.children.push(c); if (c.id) elements.set(c.id, c); return c; },
+        remove() { if (this.id) elements.delete(this.id); },
+        setAttribute() {},
+        getAttribute: () => null,
+        removeAttribute() {},
+        addEventListener() {},
+        removeEventListener() {}
+    });
+    const vidListeners = new Map();
+    const videoEl = {
+        ...createNode('video'),
+        currentTime: 2,
+        paused: false,
+        ended: false,
+        addEventListener(ev, fn) { if (!vidListeners.has(ev)) vidListeners.set(ev, new Set()); vidListeners.get(ev).add(fn); },
+        removeEventListener(ev, fn) { vidListeners.get(ev)?.delete(fn); },
+        emit(ev) { for (const fn of [...(vidListeners.get(ev) || [])]) fn(); }
+    };
+    const player = {
+        ...createNode('div'),
+        id: 'movie_player',
+        clientWidth: 960,
+        clientHeight: 540,
+        getVideoData: () => ({ video_id: 'srtPreVid01' }),
+        querySelector: sel => {
+            if (sel === 'video') return videoEl;
+            if (sel === '#supratube-fallback-captions') return elements.get('supratube-fallback-captions') || null;
+            if (sel === '#supratube-ai-corner-box') return elements.get('supratube-ai-corner-box') || null;
+            return null;
+        },
+        querySelectorAll: () => []
+    };
+    const doc = {
+        documentElement: { dataset: { supratubeWhisperBridge: '1' }, setAttribute() {}, removeAttribute() {} },
+        head: createNode('head'),
+        createElement: tag => createNode(tag),
+        getElementById: id => elements.get(id) || null,
+        querySelector: () => null,
+        querySelectorAll: () => []
+    };
+    const segments = [
+        { seq: 1, videoId: 'srtPreVid01', startSec: 0, endSec: 5, mimeType: 'audio/mp4', initSeg: new Uint8Array([1, 2]), bytes: new Uint8Array([3, 4]) },
+        { seq: 2, videoId: 'srtPreVid01', startSec: 5, endSec: 10, mimeType: 'audio/mp4', initSeg: new Uint8Array([1, 2]), bytes: new Uint8Array([5, 6]) }
+    ];
+    class FakeCustomEvent { constructor(t, i) { this.type = t; this.detail = i?.detail; } }
+    const win = {
+        location: { href: 'https://www.youtube.com/watch?v=srtPreVid01', pathname: '/watch' },
+        localStorage: { getItem: k => store.get(k) || null, setItem: (k, v) => store.set(k, String(v)), removeItem: k => store.delete(k) },
+        CustomEvent: FakeCustomEvent,
+        __supratubeAudioTap: {
+            installed: true,
+            getSegments: vid => (vid === 'srtPreVid01' ? segments : [])
+        },
+        AudioContext: class {
+            async decodeAudioData() {
+                return {
+                    numberOfChannels: 1,
+                    sampleRate: 16000,
+                    length: 16000 * 5,
+                    getChannelData: () => new Float32Array(16000 * 5)
+                };
+            }
+            close() {}
+        },
+        addEventListener(ev, fn) { if (!listeners.has(ev)) listeners.set(ev, new Set()); listeners.get(ev).add(fn); },
+        removeEventListener(ev, fn) { listeners.get(ev)?.delete(fn); },
+        dispatchEvent(ev) {
+            if (ev?.type === 'supratube-whisper-cmd') cmds.push(ev.detail);
+            for (const fn of [...(listeners.get(ev?.type) || [])]) fn(ev);
+        },
+        setTimeout,
+        clearTimeout
+    };
+
+    const ok = startManualAiCaptions({ player, videoId: 'srtPreVid01', userLang: 'es', doc, win });
+    assert.equal(ok, true);
+    assert.equal(cmds[0]?.pretranscribeOnly, true);
+
+    // Ack triggers segment 1 (covering currentTime=2) decoding and dispatch
+    win.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', { detail: { kind: 'ack', videoId: 'srtPreVid01' } }));
+    await new Promise(r => setTimeout(r, 25));
+    const segCmd1 = cmds.find(c => c.action === 'transcribe_segment');
+    assert.ok(segCmd1 && segCmd1.validStartSec === 0 && segCmd1.validEndSec === 5);
+
+    // Deliver SRT cues for segment 1 -> renders synchronously at currentTime=2
+    win.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: {
+            kind: 'srt_segment',
+            videoId: 'srtPreVid01',
+            segId: segCmd1.segId,
+            startSec: 0,
+            endSec: 5,
+            validStartSec: 0,
+            validEndSec: 5,
+            cues: [{ start: 1, end: 4, text: 'Primera frase tradicional' }]
+        }
+    }));
+    await new Promise(r => setTimeout(r, 25));
+    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Primera frase tradicional');
+
+    // Worker automatically pumped segment 2 [5..10s] ahead in background!
+    const segCmd2 = cmds.filter(c => c.action === 'transcribe_segment')[1];
+    assert.ok(segCmd2 && segCmd2.validStartSec === 5);
+    win.dispatchEvent(new FakeCustomEvent('supratube-whisper-evt', {
+        detail: {
+            kind: 'srt_segment',
+            videoId: 'srtPreVid01',
+            segId: segCmd2.segId,
+            startSec: 4.2,
+            endSec: 10,
+            validStartSec: 5,
+            validEndSec: 10,
+            cues: [{ start: 6, end: 9, text: 'Segunda frase futura' }]
+        }
+    }));
+
+    // Seeking forward renders cue 2; seeking backward replays cue 1 instantly without re-transcribing
+    videoEl.currentTime = 7;
+    videoEl.emit('timeupdate');
+    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Segunda frase futura');
+
+    videoEl.currentTime = 2;
+    videoEl.emit('seeked');
+    assert.equal(elements.get('supratube-fallback-captions')?.children[0]?.textContent, 'Primera frase tradicional');
+
+    clearFallbackCaptions(doc, win);
 });

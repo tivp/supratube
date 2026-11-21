@@ -918,3 +918,127 @@ export class SileroStreamingVadState {
         };
     }
 }
+
+/** Decode base64-encoded little-endian PCM16 mono bytes into normalized [-1, 1] Float32 samples. */
+export function decodePcm16Base64ToFloat32(b64 = '') {
+    const clean = String(b64 || '').trim();
+    if (!clean) return new Float32Array(0);
+    let u8;
+    if (typeof atob === 'function') {
+        const bin = atob(clean);
+        u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    } else {
+        u8 = new Uint8Array(Buffer.from(clean, 'base64'));
+    }
+    const sampleCount = Math.floor(u8.byteLength / 2);
+    const out = new Float32Array(sampleCount);
+    const dv = new DataView(u8.buffer, u8.byteOffset, sampleCount * 2);
+    for (let i = 0; i < sampleCount; i++) {
+        out[i] = dv.getInt16(i * 2, true) / 32768;
+    }
+    return out;
+}
+
+/** Convert per-frame VAD probabilities into bounded, merged speech spans ready for ASR transcription. */
+export function extractSpeechSpansFromProbs(
+    probs = [],
+    pcm = null,
+    {
+        sampleRate = 16000,
+        frameSize = 512,
+        onset = 0.34,
+        offset = 0.20,
+        minSpeechFrames = 5,
+        minSilenceFrames = 14,
+        preRollSec = 0.22,
+        postRollSec = 0.24,
+        mergeGapSec = 0.28,
+        maxSpanSec = 6.5
+    } = {}
+) {
+    const totalSamples = pcm?.length ?? (probs?.length || 0) * frameSize;
+    if (!probs?.length || totalSamples <= 0) return [];
+
+    const vad = new SileroStreamingVadState({ onset, offset, minSpeechFrames, minSilenceFrames });
+    const raw = [];
+    let inSpan = false;
+    let spanStart = 0;
+    let lastActiveEnd = 0;
+
+    for (let i = 0; i < probs.length; i++) {
+        const st = vad.pushProb(Number(probs[i]) || 0);
+        if (!inSpan && st.isSpeech) {
+            inSpan = true;
+            spanStart = i * frameSize;
+            lastActiveEnd = Math.min(totalSamples, (i + 1) * frameSize);
+        } else if (inSpan && st.isSpeech) {
+            if (st.isActiveVoice) {
+                lastActiveEnd = Math.min(totalSamples, (i + 1) * frameSize);
+            }
+        } else if (inSpan && !st.isSpeech) {
+            if (st.justEnded) {
+                raw.push({
+                    startSample: spanStart,
+                    endSample: Math.max(spanStart + frameSize, Math.min(totalSamples, lastActiveEnd))
+                });
+            }
+            inSpan = false;
+        }
+    }
+
+    if (inSpan && (vad.speechConfirmed || lastActiveEnd - spanStart >= minSpeechFrames * frameSize)) {
+        raw.push({
+            startSample: spanStart,
+            endSample: Math.min(totalSamples, Math.max(spanStart + frameSize, lastActiveEnd))
+        });
+    }
+    if (!raw.length) return [];
+
+    const preRoll = Math.round(preRollSec * sampleRate);
+    const postRoll = Math.round(postRollSec * sampleRate);
+    const padded = raw.map(sp => ({
+        startSample: Math.max(0, sp.startSample - preRoll),
+        endSample: Math.min(totalSamples, sp.endSample + postRoll)
+    }));
+
+    const mergeGap = Math.round(mergeGapSec * sampleRate);
+    const maxSpan = Math.round(maxSpanSec * sampleRate);
+    const merged = [padded[0]];
+    for (let i = 1; i < padded.length; i++) {
+        const prev = merged[merged.length - 1];
+        const cur = padded[i];
+        if (cur.startSample - prev.endSample < mergeGap && Math.max(prev.endSample, cur.endSample) - prev.startSample <= maxSpan) {
+            prev.endSample = Math.max(prev.endSample, cur.endSample);
+        } else {
+            merged.push(cur);
+        }
+    }
+
+    const out = [];
+    const chunks = pcm ? [{ start: 0, end: pcm.length, pcm }] : [];
+    const minCutAdvance = Math.round(sampleRate * 3.8);
+    const targetCutOffset = Math.round(sampleRate * 5.2);
+
+    for (let i = 0; i < merged.length; i++) {
+        let cur = merged[i].startSample;
+        const end = merged[i].endSample;
+        while (end - cur > maxSpan) {
+            const minCut = cur + minCutAdvance;
+            const maxCut = Math.min(end, cur + maxSpan);
+            const fallbackCut = Math.min(end, cur + targetCutOffset);
+            let cut = chunks.length
+                ? findBestSilenceCutSample(chunks, minCut, maxCut, fallbackCut)
+                : fallbackCut;
+            if (!Number.isFinite(cut) || cut <= cur + Math.round(sampleRate * 1.0)) {
+                cut = fallbackCut;
+            }
+            out.push({ startSample: cur, endSample: cut });
+            cur = cut;
+        }
+        if (end - cur >= Math.round(sampleRate * 0.15)) {
+            out.push({ startSample: cur, endSample: end });
+        }
+    }
+    return out;
+}

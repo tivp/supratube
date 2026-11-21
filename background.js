@@ -637,6 +637,26 @@ chrome.runtime.onMessage.addListener((mensaje, sender, enviarRespuesta) => {
         return false;
     }
 
+    if (mensaje.action === 'SUPRATUBE_WHISPER_SEGMENT') {
+        if (sender.tab?.id !== activeWhisperTabId || mensaje.videoId !== activeWhisperVideoId) {
+            enviarRespuesta({ ok: false, error: 'Sesión Whisper inactiva' });
+            return false;
+        }
+        sendMessageToOffscreenWithRetry({
+            type: 'TRANSCRIBE_SEGMENT',
+            videoId: activeWhisperVideoId,
+            segId: mensaje.segId || '',
+            startSec: mensaje.startSec || 0,
+            endSec: mensaje.endSec || 0,
+            validStartSec: mensaje.validStartSec,
+            validEndSec: mensaje.validEndSec,
+            pcm16B64: mensaje.pcm16B64 || ''
+        })
+            .then(() => enviarRespuesta({ ok: true }))
+            .catch(err => enviarRespuesta({ ok: false, error: err?.message || 'Error enviando segmento' }));
+        return true;
+    }
+
     if (mensaje.action === 'SUPRATUBE_WHISPER_STOP') {
         if (!activeWhisperTabId || sender.tab?.id === activeWhisperTabId) {
             const vid = mensaje.videoId || activeWhisperVideoId;
